@@ -1,0 +1,12 @@
+[package]
+name = "style"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dom = { path = "../dom" }
+css = { path = "../css" }
+
+[dev-dependencies]
+html = { path = "../html" }
