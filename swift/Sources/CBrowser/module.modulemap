@@ -1,0 +1,4 @@
+module CBrowser {
+    header "../../../include/browser.h"
+    export *
+}
