@@ -1,0 +1,16 @@
+[package]
+name = "ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "browser_ffi"
+# staticlib for linking into the Swift binary; cdylib is handy for quick ad-hoc loading.
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+engine = { path = "../engine" }
+
+[build-dependencies]
+cbindgen = "0.27"
