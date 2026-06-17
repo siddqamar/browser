@@ -300,6 +300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private var inFlightLoads = 0
+    /// Coalesces rapid live-resize events so we re-layout once the drag settles.
+    private var resizeWork: DispatchWorkItem?
 
     private let defaultURL = "https://example.com"
     private let toolbarHeight: CGFloat = 48
@@ -792,8 +794,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidResize(_ notification: Notification) {
-        updateViewport()
-        refresh()
+        // During a live drag this fires many times/sec; each re-layout is expensive. Coalesce:
+        // the BitmapView stretches the last bitmap to fit meanwhile, and we re-layout crisply
+        // once the drag pauses (~40ms idle).
+        bitmapView?.needsDisplay = true
+        resizeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.updateViewport()
+            self?.refresh()
+        }
+        resizeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: work)
     }
 
     func windowDidChangeBackingProperties(_ notification: Notification) {

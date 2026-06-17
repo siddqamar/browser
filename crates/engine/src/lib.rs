@@ -44,6 +44,15 @@ enum LoadState {
     Failed { url: String, error: String },
 }
 
+/// Cached cascade+layout result, reused across renders when only the scroll offset changes.
+/// Invalidated on navigation (`load_url`) and when the device viewport size changes.
+struct LayoutCache {
+    dw: u32,
+    dh: u32,
+    root: layout::LayoutBox,
+    content_h: f32,
+}
+
 pub struct Engine {
     /// Logical viewport size in points and the backing scale factor (e.g. 2.0 on Retina).
     vp_w: u32,
@@ -54,6 +63,8 @@ pub struct Engine {
     /// Vertical scroll offset of the page content, in device pixels (0 = top). Clamped to
     /// the laid-out document height during `render`.
     scroll_y: f32,
+    /// Cached layout tree so scrolling only re-paints (no re-cascade / re-layout).
+    layout_cache: Option<LayoutCache>,
     /// Retained so the FFI layer can hand out a pointer that stays valid until the next
     /// render or until the engine is dropped.
     framebuffer: Option<Framebuffer>,
@@ -74,6 +85,7 @@ impl Engine {
             state: LoadState::Empty,
             font: SystemFont::load(),
             scroll_y: 0.0,
+            layout_cache: None,
             framebuffer: None,
         }
     }
@@ -93,6 +105,7 @@ impl Engine {
     /// Fetch `url` and remember the outcome. Returns 0 on success, negative on error.
     pub fn load_url(&mut self, url: &str) -> i32 {
         self.scroll_y = 0.0; // new navigation starts at the top
+        self.layout_cache = None; // invalidate cached layout for the previous page
         match net::fetch(url) {
             Ok(resp) => {
                 // Parse HTML responses into a DOM; other content types just record metadata.
@@ -154,19 +167,52 @@ impl Engine {
         }
     }
 
+    /// Recompute the cascade + layout for the current viewport into `layout_cache`, unless a
+    /// cached tree for this exact device size is already present. This is the expensive part of
+    /// rendering; keeping it out of the scroll path makes scrolling cheap (paint-only).
+    fn ensure_layout(&mut self, dw: u32, dh: u32, header_h: f32) {
+        if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
+            return;
+        }
+        let left = 16.0 * self.scale;
+        // Compute into owned values first so the `&self.state` borrow ends before we assign.
+        let computed = if let (Some(font), LoadState::Loaded { doc: Some(d), styles, console, images, .. }) =
+            (self.font.as_ref(), &self.state)
+        {
+            let page_max_y = if console.is_empty() { dh as f32 } else { (dh as f32 * 0.65).floor() };
+            let vw = (dw as f32 - 2.0 * left).max(1.0);
+            let vh = (page_max_y - header_h).max(1.0);
+            let measurer = FontMeasurer { font };
+            let intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
+                .iter()
+                .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))
+                .collect();
+            let computed = style::cascade(d, styles);
+            let root =
+                layout::layout_document(d, &computed, vw, vh, &measurer, &intrinsic_sizes);
+            let content_h = root.dimensions.margin_box().height;
+            Some((root, content_h))
+        } else {
+            None
+        };
+        self.layout_cache = computed.map(|(root, content_h)| LayoutCache { dw, dh, root, content_h });
+    }
+
     /// Paint the current state into a fresh framebuffer and return a reference to it.
     pub fn render(&mut self) -> &Framebuffer {
-        let dw = ((self.vp_w as f32) * self.scale).round() as u32;
-        let dh = ((self.vp_h as f32) * self.scale).round() as u32;
-        let mut fb = Framebuffer::new(dw.max(1), dh.max(1));
-        // Local copy so we can clamp against the document height inside the (immutably
-        // borrowed) state match, then write the clamped value back after.
+        let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
+        let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
+        let header_h = 28.0 * self.scale;
+
+        // Expensive: cascade + layout (cached across scrolls / repeated renders at this size).
+        self.ensure_layout(dw, dh, header_h);
+
+        let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;
 
         paint_gradient(&mut fb);
 
         // Slim header band so it's unmistakably our paint, not a blank surface.
-        let header_h = 28.0 * self.scale;
         fb.fill_rect(Rect { x: 0, y: 0, w: dw as i32, h: header_h as i32 },
                      Color::rgb(20, 22, 30));
 
@@ -179,7 +225,7 @@ impl Engine {
                     draw_text(&mut fb, font, "Enter a URL and press Go.",
                               12.0 * self.scale, 60.0 * self.scale, px, Color::WHITE);
                 }
-                LoadState::Loaded { url, status, content_type, bytes, doc, styles, console, images } => {
+                LoadState::Loaded { url, status, content_type, bytes, doc, console, images, .. } => {
                     // Header line: HTTP status, content type, size, and URL.
                     let head =
                         format!("HTTP {status}   |   {content_type}   |   {bytes}B   |   {url}");
@@ -187,54 +233,26 @@ impl Engine {
                               19.0 * self.scale, 13.0 * self.scale, Color::rgb(120, 200, 255));
 
                     let left = 16.0 * self.scale;
-                    let max_x = dw as f32 - left;
-
-                    // When there's console output, reserve the bottom ~35% for the console
-                    // panel and clip the page text to stop above it.
                     let page_max_y = if console.is_empty() {
                         dh as f32
                     } else {
                         (dh as f32 * 0.65).floor()
                     };
+                    let viewport_height = (page_max_y - header_h).max(1.0);
 
-                    match doc {
-                        Some(d) => {
-                            // Cascade UA + author sheets + inline attrs into per-node styles,
-                            // then run box-model layout and paint the resulting box tree.
-                            let computed = style::cascade(d, styles);
-                            let viewport_width = (max_x - left).max(1.0);
-                            let viewport_height = (page_max_y - header_h).max(1.0);
-                            let measurer = FontMeasurer { font };
-                            // Intrinsic sizes (px) for replaced (image) boxes, from decoded images.
-                            let intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
-                                .iter()
-                                .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))
-                                .collect();
-                            let root = layout::layout_document(
-                                d, &computed, viewport_width, viewport_height, &measurer,
-                                &intrinsic_sizes,
-                            );
-                            // Clamp the scroll offset to the laid-out document height so we
-                            // can't scroll past the end.
-                            let content_h = root.dimensions.margin_box().height;
-                            let max_scroll = (content_h - viewport_height).max(0.0);
-                            scroll_y = scroll_y.min(max_scroll);
-                            // Translate the page below the header band, offset by the scroll
-                            // position, and clip vertically to the page region.
-                            paint_box(
-                                &mut fb, font, &root, left, header_h - scroll_y, header_h,
-                                page_max_y, images,
-                            );
-                        }
-                        None => {
-                            let line_h = px * 1.4;
-                            let mut baseline = header_h + line_h;
-                            draw_text(
-                                &mut fb, font, &format!("(non-HTML content: {})", url),
-                                left, baseline, px, Color::WHITE,
-                            );
-                            let _ = &mut baseline;
-                        }
+                    if let Some(cache) = &self.layout_cache {
+                        // Scroll just re-paints the cached layout at a new offset.
+                        let max_scroll = (cache.content_h - viewport_height).max(0.0);
+                        scroll_y = scroll_y.min(max_scroll);
+                        paint_box(
+                            &mut fb, font, &cache.root, left, header_h - scroll_y, header_h,
+                            page_max_y, images,
+                        );
+                    } else if doc.is_none() {
+                        draw_text(
+                            &mut fb, font, &format!("(non-HTML content: {})", url),
+                            left, header_h + px * 1.4, px, Color::WHITE,
+                        );
                     }
 
                     if !console.is_empty() {
