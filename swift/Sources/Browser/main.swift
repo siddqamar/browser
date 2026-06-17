@@ -374,7 +374,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
-        window.minSize = NSSize(width: 560, height: 360)
+        window.minSize = NSSize(width: 380, height: 300)
         window.center()
 
         let content = NSView(frame: contentRect)
@@ -558,7 +558,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         pillIdealWidth.priority = .defaultHigh
         let pillLeadingGap = pill.leadingAnchor.constraint(greaterThanOrEqualTo: navStack.trailingAnchor, constant: 16)
         let pillTrailingGap = pill.trailingAnchor.constraint(lessThanOrEqualTo: progress.leadingAnchor, constant: -16)
-        let pillMinWidth = pill.widthAnchor.constraint(greaterThanOrEqualToConstant: 200)
+        // Min width is non-required so the pill compresses on narrow windows instead of
+        // blocking horizontal resize (the leading/trailing gaps still prevent overlap).
+        let pillMinWidth = pill.widthAnchor.constraint(greaterThanOrEqualToConstant: 90)
+        pillMinWidth.priority = .defaultLow
         NSLayoutConstraint.activate([pillMaxWidth, pillIdealWidth, pillLeadingGap, pillTrailingGap, pillMinWidth])
 
         // Only listen for resize/backing callbacks once all views exist, so an early
