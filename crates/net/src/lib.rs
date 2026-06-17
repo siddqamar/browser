@@ -36,6 +36,9 @@ pub fn fetch(url: &str) -> Result<Response, String> {
     // Present a mainstream browser User-Agent. Many sites (Google, etc.) serve a stripped
     // or blocked page to unknown clients like ureq's default UA, so we look like a browser.
     let resp = match ureq::get(url)
+        // Bound the whole request (DNS + connect + read) so one stalled connection can't hang
+        // the engine — important when fetching large resource graphs (e.g. 200+ JS modules).
+        .timeout(std::time::Duration::from_secs(15))
         .set("User-Agent", BROWSER_USER_AGENT)
         .set(
             "Accept",

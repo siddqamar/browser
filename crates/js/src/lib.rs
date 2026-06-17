@@ -298,12 +298,18 @@ pub fn run_modules(
     entries: Vec<String>,
     modules: HashMap<String, String>,
 ) -> (dom::Document, Vec<EvalOutput>) {
-    let count = entries.len().max(1);
     let url = url.to_string();
+    // The worker sends its result through this channel so we can wait with a timeout rather
+    // than `join()` unconditionally: a heavy or self-looping module app (e.g. a big SPA the
+    // interpreter renders slowly) must not hang the page load. `fallback` is the pre-module DOM
+    // we render if the worker doesn't finish in time.
+    let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
+    let fallback = doc.clone();
     let worker = std::thread::Builder::new()
         .name("js-modules".to_string())
         .stack_size(1024 * 1024 * 1024)
         .spawn(move || {
+            let result: (dom::Document, Vec<EvalOutput>) = (move || {
             let shared: SharedDoc = Rc::new(RefCell::new(doc));
 
             let loader = Rc::new(MapLoader { sources: modules, cache: RefCell::new(HashMap::new()) });
@@ -392,22 +398,30 @@ pub fn run_modules(
                 Err(rc) => rc.borrow().clone(),
             };
             (doc, results)
+            })();
+            let _ = tx.send(result);
         });
 
     match worker {
-        Ok(handle) => handle.join().unwrap_or_else(|_| {
-            let results = vec![
-                EvalOutput {
-                    value: None,
-                    console: Vec::new(),
-                    error: Some("module execution aborted (panic in JS engine)".to_string()),
-                };
-                count
-            ];
-            (dom::Document::new(), results)
-        }),
+        Ok(_handle) => {
+            // Wait a bounded slice; if the worker doesn't finish (slow/looping app), render the
+            // pre-module DOM. The detached worker runs to completion on its own (and is reaped at
+            // process exit). A panic in the worker drops `tx`, so `recv` also returns Err here.
+            let budget = std::time::Duration::from_secs(10);
+            match rx.recv_timeout(budget) {
+                Ok(result) => result,
+                Err(_) => (
+                    fallback,
+                    vec![EvalOutput {
+                        value: None,
+                        console: Vec::new(),
+                        error: Some("module execution timed out or aborted".to_string()),
+                    }],
+                ),
+            }
+        }
         Err(e) => (
-            dom::Document::new(),
+            fallback,
             vec![EvalOutput {
                 value: None,
                 console: Vec::new(),
@@ -2906,9 +2920,15 @@ fn drain_event_loop(
         "if (typeof __fireLifecycleEvents === 'function') { __fireLifecycleEvents(); }",
     ));
 
+    // Wall-clock budget: pages with self-rescheduling `requestAnimationFrame`/`setInterval`
+    // loops (e.g. Vue render loops) never drain to empty, so without a time cap we'd spin until
+    // EVENT_LOOP_CAP — minutes of work. Real browsers render frames continuously and never block
+    // a load; we approximate by draining for a bounded slice, then painting whatever state exists.
+    let start = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(3000);
     let mut iterations = 0usize;
     loop {
-        if iterations >= EVENT_LOOP_CAP {
+        if iterations >= EVENT_LOOP_CAP || start.elapsed() >= budget {
             break;
         }
         // Run any pending promise reaction jobs (e.g. resolved `Promise.then`). 0.21 exposes
