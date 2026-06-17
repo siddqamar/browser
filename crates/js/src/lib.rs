@@ -1,21 +1,34 @@
 //! JavaScript runtime (Phase: scripting).
 //!
-//! Wraps the reused `boa_engine` (a pure-Rust JS engine) behind our own small API so the
-//! engine can be swapped for a hand-written one later — same pattern as `net`/ureq and
-//! `paint`/fontdue. Nothing outside this crate knows Boa exists.
+//! Wraps Google's V8 JavaScript engine behind our own small API so the engine could be swapped
+//! later — same pattern as `net`/ureq and `paint`/fontdue. Nothing outside this crate knows V8
+//! exists. V8 gives us full JS speed plus complete language support, including real ES modules
+//! and dynamic `import()`.
+//!
+//! ## V8 integration shape
+//! - V8 is process-global-initialized exactly once (`std::sync::Once`).
+//! - A V8 `Isolate` is single-thread-bound, so every entry point that owns an isolate either runs
+//!   on the calling thread ([`Runtime`]) or creates the isolate on a dedicated worker thread
+//!   ([`eval_batch`]/[`run_with_dom`]/[`run_modules`]).
+//! - Native callbacks in V8 are bare C function pointers and cannot capture Rust state. We share
+//!   the page DOM and console buffer with them through a [`HostState`] stored on the **context
+//!   slot** (`Context::set_slot`/`get_slot`), retrieved inside each callback via
+//!   `scope.get_current_context().get_slot::<HostState>()`. The DOM is only ever touched on the
+//!   isolate's own thread, so `Rc<RefCell<dom::Document>>` is fine (no `Send` needed).
+//!
+//! ## DOM exposure
+//! Rather than port dozens of bespoke per-node wrapper closures, we expose a *small* set of native
+//! primitive functions on `globalThis`, keyed by integer node ids (`dom::NodeId` is a `usize`),
+//! and build the `document`/element objects in JavaScript on top of them (the
+//! `DOCUMENT_BOOTSTRAP`, `TIMERS_BOOTSTRAP`, and `BROWSER_ENV_BOOTSTRAP` strings). All the
+//! framework-compatibility machinery (per-node wrapper cache + expandos, `style`/`classList`/
+//! `dataset` write-through, the DOM interface class hierarchy + `instanceof`, navigator/location/
+//! storage/observers, the timer/event loop) lives in that reused, engine-agnostic JavaScript.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-
-use boa_engine::{
-    builtins::promise::PromiseState,
-    js_string,
-    module::{ModuleLoader, ModuleRequest, Referrer},
-    object::{builtins::JsArray, ObjectInitializer},
-    property::Attribute,
-    Context, JsObject, JsResult, JsValue, Module, NativeFunction, Source,
-};
+use std::sync::Once;
 
 /// A JS execution result: the value rendered as a string (if any) plus any console output
 /// captured during execution.
@@ -26,444 +39,50 @@ pub struct EvalOutput {
     pub error: Option<String>,
 }
 
-/// A JS runtime. Owns one global context so state persists across `eval` calls.
-pub struct Runtime {
-    context: Context,
-    /// Console lines accumulated by the installed `console` global. Drained on each `eval`.
-    console: Rc<RefCell<Vec<String>>>,
+/// Initialize the V8 platform exactly once for the whole process. Safe to call repeatedly.
+fn ensure_v8_initialized() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+    });
 }
 
-impl Default for Runtime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ---------------------------------------------------------------------------------------------
+// Shared host state (lives on the V8 context slot; retrieved inside native callbacks).
+// ---------------------------------------------------------------------------------------------
 
-impl Runtime {
-    pub fn new() -> Self {
-        let mut context = Context::default();
-        let console = Rc::new(RefCell::new(Vec::new()));
-        install_console(&mut context, &console);
-        install_timers(&mut context);
-        Runtime { context, console }
-    }
-
-    /// Evaluate a script in the owned context. State (globals) persists across calls.
-    ///
-    /// On success `value` is the result rendered as a string (omitted when `undefined`);
-    /// on a JS exception `error` holds the message. Any `console.*` output produced during
-    /// the call is captured into `console`. Never panics on script errors.
-    pub fn eval(&mut self, source: &str) -> EvalOutput {
-        // Clear leftover console state (defensive; we drain after every eval anyway).
-        self.console.borrow_mut().clear();
-
-        let result = self.context.eval(Source::from_bytes(source));
-        let console = std::mem::take(&mut *self.console.borrow_mut());
-
-        match result {
-            Ok(value) => {
-                let rendered = if value.is_undefined() {
-                    None
-                } else {
-                    Some(render_value(&value, &mut self.context))
-                };
-                EvalOutput { value: rendered, console, error: None }
-            }
-            Err(err) => {
-                EvalOutput { value: None, console, error: Some(err.to_string()) }
-            }
-        }
-    }
-}
-
-/// Run `sources` in order on a single fresh runtime (so later scripts see earlier globals)
-/// and return one [`EvalOutput`] per source.
-///
-/// Executed on a dedicated thread with a large stack. Boa's parser is recursive-descent and
-/// recurses very deeply on real-world minified JavaScript; a normal thread stack (e.g. a
-/// libdispatch worker's ~512 KiB) overflows and faults — a hardware trap that can't be caught
-/// after the fact, so we must give the parser room up front. Running off-thread also isolates
-/// ordinary panics inside the engine: a panic terminates this worker and is surfaced as an
-/// error here instead of aborting the whole process.
-pub fn eval_batch(sources: Vec<String>) -> Vec<EvalOutput> {
-    let count = sources.len();
-    let worker = std::thread::Builder::new()
-        .name("js-eval".to_string())
-        // 1 GiB of address space. Boa's recursive-descent parser spends ~17 stack frames per
-        // expression-nesting level (≈33 KiB/level in debug builds), so even modestly nested
-        // real-world minified JS needs far more than a default thread stack. This is virtual
-        // address space — pages commit lazily as the stack grows — so reserving it is cheap.
-        .stack_size(1024 * 1024 * 1024)
-        .spawn(move || {
-            let mut rt = Runtime::new();
-            let mut results = sources.iter().map(|s| rt.eval(s)).collect::<Vec<_>>();
-            // Drive the event loop so timers/microtasks registered by the scripts actually run.
-            let Runtime { context, console } = &mut rt;
-            drain_event_loop(context, console, &mut results);
-            results
-        });
-
-    match worker {
-        Ok(handle) => handle.join().unwrap_or_else(|_| {
-            vec![
-                EvalOutput {
-                    value: None,
-                    console: Vec::new(),
-                    error: Some("script execution aborted (panic in JS engine)".to_string()),
-                };
-                count.max(1)
-            ]
-        }),
-        Err(e) => vec![EvalOutput {
-            value: None,
-            console: Vec::new(),
-            error: Some(format!("could not start JS worker thread: {e}")),
-        }],
-    }
-}
-
-/// A shared, mutable handle to the page's DOM. Cloned into every native binding closure so
-/// reads and writes from JS hit the one real document tree.
+/// A shared, mutable handle to the page's DOM.
 type SharedDoc = Rc<RefCell<dom::Document>>;
 
-/// Run `sources` in order against the live `doc`, returning the (possibly mutated) document
-/// and one [`EvalOutput`] per source.
-///
-/// This is the DOM-aware sibling of [`eval_batch`]. The context is given browser globals
-/// (`window`/`self`/`globalThis` aliases, a minimal `location`) and a `document` object wired
-/// to `doc`, so scripts like `document.getElementById("x").textContent = "y"` mutate the real
-/// tree and the change is visible in the returned document.
-///
-/// Like `eval_batch`, the parse/eval work runs on a dedicated 1 GiB-stack worker thread (Boa's
-/// recursive-descent parser overflows small stacks on real-world minified JS). `doc` and
-/// `sources` are both `Send`, so they are moved into the worker; the non-`Send` `Rc`/`RefCell`
-/// handle and the Boa `Context` are built *inside* the worker and never cross the boundary.
-pub fn run_with_dom(
-    doc: dom::Document,
-    sources: Vec<String>,
-    url: &str,
-) -> (dom::Document, Vec<EvalOutput>) {
-    let count = sources.len();
-    // Move an owned copy of the URL into the worker (the borrow can't cross the thread boundary).
-    let url = url.to_string();
-    let worker = std::thread::Builder::new()
-        .name("js-eval-dom".to_string())
-        // See `eval_batch` for why this is 1 GiB of (lazily-committed) address space.
-        .stack_size(1024 * 1024 * 1024)
-        .spawn(move || {
-            let shared: SharedDoc = Rc::new(RefCell::new(doc));
+/// State shared between Rust and the native primitive callbacks. Stored on the context slot as an
+/// `Rc<HostState>` so any callback can recover it from `scope.get_current_context().get_slot()`.
+/// Interior mutability via `RefCell` since the slot only hands out `&HostState` (well, `Rc`).
+struct HostState {
+    doc: SharedDoc,
+    console: RefCell<Vec<String>>,
+}
 
-            let mut context = Context::default();
-            let console = Rc::new(RefCell::new(Vec::new()));
-            install_browser_environment(&mut context, &console, &shared, &url);
-
-            let mut results = Vec::with_capacity(sources.len());
-            for source in &sources {
-                console.borrow_mut().clear();
-                let result = context.eval(Source::from_bytes(source));
-                let captured = std::mem::take(&mut *console.borrow_mut());
-                match result {
-                    Ok(value) => {
-                        let rendered = if value.is_undefined() {
-                            None
-                        } else {
-                            Some(render_value(&value, &mut context))
-                        };
-                        results.push(EvalOutput { value: rendered, console: captured, error: None });
-                    }
-                    Err(err) => results.push(EvalOutput {
-                        value: None,
-                        console: captured,
-                        error: Some(err.to_string()),
-                    }),
-                }
-            }
-
-            // Now that all page scripts have registered their timers and microtasks, drive the
-            // event loop to completion (or the safety cap), folding any console output and timer
-            // errors produced during the drain into the results.
-            drain_event_loop(&mut context, &console, &mut results);
-
-            // Recover the owned `Document`. Dropping the `Context` first releases every binding
-            // closure and element wrapper object that holds an `Rc` clone of `shared`, leaving
-            // us as the sole owner so `try_unwrap` succeeds. If anything still holds a reference
-            // (it shouldn't), fall back to cloning the inner document so we always return one.
-            drop(context);
-            let doc = match Rc::try_unwrap(shared) {
-                Ok(cell) => cell.into_inner(),
-                Err(rc) => rc.borrow().clone(),
-            };
-            (doc, results)
-        });
-
-    match worker {
-        Ok(handle) => handle.join().unwrap_or_else(|_| {
-            // The worker panicked: we lost the document it owned, so return a fresh empty one.
-            let results = vec![
-                EvalOutput {
-                    value: None,
-                    console: Vec::new(),
-                    error: Some("script execution aborted (panic in JS engine)".to_string()),
-                };
-                count.max(1)
-            ];
-            (dom::Document::new(), results)
-        }),
-        Err(e) => (
-            dom::Document::new(),
-            vec![EvalOutput {
-                value: None,
-                console: Vec::new(),
-                error: Some(format!("could not start JS worker thread: {e}")),
-            }],
-        ),
+impl HostState {
+    fn new(doc: SharedDoc) -> Rc<Self> {
+        Rc::new(HostState { doc, console: RefCell::new(Vec::new()) })
     }
 }
 
-/// Install the full DOM-aware "browser environment" into `context`: console capture, the
-/// `window`/`self`/`globalThis` aliases, the DOM-wired `document` (with write-through), the
-/// timer/event-loop APIs, and the navigator/location/etc. bootstrap. Shared by both
-/// [`run_with_dom`] (classic scripts) and [`run_modules`] (ES modules) so modules see the same
-/// `document`/`window` globals page scripts do. Order matters: `install_globals` must precede
-/// `install_browser_env` (which overwrites the minimal `location` and patches `document`).
-fn install_browser_environment(
-    context: &mut Context,
-    console: &Rc<RefCell<Vec<String>>>,
-    shared: &SharedDoc,
-    url: &str,
-) {
-    install_console(context, console);
-    install_globals(context);
-    install_document(context, shared);
-    install_timers(context);
-    install_browser_env(context, url);
-}
-
-/// A map-backed ES module loader. The engine has already rewritten every import/export specifier
-/// in each module's source to its **canonical absolute URL**, so this loader does no
-/// referrer-relative resolution: the `specifier` it receives *is* the canonical URL, and it is
-/// looked up directly in `sources`. Parsed [`Module`]s are cached by URL so a module imported from
-/// several places is parsed once (and cycles terminate).
-///
-/// GC soundness: the cached `Module`s are `Trace`-able Boa values, but they live behind an `Rc`
-/// owned by the loader (which Boa itself owns via `Context`), not captured into any
-/// `NativeFunction::from_closure`. The source `HashMap` holds only `String`s.
-struct MapLoader {
-    sources: HashMap<String, String>,
-    cache: RefCell<HashMap<String, Module>>,
-}
-
-impl ModuleLoader for MapLoader {
-    async fn load_imported_module(
-        self: Rc<Self>,
-        _referrer: Referrer,
-        request: ModuleRequest,
-        context: &RefCell<&mut Context>,
-    ) -> JsResult<Module> {
-        let key = request.specifier().to_std_string_escaped();
-        if let Some(m) = self.cache.borrow().get(&key) {
-            return Ok(m.clone());
-        }
-        let src = match self.sources.get(&key) {
-            Some(s) => s.clone(),
-            None => {
-                return Err(boa_engine::JsNativeError::typ()
-                    .with_message(format!("module not found: {key}"))
-                    .into());
-            }
-        };
-        let module = {
-            let mut ctx = context.borrow_mut();
-            Module::parse(Source::from_bytes(src.as_bytes()), None, &mut ctx)?
-        };
-        self.cache
-            .borrow_mut()
-            .insert(key, module.clone());
-        Ok(module)
-    }
-}
-
-/// Run the ES module graph for a page. `entries` are the canonical URLs of the entry modules in
-/// document order; `modules` maps every canonical module URL to its **already-rewritten** source
-/// (every import/export specifier replaced with its canonical URL). Returns the (possibly mutated)
-/// document plus one [`EvalOutput`] per entry (console output is folded into the last entry's
-/// output, the same way [`run_with_dom`] folds drain output).
-///
-/// Runs on the same 1 GiB-stack worker thread as [`run_with_dom`] (Boa's recursive-descent parser
-/// overflows small stacks on real-world minified JS — Vue is ~400 KB). The browser environment is
-/// installed identically via [`install_browser_environment`], so modules see `document`/`window`.
-pub fn run_modules(
-    doc: dom::Document,
-    url: &str,
-    entries: Vec<String>,
-    modules: HashMap<String, String>,
-) -> (dom::Document, Vec<EvalOutput>) {
-    let url = url.to_string();
-    // The worker sends its result through this channel so we can wait with a timeout rather
-    // than `join()` unconditionally: a heavy or self-looping module app (e.g. a big SPA the
-    // interpreter renders slowly) must not hang the page load. `fallback` is the pre-module DOM
-    // we render if the worker doesn't finish in time.
-    let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
-    let fallback = doc.clone();
-    let worker = std::thread::Builder::new()
-        .name("js-modules".to_string())
-        .stack_size(1024 * 1024 * 1024)
-        .spawn(move || {
-            let result: (dom::Document, Vec<EvalOutput>) = (move || {
-            let shared: SharedDoc = Rc::new(RefCell::new(doc));
-
-            let loader = Rc::new(MapLoader { sources: modules, cache: RefCell::new(HashMap::new()) });
-            let loader_ref = Rc::clone(&loader);
-            let mut context = match Context::builder().module_loader(loader).build() {
-                Ok(c) => c,
-                Err(e) => {
-                    let doc = Rc::try_unwrap(shared)
-                        .map(RefCell::into_inner)
-                        .unwrap_or_else(|rc| rc.borrow().clone());
-                    return (
-                        doc,
-                        vec![EvalOutput {
-                            value: None,
-                            console: Vec::new(),
-                            error: Some(format!("could not build module context: {e}")),
-                        }],
-                    );
-                }
-            };
-
-            let console = Rc::new(RefCell::new(Vec::new()));
-            install_browser_environment(&mut context, &console, &shared, &url);
-
-            // Parse + kick off load/link/evaluate for every entry module, collecting the returned
-            // promises so we can inspect their final state after the event loop drains.
-            let mut results: Vec<EvalOutput> = Vec::with_capacity(entries.len());
-            let mut promises: Vec<(usize, boa_engine::object::builtins::JsPromise)> = Vec::new();
-            for (i, entry) in entries.iter().enumerate() {
-                console.borrow_mut().clear();
-                // Reuse an already-parsed module if a previous entry imported it; otherwise parse
-                // from the source map and seed the cache so transitive imports dedup against it.
-                let cached = loader_ref.cache.borrow().get(entry).cloned();
-                let parsed = match cached {
-                    Some(m) => Ok(m),
-                    None => match loader_ref.sources.get(entry).cloned() {
-                        Some(src) => Module::parse(Source::from_bytes(src.as_bytes()), None, &mut context),
-                        None => {
-                            results.push(EvalOutput {
-                                value: None,
-                                console: std::mem::take(&mut *console.borrow_mut()),
-                                error: Some(format!("entry module not found: {entry}")),
-                            });
-                            continue;
-                        }
-                    },
-                };
-                match parsed {
-                    Ok(module) => {
-                        loader_ref.cache.borrow_mut().insert(entry.clone(), module.clone());
-                        let promise = module.load_link_evaluate(&mut context);
-                        promises.push((i, promise));
-                        results.push(EvalOutput {
-                            value: None,
-                            console: std::mem::take(&mut *console.borrow_mut()),
-                            error: None,
-                        });
-                    }
-                    Err(err) => results.push(EvalOutput {
-                        value: None,
-                        console: std::mem::take(&mut *console.borrow_mut()),
-                        error: Some(err.to_string()),
-                    }),
-                }
-            }
-
-            // Drive the event loop so module top-level await, promise jobs, microtasks, timers,
-            // and the DOM lifecycle events all run to completion (or the safety cap).
-            drain_event_loop(&mut context, &console, &mut results);
-
-            // Surface any module that finished rejected (load/link/evaluate failure).
-            for (i, promise) in promises {
-                if let PromiseState::Rejected(reason) = promise.state() {
-                    let msg = render_value(&reason, &mut context);
-                    if let Some(slot) = results.get_mut(i) {
-                        if slot.error.is_none() {
-                            slot.error = Some(msg);
-                        }
-                    }
-                }
-            }
-
-            drop(context);
-            let doc = match Rc::try_unwrap(shared) {
-                Ok(cell) => cell.into_inner(),
-                Err(rc) => rc.borrow().clone(),
-            };
-            (doc, results)
-            })();
-            let _ = tx.send(result);
-        });
-
-    match worker {
-        Ok(_handle) => {
-            // Wait a bounded slice; if the worker doesn't finish (slow/looping app), render the
-            // pre-module DOM. The detached worker runs to completion on its own (and is reaped at
-            // process exit). A panic in the worker drops `tx`, so `recv` also returns Err here.
-            let budget = std::time::Duration::from_secs(20);
-            match rx.recv_timeout(budget) {
-                Ok(result) => result,
-                Err(_) => (
-                    fallback,
-                    vec![EvalOutput {
-                        value: None,
-                        console: Vec::new(),
-                        error: Some("module execution timed out or aborted".to_string()),
-                    }],
-                ),
-            }
-        }
-        Err(e) => (
-            fallback,
-            vec![EvalOutput {
-                value: None,
-                console: Vec::new(),
-                error: Some(format!("could not start JS worker thread: {e}")),
-            }],
-        ),
-    }
-}
-
-/// Make `window`, `self`, and `globalThis` all refer to the global object, and add a minimal
-/// `location` object with an `href` string. After this, `typeof window === "object"`,
-/// `window === self`, and `window.foo = 1` sets a global.
-fn install_globals(context: &mut Context) {
-    let global = context.global_object();
-    // `globalThis` already exists in Boa; alias `window`/`self` to the same object.
+/// Recover the `Rc<HostState>` from the current context's slot. Panics only if state was never
+/// installed, which is a programming error (every context we run callbacks in installs it).
+fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
+    let context = scope.get_current_context();
     context
-        .register_global_property(js_string!("window"), global.clone(), Attribute::all())
-        .expect("register window global");
-    context
-        .register_global_property(js_string!("self"), global, Attribute::all())
-        .expect("register self global");
-
-    let location = ObjectInitializer::new(context)
-        .property(js_string!("href"), js_string!(""), Attribute::all())
-        .build();
-    context
-        .register_global_property(js_string!("location"), location, Attribute::all())
-        .expect("register location global");
+        .get_slot::<HostState>()
+        .expect("HostState must be installed on the context")
 }
 
-/// Hidden own-property on an element wrapper that stores its [`dom::NodeId`] index, so methods
-/// and accessors can recover the node from `this`.
-const NODE_KEY: &str = "__node";
-
-/// Read the `NodeId` index stored on an element wrapper `this` value. Returns `None` if `this`
-/// is not an element wrapper (e.g. the method was called unbound).
-fn node_id_of(this: &JsValue, context: &mut Context) -> Option<dom::NodeId> {
-    let obj = this.as_object()?;
-    let v = obj.get(js_string!(NODE_KEY), context).ok()?;
-    let n = v.as_number()?;
-    Some(dom::NodeId(n as usize))
-}
+// ---------------------------------------------------------------------------------------------
+// DOM helpers (engine-agnostic; operate directly on `dom::Document`). Reused from the prior
+// implementation — these are pure Rust and unchanged in behavior.
+// ---------------------------------------------------------------------------------------------
 
 /// Concatenate every descendant `Text` node under `id`, in document order.
 fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
@@ -483,13 +102,7 @@ fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
 }
 
 /// Serialize the children of `id` back to an HTML string (the `innerHTML` of `id`).
-///
-/// This is a minimal HTML serializer: it emits start/end tags with attributes, text, and
-/// comments. It is enough for frameworks that read `container.innerHTML` to recover an in-DOM
-/// template (e.g. Vue's `mount` uses the container's innerHTML as the component template), where
-/// a text-only serialization would silently drop structural directives like `v-for`/`v-if`.
 fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
-    /// HTML void elements never have an end tag.
     fn is_void(tag: &str) -> bool {
         matches!(
             tag.to_ascii_lowercase().as_str(),
@@ -547,7 +160,6 @@ fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
 
 /// Replace all children of `id` with a single `Text` node holding `text`.
 fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
-    // Detach existing children (orphan them; the arena keeps the slots, which is fine).
     let old: Vec<dom::NodeId> = std::mem::take(&mut doc.get_mut(id).children);
     for child in old {
         doc.get_mut(child).parent = None;
@@ -555,29 +167,19 @@ fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
     doc.append_child(id, dom::NodeData::Text(text.to_string()));
 }
 
-/// Parse `html` and replace `target`'s children with the resulting real element/text/comment
-/// nodes in the live `doc`. This makes `el.innerHTML = "<div foo=...>"` produce navigable child
-/// nodes (Vue's template compiler relies on this: `decoder.innerHTML = ...; decoder.children[0]
-/// .getAttribute(...)`). Best-effort and never panics on malformed input.
+/// Parse `html` and replace `target`'s children with the resulting real nodes in the live `doc`.
 fn set_inner_html(doc: &mut dom::Document, target: dom::NodeId, html: &str) {
-    // Detach existing children (orphan them; the arena keeps the slots, which is fine).
     let old: Vec<dom::NodeId> = std::mem::take(&mut doc.get_mut(target).children);
     for child in old {
         doc.get_mut(child).parent = None;
     }
-
-    // Parse the fragment into its own document, then deep-copy the meaningful top-level nodes
-    // under `target`. The page parser appends directly under its root and does not synthesize
-    // html/head/body wrappers, but if a fragment does contain them we descend into them so the
-    // first real child (e.g. the `<div>`) lands directly under `target`.
     let frag = html::parse(html);
     let frag_root = frag.root();
     copy_children_into(doc, target, &frag, frag_root);
 }
 
-/// Recursively copy the children of `src_node` (in document `frag`) as children of `dst_parent`
-/// in `doc`. Synthesized structural wrappers (`html`/`head`/`body`) are transparently descended
-/// into rather than copied, so fragment content lands at the expected depth.
+/// Recursively copy the children of `src_node` (in `frag`) as children of `dst_parent` in `doc`.
+/// Synthesized structural wrappers (`html`/`head`/`body`) are transparently descended into.
 fn copy_children_into(
     doc: &mut dom::Document,
     dst_parent: dom::NodeId,
@@ -587,7 +189,6 @@ fn copy_children_into(
     for &child in &frag.get(src_node).children {
         match &frag.get(child).data {
             dom::NodeData::Element(e) if matches!(e.tag.as_str(), "html" | "head" | "body") => {
-                // Transparent wrapper: descend without copying the wrapper itself.
                 copy_children_into(doc, dst_parent, frag, child);
             }
             data => {
@@ -641,15 +242,16 @@ fn find_by_id(doc: &dom::Document, root: dom::NodeId, id: &str) -> Option<dom::N
     None
 }
 
-/// A single compound selector, e.g. `div.foo#bar` → tag=Some("div"), id=Some("bar"),
-/// classes=["foo"]. `tag` of `*` (or none) matches any element.
+// ---------------------------------------------------------------------------------------------
+// CSS selector engine (type / .class / #id / compound / descendant). Reused verbatim.
+// ---------------------------------------------------------------------------------------------
+
+/// A single compound selector, e.g. `div.foo#bar`.
 #[derive(Debug, Default, Clone)]
 struct Compound {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
-    /// True if at least one parseable simple piece was present (otherwise the compound is empty
-    /// and should not match everything).
     any: bool,
 }
 
@@ -678,9 +280,7 @@ impl Compound {
     }
 }
 
-/// Parse a single compound selector (no combinators). Recognizes `tag`, `*`, `.class`, `#id`,
-/// and `[attr]`/`[attr=val]` (attribute presence/equality, value quotes stripped). Unknown
-/// pieces (pseudo-classes etc.) are ignored, which is a pragmatic over-match rather than a throw.
+/// Parse a single compound selector (no combinators).
 fn parse_compound(s: &str) -> Option<Compound> {
     let s = s.trim();
     if s.is_empty() {
@@ -710,8 +310,6 @@ fn parse_compound(s: &str) -> Option<Compound> {
                 c.any = true;
             }
             '[' => {
-                // Skip an attribute selector; we ignore its constraint (over-match) but must not
-                // choke on it. Consume up to the matching ']'.
                 while i < bytes.len() && bytes[i] != ']' {
                     i += 1;
                 }
@@ -721,7 +319,6 @@ fn parse_compound(s: &str) -> Option<Compound> {
                 c.any = true;
             }
             ':' => {
-                // Pseudo-class/element: skip the name (and any (...) group); ignore it.
                 i += 1;
                 if i < bytes.len() && bytes[i] == ':' {
                     i += 1;
@@ -745,7 +342,6 @@ fn parse_compound(s: &str) -> Option<Compound> {
                 c.any = true;
             }
             _ => {
-                // A type/universal selector at the start.
                 let start = i;
                 while i < bytes.len() && !matches!(bytes[i], '.' | '#' | '[' | ':') {
                     i += 1;
@@ -767,10 +363,7 @@ fn parse_compound(s: &str) -> Option<Compound> {
 }
 
 /// A complex selector: a chain of compounds joined by descendant combinators (whitespace).
-/// `a b c` → match a `c` that has a `b` ancestor that has an `a` ancestor. We treat `>` like a
-/// descendant combinator (over-match) for simplicity, which is acceptable for our purposes.
 fn parse_complex(s: &str) -> Option<Vec<Compound>> {
-    // Normalize `>` `+` `~` combinators to spaces (over-match; we only do descendant matching).
     let normalized: String = s
         .chars()
         .map(|c| if matches!(c, '>' | '+' | '~') { ' ' } else { c })
@@ -786,8 +379,7 @@ fn parse_complex(s: &str) -> Option<Vec<Compound>> {
     }
 }
 
-/// Does `node` match the complex selector `chain` (last compound matches `node`, earlier
-/// compounds match successive ancestors in order)?
+/// Does `node` match the complex selector `chain`?
 fn matches_complex(doc: &dom::Document, node: dom::NodeId, chain: &[Compound]) -> bool {
     if chain.is_empty() {
         return false;
@@ -796,7 +388,6 @@ fn matches_complex(doc: &dom::Document, node: dom::NodeId, chain: &[Compound]) -
     if !last.matches(doc, node) {
         return false;
     }
-    // Walk ancestors, greedily satisfying the remaining (earlier) compounds.
     let mut remaining = &chain[..chain.len() - 1];
     let mut cur = doc.get(node).parent;
     while !remaining.is_empty() {
@@ -814,7 +405,7 @@ fn matches_complex(doc: &dom::Document, node: dom::NodeId, chain: &[Compound]) -
     true
 }
 
-/// Collect every node matching any of the comma-separated selector groups, in document order.
+/// Collect every node matching any of the comma-separated selector groups, document order.
 fn query_selector_all(doc: &dom::Document, sel: &str) -> Vec<dom::NodeId> {
     let groups: Vec<Vec<Compound>> = sel.split(',').filter_map(parse_complex).collect();
     if groups.is_empty() {
@@ -836,15 +427,7 @@ fn query_selector_all(doc: &dom::Document, sel: &str) -> Vec<dom::NodeId> {
     out
 }
 
-/// First node matching `sel`, or none.
-fn query_selector(doc: &dom::Document, sel: &str) -> Option<dom::NodeId> {
-    query_selector_all(doc, sel).into_iter().next()
-}
-
-/// Like [`query_selector_all`] but scoped to the subtree under `root` (excluding `root` itself),
-/// used for element-level `querySelector`/`querySelectorAll`. Ancestor matching for descendant
-/// combinators still consults real ancestors (above `root`), matching browser semantics closely
-/// enough for our purposes.
+/// Like [`query_selector_all`] but scoped to the subtree under `root` (excluding `root` itself).
 fn query_within(doc: &dom::Document, root: dom::NodeId, sel: &str) -> Vec<dom::NodeId> {
     let groups: Vec<Vec<Compound>> = sel.split(',').filter_map(parse_complex).collect();
     let mut out = Vec::new();
@@ -869,890 +452,906 @@ fn query_within(doc: &dom::Document, root: dom::NodeId, sel: &str) -> Vec<dom::N
     out
 }
 
-/// Build a JS element wrapper object for `id`: a plain object carrying the hidden `__node`
-/// index, with accessors (`textContent`, `tagName`, `nodeName`, `id`, `className`, `innerHTML`)
-/// and methods (`getAttribute`, `setAttribute`, `appendChild`) that operate on the shared doc.
-fn make_element(id: dom::NodeId, doc: &SharedDoc, context: &mut Context) -> JsObject {
-    // Accessor functions take `&Realm`; clone it up front so we don't borrow `context` while
-    // also handing it to `ObjectInitializer`.
-    let realm = context.realm().clone();
-
-    // --- textContent: get concatenates descendant text; set replaces children with one text. ---
-    let tc_get = {
-        let doc = Rc::clone(doc);
-        // SAFETY: captures only a `SharedDoc` (`Rc<RefCell<dom::Document>>`), which holds no
-        // GC-traceable values. Per `from_closure`'s contract this is sound — see `console`.
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let s = node_id_of(this, ctx)
-                    .map(|n| text_content(&doc.borrow(), n))
-                    .unwrap_or_default();
-                Ok(JsValue::from(js_string!(s)))
-            })
+/// Collect every element under `root` carrying ALL of `wanted` classes, document order.
+fn collect_by_class(doc: &dom::Document, root: dom::NodeId, wanted: &[String], out: &mut Vec<dom::NodeId>) {
+    if let dom::NodeData::Element(e) = &doc.get(root).data {
+        if !wanted.is_empty() && wanted.iter().all(|w| e.classes().any(|c| c == w)) {
+            out.push(root);
         }
-        .to_js_function(&realm)
-    };
-    let tc_set = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                if let Some(n) = node_id_of(this, ctx) {
-                    let text = args
-                        .first()
-                        .map(|a| render_value(a, ctx))
-                        .unwrap_or_default();
-                    set_text_content(&mut doc.borrow_mut(), n, &text);
-                }
-                Ok(JsValue::undefined())
-            })
-        }
-        .to_js_function(&realm)
-    };
-
-    // --- innerHTML: get serializes children back to HTML markup (tags + attrs + text), so code
-    // that reads `el.innerHTML` as a template (e.g. Vue's `mount` uses the mount container's
-    // innerHTML as the component template) recovers structural directives like `v-for`/`v-if`
-    // instead of a flattened text run. set parses the HTML into real child nodes. ---
-    let html_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let s = node_id_of(this, ctx)
-                    .map(|n| inner_html(&doc.borrow(), n))
-                    .unwrap_or_default();
-                Ok(JsValue::from(js_string!(s)))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let html_set = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                if let Some(n) = node_id_of(this, ctx) {
-                    let text = args
-                        .first()
-                        .map(|a| render_value(a, ctx))
-                        .unwrap_or_default();
-                    set_inner_html(&mut doc.borrow_mut(), n, &text);
-                }
-                Ok(JsValue::undefined())
-            })
-        }
-        .to_js_function(&realm)
-    };
-
-    // --- tagName / nodeName: uppercased tag name. ---
-    let tag_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let s = node_id_of(this, ctx)
-                    .and_then(|n| match &doc.borrow().get(n).data {
-                        dom::NodeData::Element(e) => Some(e.tag.to_ascii_uppercase()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                Ok(JsValue::from(js_string!(s)))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let nodename_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let s = node_id_of(this, ctx)
-                    .and_then(|n| match &doc.borrow().get(n).data {
-                        dom::NodeData::Element(e) => Some(e.tag.to_ascii_uppercase()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                Ok(JsValue::from(js_string!(s)))
-            })
-        }
-        .to_js_function(&realm)
-    };
-
-    // --- id (get/set) ---
-    let id_get = attr_getter(doc, &realm, "id");
-    let id_set = attr_setter(doc, &realm, "id");
-
-    // --- className (get/set) maps to the `class` attribute. ---
-    let class_get = attr_getter(doc, &realm, "class");
-    let class_set = attr_setter(doc, &realm, "class");
-
-    // --- getAttribute(name) / setAttribute(name, value) ---
-    let get_attr = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let name = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let val = node_id_of(this, ctx).and_then(|n| match &doc.borrow().get(n).data {
-                    dom::NodeData::Element(e) => e.attrs.get(&name).cloned(),
-                    _ => None,
-                });
-                Ok(match val {
-                    Some(v) => JsValue::from(js_string!(v)),
-                    None => JsValue::null(),
-                })
-            })
-        }
-    };
-    let set_attr = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let name = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let value = args.get(1).map(|a| render_value(a, ctx)).unwrap_or_default();
-                if let Some(n) = node_id_of(this, ctx) {
-                    if let dom::NodeData::Element(e) = &mut doc.borrow_mut().get_mut(n).data {
-                        e.attrs.insert(name, value);
-                    }
-                }
-                Ok(JsValue::undefined())
-            })
-        }
-    };
-
-    // --- removeAttribute / hasAttribute ---
-    let remove_attr = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let name = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                if let Some(n) = node_id_of(this, ctx) {
-                    if let dom::NodeData::Element(e) = &mut doc.borrow_mut().get_mut(n).data {
-                        e.attrs.remove(&name);
-                    }
-                }
-                Ok(JsValue::undefined())
-            })
-        }
-    };
-    let has_attr = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let name = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let present = node_id_of(this, ctx)
-                    .map(|n| match &doc.borrow().get(n).data {
-                        dom::NodeData::Element(e) => e.attrs.contains_key(&name),
-                        _ => false,
-                    })
-                    .unwrap_or(false);
-                Ok(JsValue::from(present))
-            })
-        }
-    };
-
-    // --- appendChild(child): reparent `child`'s node under `this`, return the child. ---
-    let append_child = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let parent = node_id_of(this, ctx);
-                let child_val = args.first().cloned().unwrap_or_else(JsValue::null);
-                let child = node_id_of(&child_val, ctx);
-                if let (Some(parent), Some(child)) = (parent, child) {
-                    let mut d = doc.borrow_mut();
-                    // Unlink from any previous parent.
-                    if let Some(old_parent) = d.get(child).parent {
-                        d.get_mut(old_parent).children.retain(|&c| c != child);
-                    }
-                    d.get_mut(child).parent = Some(parent);
-                    d.get_mut(parent).children.push(child);
-                }
-                Ok(child_val)
-            })
-        }
-    };
-
-    // --- removeChild(child): unlink `child` from `this`, return it. ---
-    let remove_child = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let parent = node_id_of(this, ctx);
-                let child_val = args.first().cloned().unwrap_or_else(JsValue::null);
-                let child = node_id_of(&child_val, ctx);
-                if let (Some(parent), Some(child)) = (parent, child) {
-                    let mut d = doc.borrow_mut();
-                    d.get_mut(parent).children.retain(|&c| c != child);
-                    if d.get(child).parent == Some(parent) {
-                        d.get_mut(child).parent = None;
-                    }
-                }
-                Ok(child_val)
-            })
-        }
-    };
-
-    // --- insertBefore(newNode, refNode): insert before refNode (or append if null). ---
-    let insert_before = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let parent = node_id_of(this, ctx);
-                let new_val = args.first().cloned().unwrap_or_else(JsValue::null);
-                let new_node = node_id_of(&new_val, ctx);
-                let ref_node = args.get(1).and_then(|v| node_id_of(v, ctx));
-                if let (Some(parent), Some(new_node)) = (parent, new_node) {
-                    let mut d = doc.borrow_mut();
-                    if let Some(old) = d.get(new_node).parent {
-                        d.get_mut(old).children.retain(|&c| c != new_node);
-                    }
-                    d.get_mut(new_node).parent = Some(parent);
-                    let pos = ref_node
-                        .and_then(|r| d.get(parent).children.iter().position(|&c| c == r));
-                    match pos {
-                        Some(i) => d.get_mut(parent).children.insert(i, new_node),
-                        None => d.get_mut(parent).children.push(new_node),
-                    }
-                }
-                Ok(new_val)
-            })
-        }
-    };
-
-    // --- contains(node): is `node` a descendant-or-self of `this`? ---
-    let contains_fn = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let me = node_id_of(this, ctx);
-                let other = args.first().and_then(|v| node_id_of(v, ctx));
-                let result = match (me, other) {
-                    (Some(me), Some(mut cur)) => {
-                        let d = doc.borrow();
-                        loop {
-                            if cur == me {
-                                break true;
-                            }
-                            match d.get(cur).parent {
-                                Some(p) => cur = p,
-                                None => break false,
-                            }
-                        }
-                    }
-                    _ => false,
-                };
-                Ok(JsValue::from(result))
-            })
-        }
-    };
-
-    // --- matches(sel): does `this` match the selector? ---
-    let matches_fn = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let sel = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let result = node_id_of(this, ctx)
-                    .map(|n| {
-                        let d = doc.borrow();
-                        sel.split(',')
-                            .filter_map(parse_complex)
-                            .any(|g| matches_complex(&d, n, &g))
-                    })
-                    .unwrap_or(false);
-                Ok(JsValue::from(result))
-            })
-        }
-    };
-
-    // --- closest(sel): nearest ancestor-or-self matching the selector. ---
-    let closest_fn = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let sel = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let found = node_id_of(this, ctx).and_then(|start| {
-                    let groups: Vec<Vec<Compound>> =
-                        sel.split(',').filter_map(parse_complex).collect();
-                    let d = doc.borrow();
-                    let mut cur = Some(start);
-                    while let Some(n) = cur {
-                        if matches!(d.get(n).data, dom::NodeData::Element(_))
-                            && groups.iter().any(|g| matches_complex(&d, n, g))
-                        {
-                            return Some(n);
-                        }
-                        cur = d.get(n).parent;
-                    }
-                    None
-                });
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-    };
-
-    // --- scoped querySelector / querySelectorAll (search within `this`'s subtree). ---
-    let el_query = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let sel = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let found = node_id_of(this, ctx).and_then(|root| {
-                    let d = doc.borrow();
-                    query_within(&d, root, &sel).into_iter().next()
-                });
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-    };
-    let el_query_all = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let sel = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let ids = node_id_of(this, ctx)
-                    .map(|root| {
-                        let d = doc.borrow();
-                        query_within(&d, root, &sel)
-                    })
-                    .unwrap_or_default();
-                let items: Vec<JsValue> =
-                    ids.into_iter().map(|n| JsValue::from(make_element(n, &doc, ctx))).collect();
-                Ok(JsValue::from(JsArray::from_iter(items, ctx)))
-            })
-        }
-    };
-    let el_get_by_tag = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, args, ctx| {
-                let tag = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let mut ids = Vec::new();
-                if let Some(root) = node_id_of(this, ctx) {
-                    let d = doc.borrow();
-                    // collect_by_tag includes `root` itself; getElementsByTagName excludes self,
-                    // so collect over the children only.
-                    for &child in &d.get(root).children {
-                        collect_by_tag(&d, child, &tag, &mut ids);
-                    }
-                }
-                let items: Vec<JsValue> =
-                    ids.into_iter().map(|n| JsValue::from(make_element(n, &doc, ctx))).collect();
-                Ok(JsValue::from(JsArray::from_iter(items, ctx)))
-            })
-        }
-    };
-
-    // --- navigation accessors: parentNode / parentElement / children / childNodes /
-    // firstChild / lastChild / nextSibling / previousSibling / *ElementSibling. ---
-    let parent_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let found = node_id_of(this, ctx).and_then(|n| doc.borrow().get(n).parent);
-                // Don't expose the Document root as a parentElement.
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let children_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let ids: Vec<dom::NodeId> = node_id_of(this, ctx)
-                    .map(|n| {
-                        let d = doc.borrow();
-                        d.get(n)
-                            .children
-                            .iter()
-                            .copied()
-                            .filter(|&c| matches!(d.get(c).data, dom::NodeData::Element(_)))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let items: Vec<JsValue> =
-                    ids.into_iter().map(|n| JsValue::from(make_element(n, &doc, ctx))).collect();
-                Ok(JsValue::from(JsArray::from_iter(items, ctx)))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let child_nodes_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let ids: Vec<dom::NodeId> = node_id_of(this, ctx)
-                    .map(|n| doc.borrow().get(n).children.clone())
-                    .unwrap_or_default();
-                let items: Vec<JsValue> =
-                    ids.into_iter().map(|n| JsValue::from(make_element(n, &doc, ctx))).collect();
-                Ok(JsValue::from(JsArray::from_iter(items, ctx)))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let first_child_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let found = node_id_of(this, ctx)
-                    .and_then(|n| doc.borrow().get(n).children.first().copied());
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let last_child_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let found = node_id_of(this, ctx)
-                    .and_then(|n| doc.borrow().get(n).children.last().copied());
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let first_el_child_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let found = node_id_of(this, ctx).and_then(|n| {
-                    let d = doc.borrow();
-                    d.get(n)
-                        .children
-                        .iter()
-                        .copied()
-                        .find(|&c| matches!(d.get(c).data, dom::NodeData::Element(_)))
-                });
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let sibling_get = |doc: &SharedDoc, realm: &boa_engine::realm::Realm, next: bool, element_only: bool| {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |this, _args, ctx| {
-                let found = node_id_of(this, ctx).and_then(|n| {
-                    let d = doc.borrow();
-                    let parent = d.get(n).parent?;
-                    let sibs = &d.get(parent).children;
-                    let idx = sibs.iter().position(|&c| c == n)?;
-                    let mut iter_pos = idx;
-                    loop {
-                        let cand = if next {
-                            if iter_pos + 1 >= sibs.len() {
-                                return None;
-                            }
-                            iter_pos += 1;
-                            sibs[iter_pos]
-                        } else {
-                            if iter_pos == 0 {
-                                return None;
-                            }
-                            iter_pos -= 1;
-                            sibs[iter_pos]
-                        };
-                        if !element_only || matches!(d.get(cand).data, dom::NodeData::Element(_)) {
-                            return Some(cand);
-                        }
-                    }
-                });
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-        .to_js_function(realm)
-    };
-    let next_sibling_get = sibling_get(doc, &realm, true, false);
-    let prev_sibling_get = sibling_get(doc, &realm, false, false);
-    let next_el_sibling_get = sibling_get(doc, &realm, true, true);
-    let prev_el_sibling_get = sibling_get(doc, &realm, false, true);
-
-    let attr = Attribute::all();
-    let obj = ObjectInitializer::new(context)
-        .function(get_attr, js_string!("getAttribute"), 1)
-        .function(set_attr, js_string!("setAttribute"), 2)
-        .function(remove_attr, js_string!("removeAttribute"), 1)
-        .function(has_attr, js_string!("hasAttribute"), 1)
-        .function(append_child, js_string!("appendChild"), 1)
-        .function(remove_child, js_string!("removeChild"), 1)
-        .function(insert_before, js_string!("insertBefore"), 2)
-        .function(contains_fn, js_string!("contains"), 1)
-        .function(matches_fn, js_string!("matches"), 1)
-        .function(closest_fn, js_string!("closest"), 1)
-        .function(el_query, js_string!("querySelector"), 1)
-        .function(el_query_all, js_string!("querySelectorAll"), 1)
-        .function(el_get_by_tag, js_string!("getElementsByTagName"), 1)
-        .accessor(js_string!("textContent"), Some(tc_get), Some(tc_set), attr)
-        .accessor(js_string!("innerHTML"), Some(html_get), Some(html_set), attr)
-        .accessor(js_string!("tagName"), Some(tag_get), None, attr)
-        .accessor(js_string!("nodeName"), Some(nodename_get), None, attr)
-        .accessor(js_string!("id"), Some(id_get), Some(id_set), attr)
-        .accessor(js_string!("className"), Some(class_get), Some(class_set), attr)
-        .accessor(js_string!("parentNode"), Some(parent_get.clone()), None, attr)
-        .accessor(js_string!("parentElement"), Some(parent_get), None, attr)
-        .accessor(js_string!("children"), Some(children_get), None, attr)
-        .accessor(js_string!("childNodes"), Some(child_nodes_get), None, attr)
-        .accessor(js_string!("firstChild"), Some(first_child_get), None, attr)
-        .accessor(js_string!("lastChild"), Some(last_child_get), None, attr)
-        .accessor(js_string!("firstElementChild"), Some(first_el_child_get), None, attr)
-        .accessor(js_string!("nextSibling"), Some(next_sibling_get), None, attr)
-        .accessor(js_string!("previousSibling"), Some(prev_sibling_get), None, attr)
-        .accessor(js_string!("nextElementSibling"), Some(next_el_sibling_get), None, attr)
-        .accessor(js_string!("previousElementSibling"), Some(prev_el_sibling_get), None, attr)
-        .build();
-
-    // Store the node index as a non-enumerable, non-writable own property.
-    obj.create_data_property_or_throw(js_string!(NODE_KEY), JsValue::from(id.0 as i32), context)
-        .expect("store __node on element wrapper");
-    obj
+    }
+    let children = doc.get(root).children.clone();
+    for child in children {
+        collect_by_class(doc, child, wanted, out);
+    }
 }
 
-/// Build a getter for the element attribute `name` (returns "" when absent).
-fn attr_getter(doc: &SharedDoc, realm: &boa_engine::realm::Realm, name: &'static str) -> boa_engine::object::builtins::JsFunction {
-    let doc = Rc::clone(doc);
-    unsafe {
-        NativeFunction::from_closure(move |this, _args, ctx| {
-            let s = node_id_of(this, ctx)
-                .and_then(|n| match &doc.borrow().get(n).data {
-                    dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            Ok(JsValue::from(js_string!(s)))
+// ---------------------------------------------------------------------------------------------
+// V8 value conversion helpers.
+// ---------------------------------------------------------------------------------------------
+
+/// Render a V8 value to a display string (via JS `String(value)` coercion). Never throws out:
+/// uses `to_rust_string_lossy` after a `to_string` coercion, falling back to "undefined".
+fn render_value(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> String {
+    match value.to_string(scope) {
+        Some(s) => s.to_rust_string_lossy(scope),
+        None => "undefined".to_string(),
+    }
+}
+
+/// Read positional argument `i` from a callback as a Rust string (JS-coerced). Missing → "".
+fn arg_str(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, i: i32) -> String {
+    if i >= args.length() {
+        return String::new();
+    }
+    let v = args.get(i);
+    render_value(scope, v)
+}
+
+/// Read positional argument `i` as a node id (`usize`). Missing/NaN → None.
+fn arg_node(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, i: i32) -> Option<dom::NodeId> {
+    if i >= args.length() {
+        return None;
+    }
+    let v = args.get(i);
+    let n = v.number_value(scope)?;
+    if n.is_nan() || n < 0.0 {
+        return None;
+    }
+    Some(dom::NodeId(n as usize))
+}
+
+/// Build a JS string Local. Falls back to an empty string if V8 rejects the (huge) input.
+fn js_str<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::Value> {
+    match v8::String::new(scope, s) {
+        Some(v) => v.into(),
+        None => v8::String::empty(scope).into(),
+    }
+}
+
+/// Build a JS array of node ids (as numbers).
+fn js_id_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    ids: &[dom::NodeId],
+) -> v8::Local<'s, v8::Value> {
+    let elements: Vec<v8::Local<v8::Value>> = ids
+        .iter()
+        .map(|id| v8::Number::new(scope, id.0 as f64).into())
+        .collect();
+    v8::Array::new_with_elements(scope, &elements).into()
+}
+
+/// Build a JS array of strings.
+fn js_str_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    items: &[String],
+) -> v8::Local<'s, v8::Value> {
+    let elements: Vec<v8::Local<v8::Value>> =
+        items.iter().map(|s| js_str(scope, s)).collect();
+    v8::Array::new_with_elements(scope, &elements).into()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Native primitive callbacks. These are bare functions (V8 callbacks cannot capture state); they
+// recover the shared DOM + console from the context slot via `host_state(scope)`. The JS
+// bootstrap (DOCUMENT_BOOTSTRAP) builds `document`/element objects on top of these.
+// ---------------------------------------------------------------------------------------------
+
+/// `__consoleLog(...args)` — push a space-joined line into the shared console buffer.
+fn prim_console_log(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let mut parts = Vec::with_capacity(args.length() as usize);
+    for i in 0..args.length() {
+        let v = args.get(i);
+        parts.push(render_value(scope, v));
+    }
+    let line = parts.join(" ");
+    host_state(scope).console.borrow_mut().push(line);
+}
+
+/// `__createElement(tag) -> id`
+fn prim_create_element(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let tag = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let id = state.doc.borrow_mut().alloc(
+        dom::NodeData::Element(dom::ElementData { tag, attrs: HashMap::new() }),
+        None,
+    );
+    rv.set_double(id.0 as f64);
+}
+
+/// `__createText(text) -> id`
+fn prim_create_text(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let text = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let id = state.doc.borrow_mut().alloc(dom::NodeData::Text(text), None);
+    rv.set_double(id.0 as f64);
+}
+
+/// `__createComment(text) -> id`
+fn prim_create_comment(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let text = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let id = state.doc.borrow_mut().alloc(dom::NodeData::Comment(text), None);
+    rv.set_double(id.0 as f64);
+}
+
+/// `__getAttr(id, name) -> string | null`
+fn prim_get_attr(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let name = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    let val = node.and_then(|n| match &state.doc.borrow().get(n).data {
+        dom::NodeData::Element(e) => e.attrs.get(&name).cloned(),
+        _ => None,
+    });
+    match val {
+        Some(v) => {
+            let s = js_str(scope, &v);
+            rv.set(s);
+        }
+        None => rv.set_null(),
+    }
+}
+
+/// `__setAttr(id, name, val)`
+fn prim_set_attr(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let name = arg_str(scope, &args, 1);
+    let value = arg_str(scope, &args, 2);
+    let state = host_state(scope);
+    if let Some(n) = node {
+        if let dom::NodeData::Element(e) = &mut state.doc.borrow_mut().get_mut(n).data {
+            e.attrs.insert(name, value);
+        }
+    }
+}
+
+/// `__removeAttr(id, name)`
+fn prim_remove_attr(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let name = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    if let Some(n) = node {
+        if let dom::NodeData::Element(e) = &mut state.doc.borrow_mut().get_mut(n).data {
+            e.attrs.remove(&name);
+        }
+    }
+}
+
+/// `__attrNames(id) -> [name...]`
+fn prim_attr_names(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let names: Vec<String> = node
+        .map(|n| match &state.doc.borrow().get(n).data {
+            dom::NodeData::Element(e) => e.attrs.keys().cloned().collect(),
+            _ => Vec::new(),
         })
-    }
-    .to_js_function(realm)
+        .unwrap_or_default();
+    let arr = js_str_array(scope, &names);
+    rv.set(arr);
 }
 
-/// Build a setter for the element attribute `name`.
-fn attr_setter(doc: &SharedDoc, realm: &boa_engine::realm::Realm, name: &'static str) -> boa_engine::object::builtins::JsFunction {
-    let doc = Rc::clone(doc);
-    unsafe {
-        NativeFunction::from_closure(move |this, args, ctx| {
-            let value = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-            if let Some(n) = node_id_of(this, ctx) {
-                if let dom::NodeData::Element(e) = &mut doc.borrow_mut().get_mut(n).data {
-                    e.attrs.insert(name.to_string(), value);
-                }
-            }
-            Ok(JsValue::undefined())
+/// `__appendChild(parentId, childId)` — reparent child under parent.
+fn prim_append_child(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let parent = arg_node(scope, &args, 0);
+    let child = arg_node(scope, &args, 1);
+    let state = host_state(scope);
+    if let (Some(parent), Some(child)) = (parent, child) {
+        let mut d = state.doc.borrow_mut();
+        if let Some(old_parent) = d.get(child).parent {
+            d.get_mut(old_parent).children.retain(|&c| c != child);
+        }
+        d.get_mut(child).parent = Some(parent);
+        d.get_mut(parent).children.push(child);
+    }
+}
+
+/// `__insertBefore(parentId, childId, refIdOrMinus1)`
+fn prim_insert_before(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let parent = arg_node(scope, &args, 0);
+    let child = arg_node(scope, &args, 1);
+    // ref is -1 (append) or a node id.
+    let ref_node = arg_node(scope, &args, 2);
+    let state = host_state(scope);
+    if let (Some(parent), Some(child)) = (parent, child) {
+        let mut d = state.doc.borrow_mut();
+        if let Some(old) = d.get(child).parent {
+            d.get_mut(old).children.retain(|&c| c != child);
+        }
+        d.get_mut(child).parent = Some(parent);
+        let pos = ref_node.and_then(|r| d.get(parent).children.iter().position(|&c| c == r));
+        match pos {
+            Some(i) => d.get_mut(parent).children.insert(i, child),
+            None => d.get_mut(parent).children.push(child),
+        }
+    }
+}
+
+/// `__removeChild(parentId, childId)`
+fn prim_remove_child(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let parent = arg_node(scope, &args, 0);
+    let child = arg_node(scope, &args, 1);
+    let state = host_state(scope);
+    if let (Some(parent), Some(child)) = (parent, child) {
+        let mut d = state.doc.borrow_mut();
+        d.get_mut(parent).children.retain(|&c| c != child);
+        if d.get(child).parent == Some(parent) {
+            d.get_mut(child).parent = None;
+        }
+    }
+}
+
+/// `__children(id) -> [id...]` (all child nodes, in order)
+fn prim_children(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let ids: Vec<dom::NodeId> = node
+        .map(|n| state.doc.borrow().get(n).children.clone())
+        .unwrap_or_default();
+    let arr = js_id_array(scope, &ids);
+    rv.set(arr);
+}
+
+/// `__parent(id) -> id | -1`
+fn prim_parent(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let parent = node.and_then(|n| state.doc.borrow().get(n).parent);
+    rv.set_double(parent.map(|p| p.0 as f64).unwrap_or(-1.0));
+}
+
+/// `__tag(id) -> string` (lowercased), or "" for non-elements.
+fn prim_tag(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let tag = node
+        .and_then(|n| match &state.doc.borrow().get(n).data {
+            dom::NodeData::Element(e) => Some(e.tag.to_ascii_lowercase()),
+            _ => None,
         })
+        .unwrap_or_default();
+    let s = js_str(scope, &tag);
+    rv.set(s);
+}
+
+/// `__nodeType(id) -> 1 | 3 | 8 | 9`
+fn prim_node_type(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let ty = node
+        .map(|n| match &state.doc.borrow().get(n).data {
+            dom::NodeData::Element(_) => 1,
+            dom::NodeData::Text(_) => 3,
+            dom::NodeData::Comment(_) => 8,
+            dom::NodeData::Document => 9,
+        })
+        .unwrap_or(1);
+    rv.set_int32(ty);
+}
+
+/// `__textContent(id) -> string`
+fn prim_text_content(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let s = node.map(|n| text_content(&state.doc.borrow(), n)).unwrap_or_default();
+    let v = js_str(scope, &s);
+    rv.set(v);
+}
+
+/// `__setTextContent(id, text)`
+fn prim_set_text_content(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let text = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    if let Some(n) = node {
+        set_text_content(&mut state.doc.borrow_mut(), n, &text);
     }
-    .to_js_function(realm)
 }
 
-/// Build a JS value for an optional element node: a wrapper object, or `null`.
-fn element_or_null(id: Option<dom::NodeId>, doc: &SharedDoc, context: &mut Context) -> JsValue {
-    match id {
-        Some(id) => JsValue::from(make_element(id, doc, context)),
-        None => JsValue::null(),
+/// `__innerHTML(id) -> string`
+fn prim_inner_html(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let s = node.map(|n| inner_html(&state.doc.borrow(), n)).unwrap_or_default();
+    let v = js_str(scope, &s);
+    rv.set(v);
+}
+
+/// `__setInnerHTML(id, html)`
+fn prim_set_inner_html(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let html = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    if let Some(n) = node {
+        set_inner_html(&mut state.doc.borrow_mut(), n, &html);
     }
 }
 
-/// Install the `document` global wired to the shared DOM: `getElementById`, `getElementsByTagName`,
-/// `querySelector`, `querySelectorAll`, `createElement` (methods), and `title`, `body`,
-/// `documentElement` (accessors).
-fn install_document(context: &mut Context, doc: &SharedDoc) {
-    let realm = context.realm().clone();
-
-    let get_by_id = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let id = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let found = find_by_id(&doc.borrow(), doc.borrow().root(), &id);
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
+/// `__getElementById(idStr) -> id | -1`
+fn prim_get_element_by_id(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let found = {
+        let d = state.doc.borrow();
+        find_by_id(&d, d.root(), &id)
     };
-
-    let get_by_tag = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let tag = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let mut ids = Vec::new();
-                {
-                    let d = doc.borrow();
-                    collect_by_tag(&d, d.root(), &tag, &mut ids);
-                }
-                let items: Vec<JsValue> =
-                    ids.into_iter().map(|n| JsValue::from(make_element(n, &doc, ctx))).collect();
-                let arr = JsArray::from_iter(items, ctx);
-                Ok(JsValue::from(arr))
-            })
-        }
-    };
-
-    let query = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let sel = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let found = query_selector(&doc.borrow(), &sel);
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-    };
-
-    let query_all = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let sel = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let ids = {
-                    let d = doc.borrow();
-                    query_selector_all(&d, &sel)
-                };
-                let items: Vec<JsValue> = ids
-                    .into_iter()
-                    .map(|n| JsValue::from(make_element(n, &doc, ctx)))
-                    .collect();
-                let arr = JsArray::from_iter(items, ctx);
-                Ok(JsValue::from(arr))
-            })
-        }
-    };
-
-    let get_by_class = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                // Match elements carrying ALL of the (space-separated) requested classes.
-                let raw = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let wanted: Vec<String> =
-                    raw.split_whitespace().map(|s| s.to_string()).collect();
-                let mut ids = Vec::new();
-                {
-                    let d = doc.borrow();
-                    fn walk(
-                        doc: &dom::Document,
-                        node: dom::NodeId,
-                        wanted: &[String],
-                        out: &mut Vec<dom::NodeId>,
-                    ) {
-                        if let dom::NodeData::Element(e) = &doc.get(node).data {
-                            if !wanted.is_empty()
-                                && wanted.iter().all(|w| e.classes().any(|c| c == w))
-                            {
-                                out.push(node);
-                            }
-                        }
-                        for &child in &doc.get(node).children {
-                            walk(doc, child, wanted, out);
-                        }
-                    }
-                    walk(&d, d.root(), &wanted, &mut ids);
-                }
-                let items: Vec<JsValue> = ids
-                    .into_iter()
-                    .map(|n| JsValue::from(make_element(n, &doc, ctx)))
-                    .collect();
-                let arr = JsArray::from_iter(items, ctx);
-                Ok(JsValue::from(arr))
-            })
-        }
-    };
-
-    // --- Native attribute accessors keyed by a node-id argument. The browser-env bootstrap
-    // uses these to back live `style`/`classList`/`dataset` on element wrappers, reading and
-    // writing the real DOM `attrs` so JS-driven changes survive into re-cascade. ---
-    let raw_get_attr = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let node = args.first().and_then(|v| v.as_number()).map(|n| dom::NodeId(n as usize));
-                let name = args.get(1).map(|a| render_value(a, ctx)).unwrap_or_default();
-                let val = node.and_then(|n| match &doc.borrow().get(n).data {
-                    dom::NodeData::Element(e) => e.attrs.get(&name).cloned(),
-                    _ => None,
-                });
-                Ok(match val {
-                    Some(v) => JsValue::from(js_string!(v)),
-                    None => JsValue::null(),
-                })
-            })
-        }
-    };
-    let raw_set_attr = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let node = args.first().and_then(|v| v.as_number()).map(|n| dom::NodeId(n as usize));
-                let name = args.get(1).map(|a| render_value(a, ctx)).unwrap_or_default();
-                let value = args.get(2).map(|a| render_value(a, ctx)).unwrap_or_default();
-                if let Some(n) = node {
-                    if let dom::NodeData::Element(e) = &mut doc.borrow_mut().get_mut(n).data {
-                        e.attrs.insert(name, value);
-                    }
-                }
-                Ok(JsValue::undefined())
-            })
-        }
-    };
-    let raw_remove_attr = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let node = args.first().and_then(|v| v.as_number()).map(|n| dom::NodeId(n as usize));
-                let name = args.get(1).map(|a| render_value(a, ctx)).unwrap_or_default();
-                if let Some(n) = node {
-                    if let dom::NodeData::Element(e) = &mut doc.borrow_mut().get_mut(n).data {
-                        e.attrs.remove(&name);
-                    }
-                }
-                Ok(JsValue::undefined())
-            })
-        }
-    };
-
-    let create_element = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let tag = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let id = {
-                    let mut d = doc.borrow_mut();
-                    d.alloc(
-                        dom::NodeData::Element(dom::ElementData {
-                            tag,
-                            attrs: std::collections::HashMap::new(),
-                        }),
-                        None,
-                    )
-                };
-                Ok(JsValue::from(make_element(id, &doc, ctx)))
-            })
-        }
-    };
-
-    // title getter/setter
-    let title_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, _args, _ctx| {
-                let d = doc.borrow();
-                let s = find_by_tag(&d, d.root(), "title")
-                    .map(|n| text_content(&d, n))
-                    .unwrap_or_default();
-                Ok(JsValue::from(js_string!(s)))
-            })
-        }
-        .to_js_function(&realm)
-    };
-    let title_set = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, args, ctx| {
-                let text = args.first().map(|a| render_value(a, ctx)).unwrap_or_default();
-                let title = {
-                    let d = doc.borrow();
-                    find_by_tag(&d, d.root(), "title")
-                };
-                if let Some(n) = title {
-                    set_text_content(&mut doc.borrow_mut(), n, &text);
-                }
-                Ok(JsValue::undefined())
-            })
-        }
-        .to_js_function(&realm)
-    };
-
-    let body_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, _args, ctx| {
-                let found = {
-                    let d = doc.borrow();
-                    find_by_tag(&d, d.root(), "body")
-                };
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-        .to_js_function(&realm)
-    };
-
-    let doc_el_get = {
-        let doc = Rc::clone(doc);
-        unsafe {
-            NativeFunction::from_closure(move |_this, _args, ctx| {
-                let found = {
-                    let d = doc.borrow();
-                    find_by_tag(&d, d.root(), "html")
-                };
-                Ok(element_or_null(found, &doc, ctx))
-            })
-        }
-        .to_js_function(&realm)
-    };
-
-    let attr = Attribute::all();
-    let document = ObjectInitializer::new(context)
-        .function(get_by_id, js_string!("getElementById"), 1)
-        .function(get_by_tag, js_string!("getElementsByTagName"), 1)
-        .function(get_by_class, js_string!("getElementsByClassName"), 1)
-        .function(query, js_string!("querySelector"), 1)
-        .function(query_all, js_string!("querySelectorAll"), 1)
-        .function(create_element, js_string!("createElement"), 1)
-        .function(raw_get_attr, js_string!("__getAttr"), 2)
-        .function(raw_set_attr, js_string!("__setAttr"), 3)
-        .function(raw_remove_attr, js_string!("__removeAttr"), 2)
-        .accessor(js_string!("title"), Some(title_get), Some(title_set), attr)
-        .accessor(js_string!("body"), Some(body_get), None, attr)
-        .accessor(js_string!("documentElement"), Some(doc_el_get), None, attr)
-        .build();
-
-    context
-        .register_global_property(js_string!("document"), document, Attribute::all())
-        .expect("register document global");
+    rv.set_double(found.map(|n| n.0 as f64).unwrap_or(-1.0));
 }
 
-/// Install a minimal `console` global whose `log`/`info`/`warn`/`error` push a formatted,
-/// space-separated line into the shared buffer. We register our own native functions rather
-/// than `boa_runtime::Console` so output is captured into our buffer instead of stdout.
-fn install_console(context: &mut Context, buffer: &Rc<RefCell<Vec<String>>>) {
-    let make_logger = |buffer: Rc<RefCell<Vec<String>>>| {
-        // SAFETY: the closure captures only an `Rc<RefCell<Vec<String>>>`, which contains no
-        // GC-traceable (`Trace`) values. Per `from_closure`'s contract, capturing only
-        // non-traceable data is sound — there is nothing the GC needs to walk.
-        unsafe {
-            NativeFunction::from_closure(
-                move |_this: &JsValue, args: &[JsValue], ctx: &mut Context| -> JsResult<JsValue> {
-                    let line = args
-                        .iter()
-                        .map(|a| stringify_arg(a, ctx))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    buffer.borrow_mut().push(line);
-                    Ok(JsValue::undefined())
-                },
-            )
-        }
+/// `__querySelectorAll(sel) -> [id...]`
+fn prim_query_selector_all(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let sel = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let ids = {
+        let d = state.doc.borrow();
+        query_selector_all(&d, &sel)
     };
-
-    let console = ObjectInitializer::new(context)
-        .function(make_logger(Rc::clone(buffer)), js_string!("log"), 0)
-        .function(make_logger(Rc::clone(buffer)), js_string!("info"), 0)
-        .function(make_logger(Rc::clone(buffer)), js_string!("warn"), 0)
-        .function(make_logger(Rc::clone(buffer)), js_string!("error"), 0)
-        .function(make_logger(Rc::clone(buffer)), js_string!("debug"), 0)
-        .build();
-
-    context
-        .register_global_property(js_string!("console"), console, boa_engine::property::Attribute::all())
-        .expect("register console global");
+    let arr = js_id_array(scope, &ids);
+    rv.set(arr);
 }
 
-/// JS bootstrap implementing the timer / event-loop APIs.
-///
-/// The whole queue (including the user-supplied callbacks) lives on a reachable JS object so
-/// Boa's GC roots the callbacks for us — we deliberately keep no Boa `JsValue`/`JsObject` in
-/// Rust-side state, which would break GC rooting (see the `from_closure` SAFETY notes above).
-/// Rust only *drives* the loop by calling `globalThis.__runDueTimers()` and reading the
-/// `__timerErrors` array; all scheduling logic is here.
-///
-/// Since the runtime never actually sleeps, `delay` only establishes ordering: the next due
-/// timer is always the one with the smallest `when` (ties broken by id = insertion order), and
-/// running it advances the virtual clock `__eventLoop.now` to its `when`.
+/// `__querySelectorAllWithin(rootId, sel) -> [id...]`
+fn prim_query_selector_all_within(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let root = arg_node(scope, &args, 0);
+    let sel = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    let ids = match root {
+        Some(root) => {
+            let d = state.doc.borrow();
+            query_within(&d, root, &sel)
+        }
+        None => Vec::new(),
+    };
+    let arr = js_id_array(scope, &ids);
+    rv.set(arr);
+}
+
+/// `__getElementsByTagName(tag) -> [id...]` (whole document)
+fn prim_get_elements_by_tag_name(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let tag = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let mut ids = Vec::new();
+    {
+        let d = state.doc.borrow();
+        collect_by_tag(&d, d.root(), &tag, &mut ids);
+    }
+    let arr = js_id_array(scope, &ids);
+    rv.set(arr);
+}
+
+/// `__getElementsByTagNameWithin(rootId, tag) -> [id...]` (excludes root itself)
+fn prim_get_elements_by_tag_name_within(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let root = arg_node(scope, &args, 0);
+    let tag = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    let mut ids = Vec::new();
+    if let Some(root) = root {
+        let d = state.doc.borrow();
+        for &child in &d.get(root).children {
+            collect_by_tag(&d, child, &tag, &mut ids);
+        }
+    }
+    let arr = js_id_array(scope, &ids);
+    rv.set(arr);
+}
+
+/// `__getElementsByClassName(cls) -> [id...]` (space-separated = all required)
+fn prim_get_elements_by_class_name(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let raw = arg_str(scope, &args, 0);
+    let wanted: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
+    let state = host_state(scope);
+    let mut ids = Vec::new();
+    {
+        let d = state.doc.borrow();
+        collect_by_class(&d, d.root(), &wanted, &mut ids);
+    }
+    let arr = js_id_array(scope, &ids);
+    rv.set(arr);
+}
+
+/// `__documentElementId() -> id | -1` (the <html> element)
+fn prim_document_element_id(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let found = {
+        let d = state.doc.borrow();
+        find_by_tag(&d, d.root(), "html")
+    };
+    rv.set_double(found.map(|n| n.0 as f64).unwrap_or(-1.0));
+}
+
+/// `__bodyId() -> id | -1`
+fn prim_body_id(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let found = {
+        let d = state.doc.borrow();
+        find_by_tag(&d, d.root(), "body")
+    };
+    rv.set_double(found.map(|n| n.0 as f64).unwrap_or(-1.0));
+}
+
+/// `__headId() -> id | -1`
+fn prim_head_id(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let found = {
+        let d = state.doc.borrow();
+        find_by_tag(&d, d.root(), "head")
+    };
+    rv.set_double(found.map(|n| n.0 as f64).unwrap_or(-1.0));
+}
+
+/// `__rootId() -> id` (the Document root node)
+fn prim_root_id(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let root = state.doc.borrow().root();
+    rv.set_double(root.0 as f64);
+}
+
+/// `__titleText() -> string`
+fn prim_title_text(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let s = {
+        let d = state.doc.borrow();
+        find_by_tag(&d, d.root(), "title").map(|n| text_content(&d, n)).unwrap_or_default()
+    };
+    let v = js_str(scope, &s);
+    rv.set(v);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Installation: register native primitives + evaluate the JS bootstrap onto a fresh context.
+// ---------------------------------------------------------------------------------------------
+
+/// Define a native function on `target` under `name`.
+fn set_fn(
+    scope: &mut v8::PinScope,
+    target: v8::Local<v8::Object>,
+    name: &str,
+    cb: impl v8::MapFnTo<v8::FunctionCallback>,
+) {
+    let func = v8::Function::new(scope, cb).unwrap();
+    let key = v8::String::new(scope, name).unwrap();
+    target.set(scope, key.into(), func.into());
+}
+
+/// Install the `__consoleLog` native sink. The JS `console` object (built in the bootstrap) calls
+/// it. On the no-DOM `Runtime::eval` path it is the only thing installed besides timers.
+fn install_console_sink(scope: &mut v8::PinScope, global: v8::Local<v8::Object>) {
+    set_fn(scope, global, "__consoleLog", prim_console_log);
+    // A minimal `console` whose methods all funnel into `__consoleLog`. (The browser-env bootstrap
+    // does not touch console; this is the canonical one used everywhere.)
+    let src = r#"
+    (function () {
+      function log() { __consoleLog.apply(null, Array.prototype.slice.call(arguments)); }
+      globalThis.console = { log: log, info: log, warn: log, error: log, debug: log,
+        trace: log, dir: log, table: log, group: log, groupEnd: function(){}, groupCollapsed: log,
+        assert: function(c){ if(!c){ log.apply(null, Array.prototype.slice.call(arguments,1)); } },
+        count: function(){}, time: function(){}, timeEnd: function(){} };
+    })();
+    "#;
+    eval_internal(scope, src, "<console>");
+}
+
+/// Install the node-id DOM primitives onto `globalThis`.
+fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object>) {
+    set_fn(scope, global, "__createElement", prim_create_element);
+    set_fn(scope, global, "__createText", prim_create_text);
+    set_fn(scope, global, "__createComment", prim_create_comment);
+    set_fn(scope, global, "__getAttr", prim_get_attr);
+    set_fn(scope, global, "__setAttr", prim_set_attr);
+    set_fn(scope, global, "__removeAttr", prim_remove_attr);
+    set_fn(scope, global, "__attrNames", prim_attr_names);
+    set_fn(scope, global, "__appendChild", prim_append_child);
+    set_fn(scope, global, "__insertBefore", prim_insert_before);
+    set_fn(scope, global, "__removeChild", prim_remove_child);
+    set_fn(scope, global, "__children", prim_children);
+    set_fn(scope, global, "__parent", prim_parent);
+    set_fn(scope, global, "__tag", prim_tag);
+    set_fn(scope, global, "__nodeType", prim_node_type);
+    set_fn(scope, global, "__textContent", prim_text_content);
+    set_fn(scope, global, "__setTextContent", prim_set_text_content);
+    set_fn(scope, global, "__innerHTML", prim_inner_html);
+    set_fn(scope, global, "__setInnerHTML", prim_set_inner_html);
+    set_fn(scope, global, "__getElementById", prim_get_element_by_id);
+    set_fn(scope, global, "__querySelectorAll", prim_query_selector_all);
+    set_fn(scope, global, "__querySelectorAllWithin", prim_query_selector_all_within);
+    set_fn(scope, global, "__getElementsByTagName", prim_get_elements_by_tag_name);
+    set_fn(scope, global, "__getElementsByTagNameWithin", prim_get_elements_by_tag_name_within);
+    set_fn(scope, global, "__getElementsByClassName", prim_get_elements_by_class_name);
+    set_fn(scope, global, "__documentElementId", prim_document_element_id);
+    set_fn(scope, global, "__bodyId", prim_body_id);
+    set_fn(scope, global, "__headId", prim_head_id);
+    set_fn(scope, global, "__rootId", prim_root_id);
+    set_fn(scope, global, "__titleText", prim_title_text);
+}
+
+/// Compile+run a script in the current context, ignoring the result. Used for bootstraps where a
+/// failure would be a build-time bug (we surface it via a panic in debug-style assertions).
+fn eval_internal(scope: &mut v8::PinScope, source: &str, name: &str) -> bool {
+    v8::tc_scope!(let tc, scope);
+    let code = match v8::String::new(tc, source) {
+        Some(c) => c,
+        None => return false,
+    };
+    let resource = v8::String::new(tc, name).unwrap();
+    let origin = v8::ScriptOrigin::new(
+        tc,
+        resource.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let script = match v8::Script::compile(tc, code, Some(&origin)) {
+        Some(s) => s,
+        None => return false,
+    };
+    script.run(tc).is_some()
+}
+
+/// Install the full DOM-aware browser environment into the current context: console, the DOM
+/// primitives + JS `document`/element layer, the timer/event loop, and the navigator/location/etc.
+/// bootstrap. `__pageURL` is set as a real string value (no source interpolation) before the
+/// browser-env bootstrap reads it.
+fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
+    let global = scope.get_current_context().global(scope);
+    install_console_sink(scope, global);
+    install_dom_primitives(scope, global);
+    // Build `window`/`self`/`globalThis` aliases + the JS `document` over the primitives.
+    eval_internal(scope, DOCUMENT_BOOTSTRAP, "<document>");
+    // Timers / event loop.
+    eval_internal(scope, TIMERS_BOOTSTRAP, "<timers>");
+    // Set the page URL as a real string value, then run the browser-env bootstrap.
+    let key = v8::String::new(scope, "__pageURL").unwrap();
+    let val = js_str(scope, url);
+    global.set(scope, key.into(), val);
+    eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
+}
+
+/// JS bootstrap that builds `window`/`self`/`globalThis` aliases and the `document` object +
+/// element wrapper layer on top of the node-id native primitives (`__createElement`, `__getAttr`,
+/// `__appendChild`, ...). This replaces the old Rust-side per-node wrapper closures: every element
+/// is a plain JS object carrying a hidden `__node` id, with accessors/methods that call the
+/// primitives. The browser-env bootstrap's `canon`/`enrichElement` machinery then layers wrapper
+/// caching, `style`/`classList`/`dataset` write-through, and the DOM interface prototype chain on
+/// top — exactly as before — because these wrappers expose the same shape the old native layer did
+/// (fresh object carrying `__node`, with the same method/accessor names).
+const DOCUMENT_BOOTSTRAP: &str = r##"
+(function () {
+  function def(obj, name, value) {
+    Object.defineProperty(obj, name, { value: value, enumerable: false, configurable: true, writable: true });
+  }
+
+  // window / self aliases (globalThis already exists).
+  globalThis.window = globalThis;
+  globalThis.self = globalThis;
+  // Minimal location stub (overwritten by the browser-env bootstrap).
+  globalThis.location = { href: "" };
+
+  var NODE = "__node";
+
+  // Build a fresh element wrapper object for a node id. Carries `__node` plus accessors/methods
+  // that delegate to the native primitives. Returns null for id === -1.
+  function wrap(id) {
+    if (typeof id !== "number" || id < 0) { return null; }
+    var el = {};
+    def(el, NODE, id);
+
+    function uc(s) { return String(s == null ? "" : s).toUpperCase(); }
+
+    Object.defineProperty(el, "tagName", { get: function () { return uc(__tag(id)); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "nodeName", { get: function () {
+      var t = __nodeType(id);
+      if (t === 3) { return "#text"; }
+      if (t === 8) { return "#comment"; }
+      if (t === 9) { return "#document"; }
+      return uc(__tag(id));
+    }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "nodeType", { get: function () { return __nodeType(id); }, enumerable: true, configurable: true });
+
+    Object.defineProperty(el, "textContent", {
+      get: function () { return __textContent(id); },
+      set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(el, "innerHTML", {
+      get: function () { return __innerHTML(id); },
+      set: function (v) { __setInnerHTML(id, v == null ? "" : String(v)); },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(el, "outerHTML", {
+      get: function () { try { return __innerHTML(__parent(id) >= 0 ? id : id); } catch (e) { return ""; } },
+      enumerable: true, configurable: true
+    });
+
+    Object.defineProperty(el, "id", {
+      get: function () { var v = __getAttr(id, "id"); return v == null ? "" : v; },
+      set: function (v) { __setAttr(id, "id", v == null ? "" : String(v)); },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(el, "className", {
+      get: function () { var v = __getAttr(id, "class"); return v == null ? "" : v; },
+      set: function (v) { __setAttr(id, "class", v == null ? "" : String(v)); },
+      enumerable: true, configurable: true
+    });
+
+    def(el, "getAttribute", function (name) { return __getAttr(id, String(name)); });
+    def(el, "setAttribute", function (name, value) { __setAttr(id, String(name), value == null ? "" : String(value)); });
+    def(el, "removeAttribute", function (name) { __removeAttr(id, String(name)); });
+    def(el, "hasAttribute", function (name) { return __getAttr(id, String(name)) != null; });
+    def(el, "getAttributeNames", function () { return __attrNames(id); });
+
+    def(el, "appendChild", function (child) {
+      if (child && typeof child.__node === "number") { __appendChild(id, child.__node); }
+      return child;
+    });
+    def(el, "removeChild", function (child) {
+      if (child && typeof child.__node === "number") { __removeChild(id, child.__node); }
+      return child;
+    });
+    def(el, "insertBefore", function (newNode, refNode) {
+      if (newNode && typeof newNode.__node === "number") {
+        var refId = (refNode && typeof refNode.__node === "number") ? refNode.__node : -1;
+        __insertBefore(id, newNode.__node, refId);
+      }
+      return newNode;
+    });
+    def(el, "replaceChild", function (newNode, oldNode) {
+      if (newNode && typeof newNode.__node === "number" && oldNode && typeof oldNode.__node === "number") {
+        __insertBefore(id, newNode.__node, oldNode.__node);
+        __removeChild(id, oldNode.__node);
+      }
+      return oldNode;
+    });
+    def(el, "remove", function () { var p = __parent(id); if (p >= 0) { __removeChild(p, id); } });
+    def(el, "append", function () {
+      for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; if (c && typeof c.__node === "number") { __appendChild(id, c.__node); } }
+    });
+    def(el, "prepend", function () {
+      var kids = __children(id); var first = kids.length ? kids[0] : -1;
+      for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; if (c && typeof c.__node === "number") { __insertBefore(id, c.__node, first); } }
+    });
+
+    def(el, "contains", function (other) {
+      if (!other || typeof other.__node !== "number") { return false; }
+      var cur = other.__node;
+      while (cur >= 0) { if (cur === id) { return true; } cur = __parent(cur); }
+      return false;
+    });
+
+    def(el, "querySelector", function (sel) { var r = __querySelectorAllWithin(id, String(sel)); return r.length ? wrap(r[0]) : null; });
+    def(el, "querySelectorAll", function (sel) { return __querySelectorAllWithin(id, String(sel)).map(wrap); });
+    def(el, "getElementsByTagName", function (tag) { return __getElementsByTagNameWithin(id, String(tag)).map(wrap); });
+    def(el, "getElementsByClassName", function (cls) {
+      // Scope getElementsByClassName by filtering the global result to descendants of `id`.
+      var wanted = String(cls).split(/\s+/).filter(Boolean);
+      var all = __getElementsByClassName(String(cls));
+      var out = [];
+      for (var i = 0; i < all.length; i++) {
+        var cur = __parent(all[i]); var isDesc = false;
+        while (cur >= 0) { if (cur === id) { isDesc = true; break; } cur = __parent(cur); }
+        if (isDesc) { out.push(wrap(all[i])); }
+      }
+      return out;
+    });
+
+    def(el, "matches", function (sel) {
+      // An element matches `sel` if it appears in the document-wide result set.
+      var r = __querySelectorAll(String(sel));
+      for (var i = 0; i < r.length; i++) { if (r[i] === id) { return true; } }
+      return false;
+    });
+    def(el, "closest", function (sel) {
+      var cur = id;
+      while (cur >= 0) {
+        var w = wrap(cur);
+        if (w && w.matches(sel)) { return w; }
+        cur = __parent(cur);
+      }
+      return null;
+    });
+
+    // Navigation accessors (return fresh wrappers; the enrich layer canonicalizes them).
+    function childList(elementsOnly) {
+      var kids = __children(id); var out = [];
+      for (var i = 0; i < kids.length; i++) {
+        if (!elementsOnly || __nodeType(kids[i]) === 1) { out.push(wrap(kids[i])); }
+      }
+      return out;
+    }
+    Object.defineProperty(el, "children", { get: function () { return childList(true); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "childNodes", { get: function () { return childList(false); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "parentNode", { get: function () { return wrap(__parent(id)); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "parentElement", { get: function () { var p = __parent(id); return (p >= 0 && __nodeType(p) === 1) ? wrap(p) : (p >= 0 ? wrap(p) : null); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "firstChild", { get: function () { var k = __children(id); return k.length ? wrap(k[0]) : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "lastChild", { get: function () { var k = __children(id); return k.length ? wrap(k[k.length - 1]) : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "firstElementChild", { get: function () { var c = childList(true); return c.length ? c[0] : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "lastElementChild", { get: function () { var c = childList(true); return c.length ? c[c.length - 1] : null; }, enumerable: true, configurable: true });
+
+    function sibling(next, elementOnly) {
+      var p = __parent(id); if (p < 0) { return null; }
+      var sibs = __children(p);
+      var idx = sibs.indexOf(id); if (idx < 0) { return null; }
+      var i = idx;
+      while (true) {
+        if (next) { i++; if (i >= sibs.length) { return null; } }
+        else { i--; if (i < 0) { return null; } }
+        if (!elementOnly || __nodeType(sibs[i]) === 1) { return wrap(sibs[i]); }
+      }
+    }
+    Object.defineProperty(el, "nextSibling", { get: function () { return sibling(true, false); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "previousSibling", { get: function () { return sibling(false, false); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "nextElementSibling", { get: function () { return sibling(true, true); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "previousElementSibling", { get: function () { return sibling(false, true); }, enumerable: true, configurable: true });
+
+    return el;
+  }
+  def(globalThis, "__wrapNode", wrap);
+
+  // --- document --------------------------------------------------------------------------------
+  var document = {};
+  def(document, "getElementById", function (idStr) { var n = __getElementById(String(idStr)); return n >= 0 ? wrap(n) : null; });
+  def(document, "getElementsByTagName", function (tag) { return __getElementsByTagName(String(tag)).map(wrap); });
+  def(document, "getElementsByClassName", function (cls) { return __getElementsByClassName(String(cls)).map(wrap); });
+  def(document, "querySelector", function (sel) { var r = __querySelectorAll(String(sel)); return r.length ? wrap(r[0]) : null; });
+  def(document, "querySelectorAll", function (sel) { return __querySelectorAll(String(sel)).map(wrap); });
+  def(document, "createElement", function (tag) { return wrap(__createElement(String(tag))); });
+  // Node-id-keyed attribute helpers the browser-env bootstrap uses for style/classList/dataset.
+  def(document, "__getAttr", function (node, name) { return __getAttr(node, String(name)); });
+  def(document, "__setAttr", function (node, name, value) { __setAttr(node, String(name), value == null ? "" : String(value)); });
+  def(document, "__removeAttr", function (node, name) { __removeAttr(node, String(name)); });
+
+  Object.defineProperty(document, "title", {
+    get: function () { return __titleText(); },
+    set: function (v) {
+      var head = __headId();
+      var t = -1;
+      var all = __getElementsByTagName("title");
+      if (all.length) { t = all[0]; }
+      if (t < 0) {
+        t = __createElement("title");
+        var parent = head >= 0 ? head : __documentElementId();
+        if (parent >= 0) { __appendChild(parent, t); }
+      }
+      if (t >= 0) { __setTextContent(t, v == null ? "" : String(v)); }
+    },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(document, "body", { get: function () { var n = __bodyId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "documentElement", { get: function () { var n = __documentElementId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "head", { get: function () { var n = __headId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
+  def(document, "nodeType", 9);
+
+  globalThis.document = document;
+})();
+"##;
+
+/// JS bootstrap implementing the timer / event-loop APIs. Engine-agnostic — reused verbatim.
+/// All scheduling lives here; Rust only drives via `__runDueTimers()` and reads `__timerErrors`.
 const TIMERS_BOOTSTRAP: &str = r#"
 (function () {
   var loop = { timers: [], micro: [], nextId: 1, now: 0 };
@@ -1832,30 +1431,12 @@ const TIMERS_BOOTSTRAP: &str = r#"
 })();
 "#;
 
-/// Install the timer / event-loop APIs (`setTimeout`, `setInterval`, `clearTimeout`,
-/// `clearInterval`, `queueMicrotask`, `requestAnimationFrame`/`cancelAnimationFrame`) by
-/// evaluating [`TIMERS_BOOTSTRAP`]. Must be called after `install_globals` so `globalThis`
-/// aliases exist (it only touches `globalThis`, so it also works without them).
-fn install_timers(context: &mut Context) {
-    context
-        .eval(Source::from_bytes(TIMERS_BOOTSTRAP))
-        .expect("install timer bootstrap");
-}
-
-/// JS bootstrap implementing a standard "browser environment" of global APIs (`navigator`,
-/// `location`, `history`, `localStorage`/`sessionStorage`, `screen`, window metrics,
-/// `matchMedia`, `getComputedStyle`, a no-op event model + DOM lifecycle dispatch, and a grab
-/// bag of presence stubs like `fetch`/`XMLHttpRequest`/`crypto`/`btoa`).
-///
-/// Everything is implemented as real reachable JS objects so feature-detection code that does
-/// `Object.keys(navigator)` / `Object.assign({}, navigator)` / spreads / iterates these APIs
-/// does not throw on missing globals. Callbacks registered here live on reachable JS objects,
-/// so Boa's GC roots them for us — we keep no Boa values in Rust state (same discipline as
-/// [`TIMERS_BOOTSTRAP`]).
-///
-/// `location` and the document URL fields are populated from `globalThis.__pageURL`, which Rust
-/// sets via a native string property *before* this bootstrap runs (so there is no string
-/// interpolation of the URL into JS source — no quoting/injection hazard).
+/// JS bootstrap implementing the standard browser environment (navigator/location/history/
+/// storage/screen/matchMedia/getComputedStyle/event model/observers/URL/etc.) plus the per-node
+/// wrapper cache, `style`/`classList`/`dataset` write-through, and the DOM interface class
+/// hierarchy. Engine-agnostic — reused verbatim from the prior implementation; it talks to the
+/// document via the JS `document` layer + the node-id `document.__getAttr/__setAttr/__removeAttr`
+/// helpers (now built over the native primitives in DOCUMENT_BOOTSTRAP).
 const BROWSER_ENV_BOOTSTRAP: &str = r#"
 (function () {
   function def(obj, name, value) {
@@ -2868,62 +2449,98 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 })();
 "#;
 
-/// Install the browser environment APIs by:
-/// 1. setting `globalThis.__pageURL` to `url` via a native string property (no JS-source
-///    interpolation, so the URL can contain quotes/backslashes safely), then
-/// 2. evaluating [`BROWSER_ENV_BOOTSTRAP`], which reads `__pageURL` to populate `location` and
-///    the document URL fields and defines everything else.
-///
-/// Must be called *after* `install_globals`/`install_document`/`install_timers`: it overwrites
-/// the minimal `location`, patches `document` (cookie, lifecycle, element enrichment), and uses
-/// `setTimeout`/`__timerErrors` from the timer bootstrap.
-fn install_browser_env(context: &mut Context, url: &str) {
-    // Pass the URL as a real JS string value (not interpolated into source) to avoid any
-    // quoting/injection issues with odd characters in the URL.
-    context
-        .register_global_property(
-            js_string!("__pageURL"),
-            JsValue::from(js_string!(url)),
-            Attribute::all(),
-        )
-        .expect("register __pageURL global");
-    context
-        .eval(Source::from_bytes(BROWSER_ENV_BOOTSTRAP))
-        .expect("install browser env bootstrap");
-}
+// ---------------------------------------------------------------------------------------------
+// Event loop drain + script evaluation against a V8 context.
+// ---------------------------------------------------------------------------------------------
 
-/// Maximum number of `__runDueTimers()` task iterations to run when draining the event loop.
-/// Bounds runaway `setInterval`/self-rescheduling timers so the loop can never hang.
+/// Maximum number of `__runDueTimers()` iterations when draining the event loop.
 const EVENT_LOOP_CAP: usize = 10_000;
 
-/// Drive the event loop to completion (or [`EVENT_LOOP_CAP`]) after all page sources have run.
-///
-/// Each iteration: (a) run Boa's pending promise jobs via `context.run_jobs()`, then (b) call
-/// `globalThis.__runDueTimers()` and inspect its boolean result; stop when it returns `false`
-/// (queue empty) or the cap is hit. Any `console.*` output produced by timer callbacks lands in
-/// the shared `console` buffer; together with the JS-side `__timerErrors` array, it is folded
-/// into `results` (appended to the last source's [`EvalOutput`], or a synthetic trailing one if
-/// `results` is empty).
-fn drain_event_loop(
-    context: &mut Context,
-    console: &Rc<RefCell<Vec<String>>>,
-    results: &mut [EvalOutput],
-) {
-    // Console may carry leftovers from the last source's eval that were already attached; start
-    // fresh so we only pick up output produced during the drain.
-    console.borrow_mut().clear();
+/// Compile + run a single source string in the current context, capturing console + error.
+/// Drains the per-call console buffer of the [`HostState`] into the result. Never panics on a JS
+/// error: it is captured into `EvalOutput.error` via a `TryCatch`.
+fn eval_source(scope: &mut v8::PinScope, source: &str, name: &str) -> EvalOutput {
+    // Clear any leftover console from a prior call so this result only captures its own output.
+    if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
+        state.console.borrow_mut().clear();
+    }
 
-    // Fire the DOM lifecycle events (readystatechange/DOMContentLoaded/load) now that page
-    // scripts have registered their handlers, so deferred init runs. Defined by the browser-env
-    // bootstrap; a no-op (and harmless) on the non-DOM `eval_batch` path where it's absent.
-    let _ = context.eval(Source::from_bytes(
+    let result = {
+        v8::tc_scope!(let tc, scope);
+        let code = match v8::String::new(tc, source) {
+            Some(c) => c,
+            None => {
+                return EvalOutput {
+                    value: None,
+                    console: Vec::new(),
+                    error: Some("source too large for the JS engine".to_string()),
+                };
+            }
+        };
+        let resource = v8::String::new(tc, name).unwrap();
+        let origin = v8::ScriptOrigin::new(
+            tc, resource.into(), 0, 0, false, 0, None, false, false, false, None,
+        );
+        match v8::Script::compile(tc, code, Some(&origin)) {
+            Some(script) => match script.run(tc) {
+                Some(value) => {
+                    let rendered = if value.is_undefined() {
+                        None
+                    } else {
+                        Some(render_value(tc, value))
+                    };
+                    Ok(rendered)
+                }
+                None => Err(format_exception(tc)),
+            },
+            None => Err(format_exception(tc)),
+        }
+    };
+
+    // Drain captured console.
+    let console = scope
+        .get_current_context()
+        .get_slot::<HostState>()
+        .map(|s| std::mem::take(&mut *s.console.borrow_mut()))
+        .unwrap_or_default();
+
+    match result {
+        Ok(value) => EvalOutput { value, console, error: None },
+        Err(error) => EvalOutput { value: None, console, error: Some(error) },
+    }
+}
+
+/// Format a caught exception (message + stack) into an error string matching the prior shape.
+fn format_exception(tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>) -> String {
+    if let Some(exception) = tc.exception() {
+        // Prefer a stack trace if present; otherwise fall back to the exception's string form.
+        if let Some(stack) = tc.stack_trace() {
+            let s = stack.to_rust_string_lossy(tc);
+            if !s.is_empty() {
+                return s;
+            }
+        }
+        return exception.to_rust_string_lossy(tc);
+    }
+    "uncaught exception".to_string()
+}
+
+/// Drive the event loop to completion (or the time/iteration cap) after page sources have run.
+/// Fires the DOM lifecycle events, then alternates V8 microtask checkpoints with the JS
+/// `__runDueTimers()` driver. Folds any console output + `__timerErrors` produced during the
+/// drain into the last result (matching the prior behavior).
+fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) {
+    if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
+        state.console.borrow_mut().clear();
+    }
+
+    // Fire lifecycle events (readystatechange/DOMContentLoaded/load); a no-op on the non-DOM path.
+    eval_internal(
+        scope,
         "if (typeof __fireLifecycleEvents === 'function') { __fireLifecycleEvents(); }",
-    ));
+        "<lifecycle>",
+    );
 
-    // Wall-clock budget: pages with self-rescheduling `requestAnimationFrame`/`setInterval`
-    // loops (e.g. Vue render loops) never drain to empty, so without a time cap we'd spin until
-    // EVENT_LOOP_CAP — minutes of work. Real browsers render frames continuously and never block
-    // a load; we approximate by draining for a bounded slice, then painting whatever state exists.
     let start = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(3000);
     let mut iterations = 0usize;
@@ -2931,25 +2548,28 @@ fn drain_event_loop(
         if iterations >= EVENT_LOOP_CAP || start.elapsed() >= budget {
             break;
         }
-        // Run any pending promise reaction jobs (e.g. resolved `Promise.then`). 0.21 exposes
-        // `Context::run_jobs() -> JsResult<()>`; ignore its result so a rejected promise job
-        // doesn't abort the drain.
-        let _ = context.run_jobs();
+        // Run any pending V8 microtasks/promise jobs first.
+        scope.perform_microtask_checkpoint();
 
-        let ran = context.eval(Source::from_bytes("__runDueTimers()"));
+        // Then run one due timer/microtask from the JS event loop.
+        let ran = run_due_timers(scope);
         iterations += 1;
-        match ran {
-            Ok(v) if v.as_boolean() == Some(true) => continue,
-            _ => break, // false, undefined, or an error → nothing left to do.
+        if !ran {
+            // Nothing left in the JS loop; one more microtask checkpoint in case the last timer
+            // queued a job, then stop if still empty.
+            scope.perform_microtask_checkpoint();
+            if !run_due_timers(scope) {
+                break;
+            }
         }
     }
 
-    // Collect any errors recorded by timer/microtask callbacks.
+    // Collect timer/microtask errors recorded JS-side.
     let mut extra: Vec<String> = Vec::new();
-    if let Ok(errs) = context.eval(Source::from_bytes(
+    if let Some(joined) = eval_to_string(
+        scope,
         "(globalThis.__timerErrors || []).join('\\u0000')",
-    )) {
-        let joined = render_value(&errs, context);
+    ) {
         for e in joined.split('\u{0}') {
             if !e.is_empty() {
                 extra.push(format!("⚠ {e}"));
@@ -2957,35 +2577,496 @@ fn drain_event_loop(
         }
     }
 
-    // Console output produced during the drain (timer callbacks' `console.log`, etc.).
-    let drained = std::mem::take(&mut *console.borrow_mut());
+    let drained = scope
+        .get_current_context()
+        .get_slot::<HostState>()
+        .map(|s| std::mem::take(&mut *s.console.borrow_mut()))
+        .unwrap_or_default();
 
     if drained.is_empty() && extra.is_empty() {
         return;
     }
-
-    // Fold into the last source's output, or a synthetic trailing one if there were no sources.
     if let Some(last) = results.last_mut() {
         last.console.extend(drained);
         last.console.extend(extra);
     }
-    // When `results` is a borrowed slice we cannot push; the `eval_batch`/`run_with_dom` callers
-    // always pass at least one result for non-empty source lists, and an empty source list has
-    // no timers to drain — so the slice is only ever empty in the trivial no-op case.
 }
 
-/// Render a console argument to a reasonable string (numbers, strings, booleans, arrays…).
-fn stringify_arg(value: &JsValue, context: &mut Context) -> String {
-    render_value(value, context)
+/// Run `globalThis.__runDueTimers()` and return its boolean result (false if absent/empty).
+fn run_due_timers(scope: &mut v8::PinScope) -> bool {
+    eval_to_bool(scope, "(typeof __runDueTimers === 'function') && __runDueTimers()")
 }
 
-/// Render a `JsValue` to a display string, falling back to a coerced string conversion.
-fn render_value(value: &JsValue, context: &mut Context) -> String {
-    match value.to_string(context) {
-        Ok(js_str) => js_str.to_std_string_escaped(),
-        // `to_string` can throw (e.g. objects with a throwing `toString`); fall back.
-        Err(_) => value.display().to_string(),
+/// Evaluate an internal expression, returning its boolean coercion. Errors → false.
+fn eval_to_bool(scope: &mut v8::PinScope, source: &str) -> bool {
+    v8::tc_scope!(let tc, scope);
+    let code = match v8::String::new(tc, source) {
+        Some(c) => c,
+        None => return false,
+    };
+    match v8::Script::compile(tc, code, None).and_then(|s| s.run(tc)) {
+        Some(v) => v.boolean_value(tc),
+        None => false,
     }
+}
+
+/// Evaluate an internal expression, returning its string coercion. Errors → None.
+fn eval_to_string(scope: &mut v8::PinScope, source: &str) -> Option<String> {
+    v8::tc_scope!(let tc, scope);
+    let code = v8::String::new(tc, source)?;
+    let v = v8::Script::compile(tc, code, None).and_then(|s| s.run(tc))?;
+    Some(render_value(tc, v))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Public API: Runtime, eval_batch, run_with_dom, run_modules.
+// ---------------------------------------------------------------------------------------------
+
+/// A JS runtime. Owns one V8 isolate + global context so state persists across `eval` calls.
+///
+/// The isolate is single-thread-bound, so a `Runtime` must be created and used on the same thread.
+pub struct Runtime {
+    isolate: v8::OwnedIsolate,
+    context: v8::Global<v8::Context>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Runtime {
+    /// Build a fresh runtime with `console` + timers installed (no DOM). State persists across
+    /// `eval` calls via the owned global context.
+    pub fn new() -> Self {
+        ensure_v8_initialized();
+        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        let context = {
+            v8::scope!(let handle_scope, &mut isolate);
+            let context = v8::Context::new(handle_scope, Default::default());
+            let scope = &mut v8::ContextScope::new(handle_scope, context);
+            // No DOM on this path, but install a HostState so console works (doc is an empty doc).
+            let state = HostState::new(Rc::new(RefCell::new(dom::Document::new())));
+            scope.get_current_context().set_slot(state);
+            let global = scope.get_current_context().global(scope);
+            install_console_sink(scope, global);
+            eval_internal(scope, TIMERS_BOOTSTRAP, "<timers>");
+            v8::Global::new(scope, context)
+        };
+        Runtime { isolate, context }
+    }
+
+    /// Evaluate a script in the owned context. Globals persist across calls. Never panics on a JS
+    /// error — it is captured into `EvalOutput.error`.
+    pub fn eval(&mut self, source: &str) -> EvalOutput {
+        let context = self.context.clone();
+        v8::scope!(let handle_scope, &mut self.isolate);
+        let local_ctx = v8::Local::new(handle_scope, &context);
+        let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+        eval_source(scope, source, "<eval>")
+    }
+}
+
+/// Run `sources` in order on a single fresh runtime (so later scripts see earlier globals) and
+/// return one [`EvalOutput`] per source.
+///
+/// Runs on a dedicated worker thread with a generous stack so a runaway script (or deep
+/// recursion) can't block or fault the caller; the V8 isolate is created on that worker thread
+/// (isolates are single-thread-bound). A panic on the worker is isolated and surfaced as an error.
+pub fn eval_batch(sources: Vec<String>) -> Vec<EvalOutput> {
+    let count = sources.len();
+    let worker = std::thread::Builder::new()
+        .name("js-eval".to_string())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let mut rt = Runtime::new();
+            let mut results: Vec<EvalOutput> = sources.iter().map(|s| rt.eval(s)).collect();
+            // Drive the event loop so timers/microtasks the scripts registered actually run.
+            let context = rt.context.clone();
+            v8::scope!(let handle_scope, &mut rt.isolate);
+            let local_ctx = v8::Local::new(handle_scope, &context);
+            let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+            drain_event_loop(scope, &mut results);
+            results
+        });
+
+    match worker {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            vec![
+                EvalOutput {
+                    value: None,
+                    console: Vec::new(),
+                    error: Some("script execution aborted (panic in JS engine)".to_string()),
+                };
+                count.max(1)
+            ]
+        }),
+        Err(e) => vec![EvalOutput {
+            value: None,
+            console: Vec::new(),
+            error: Some(format!("could not start JS worker thread: {e}")),
+        }],
+    }
+}
+
+/// Run `sources` in order against the live `doc`, returning the (possibly mutated) document and
+/// one [`EvalOutput`] per source.
+///
+/// The DOM-aware sibling of [`eval_batch`]: the context gets the full browser environment
+/// (`window`/`self`/`globalThis`, `location`, a DOM-wired `document`, timers, navigator/etc.) so
+/// scripts mutate the real tree and the change is visible in the returned document. Runs on a
+/// dedicated worker thread; the V8 isolate, the `Rc<RefCell<Document>>`, and all wrappers live on
+/// that thread and never cross the boundary.
+pub fn run_with_dom(
+    doc: dom::Document,
+    sources: Vec<String>,
+    url: &str,
+) -> (dom::Document, Vec<EvalOutput>) {
+    let count = sources.len();
+    let url = url.to_string();
+    let worker = std::thread::Builder::new()
+        .name("js-eval-dom".to_string())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            ensure_v8_initialized();
+            let shared: SharedDoc = Rc::new(RefCell::new(doc));
+            let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+            let mut results: Vec<EvalOutput> = Vec::with_capacity(sources.len());
+            {
+                v8::scope!(let handle_scope, &mut isolate);
+                let context = v8::Context::new(handle_scope, Default::default());
+                let scope = &mut v8::ContextScope::new(handle_scope, context);
+                let state = HostState::new(Rc::clone(&shared));
+                scope.get_current_context().set_slot(state);
+                install_browser_environment(scope, &url);
+
+                for source in &sources {
+                    results.push(eval_source(scope, source, "<script>"));
+                }
+                drain_event_loop(scope, &mut results);
+            }
+            // Recover the owned Document. Dropping the isolate releases the context (and HostState
+            // slot, which holds the only other Rc clone of `shared`), so `try_unwrap` succeeds.
+            drop(isolate);
+            let doc = match Rc::try_unwrap(shared) {
+                Ok(cell) => cell.into_inner(),
+                Err(rc) => rc.borrow().clone(),
+            };
+            (doc, results)
+        });
+
+    match worker {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            let results = vec![
+                EvalOutput {
+                    value: None,
+                    console: Vec::new(),
+                    error: Some("script execution aborted (panic in JS engine)".to_string()),
+                };
+                count.max(1)
+            ];
+            (dom::Document::new(), results)
+        }),
+        Err(e) => (
+            dom::Document::new(),
+            vec![EvalOutput {
+                value: None,
+                console: Vec::new(),
+                error: Some(format!("could not start JS worker thread: {e}")),
+            }],
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ES modules + dynamic import (run_modules). V8 handles modules natively; we wire resolution.
+// ---------------------------------------------------------------------------------------------
+
+/// Registry of compiled modules + their (already canonicalized) source map, stored on the context
+/// slot so the bare-fn resolve/dynamic-import callbacks can recover it. Keyed by canonical URL.
+struct ModuleRegistry {
+    /// Canonical URL -> already-rewritten module source.
+    sources: HashMap<String, String>,
+    /// Canonical URL -> compiled module. Populated lazily (compile-on-resolve). Specifiers are
+    /// already canonical URLs (the engine rewrites them), so resolution is a direct lookup and no
+    /// referrer-relative bookkeeping is needed.
+    compiled: RefCell<HashMap<String, v8::Global<v8::Module>>>,
+}
+
+/// Compile a module source under its canonical URL origin and register it. Returns the compiled
+/// module local, or None on a compile error (the TryCatch holds the exception).
+fn compile_and_register<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    url: &str,
+    source: &str,
+) -> Option<v8::Local<'s, v8::Module>> {
+    let registry = scope.get_current_context().get_slot::<ModuleRegistry>()?;
+    // Reuse an already-compiled module if present.
+    if let Some(g) = registry.compiled.borrow().get(url) {
+        return Some(v8::Local::new(scope, g));
+    }
+    let code = v8::String::new(scope, source)?;
+    let resource = v8::String::new(scope, url)?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        resource.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        true, // is_module
+        None,
+    );
+    let mut src = v8::script_compiler::Source::new(code, Some(&origin));
+    let module = v8::script_compiler::compile_module(scope, &mut src)?;
+    let global = v8::Global::new(scope, module);
+    registry.compiled.borrow_mut().insert(url.to_string(), global);
+    Some(module)
+}
+
+/// Module resolution callback. The specifier is the already-canonical URL (the engine rewrote it),
+/// so we look it up directly in the registry, compiling on demand.
+fn resolve_module_callback<'s>(
+    context: v8::Local<'s, v8::Context>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    _referrer: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Module>> {
+    v8::callback_scope!(unsafe scope, context);
+    let url = specifier.to_rust_string_lossy(scope);
+    let registry = scope.get_current_context().get_slot::<ModuleRegistry>()?;
+    if let Some(g) = registry.compiled.borrow().get(&url) {
+        return Some(v8::Local::new(scope, g));
+    }
+    let source = registry.sources.get(&url).cloned();
+    match source {
+        Some(src) => compile_and_register(scope, &url, &src),
+        None => {
+            let msg = v8::String::new(scope, &format!("module not found: {url}")).unwrap();
+            let exc = v8::Exception::type_error(scope, msg);
+            scope.throw_exception(exc);
+            None
+        }
+    }
+}
+
+/// Dynamic `import(specifier)` host callback. The specifier is already canonical. We resolve it
+/// from the registry (compiling, instantiating, and evaluating as needed) and resolve a promise
+/// with the module namespace; on failure we reject.
+fn dynamic_import_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    _resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let promise = resolver.get_promise(scope);
+    let url = specifier.to_rust_string_lossy(scope);
+
+    let registry = match scope.get_current_context().get_slot::<ModuleRegistry>() {
+        Some(r) => r,
+        None => {
+            let msg = v8::String::new(scope, "no module registry").unwrap();
+            let exc = v8::Exception::error(scope, msg);
+            resolver.reject(scope, exc);
+            return Some(promise);
+        }
+    };
+
+    // Compile-on-demand from the source map. Modules not in the provided graph reject.
+    let module = {
+        let existing = registry.compiled.borrow().get(&url).map(|g| v8::Local::new(scope, g));
+        match existing {
+            Some(m) => Some(m),
+            None => registry.sources.get(&url).cloned().and_then(|src| {
+                v8::tc_scope!(let tc, scope);
+                compile_and_register(tc, &url, &src)
+            }),
+        }
+    };
+
+    let module = match module {
+        Some(m) => m,
+        None => {
+            let msg = v8::String::new(scope, &format!("dynamic import not found: {url}")).unwrap();
+            let exc = v8::Exception::type_error(scope, msg);
+            resolver.reject(scope, exc);
+            return Some(promise);
+        }
+    };
+
+    // Instantiate + evaluate (idempotent if already done).
+    let ok = {
+        v8::tc_scope!(let tc, scope);
+        let inst = module.instantiate_module(tc, resolve_module_callback);
+        if inst != Some(true) {
+            None
+        } else {
+            let _ = module.evaluate(tc);
+            Some(())
+        }
+    };
+
+    match ok {
+        Some(()) if module.get_status() != v8::ModuleStatus::Errored => {
+            let ns = module.get_module_namespace();
+            resolver.resolve(scope, ns);
+        }
+        _ => {
+            let reason = if module.get_status() == v8::ModuleStatus::Errored {
+                module.get_exception()
+            } else {
+                let msg = v8::String::new(scope, &format!("could not instantiate: {url}")).unwrap();
+                v8::Exception::type_error(scope, msg)
+            };
+            resolver.reject(scope, reason);
+        }
+    }
+    Some(promise)
+}
+
+/// Run the ES module graph for a page. `entries` are the canonical URLs of the entry modules in
+/// document order; `modules` maps every canonical module URL to its already-rewritten source.
+/// Returns the (possibly mutated) document plus one [`EvalOutput`] per entry. The browser
+/// environment is installed identically to [`run_with_dom`], so modules see `document`/`window`.
+/// Dynamic `import()` is wired via the isolate's host-import callback.
+pub fn run_modules(
+    doc: dom::Document,
+    url: &str,
+    entries: Vec<String>,
+    modules: HashMap<String, String>,
+) -> (dom::Document, Vec<EvalOutput>) {
+    let url = url.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
+    let fallback = doc.clone();
+    let worker = std::thread::Builder::new()
+        .name("js-modules".to_string())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            ensure_v8_initialized();
+            let shared: SharedDoc = Rc::new(RefCell::new(doc));
+            let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+            isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
+
+            let mut results: Vec<EvalOutput> = Vec::with_capacity(entries.len());
+            {
+                v8::scope!(let handle_scope, &mut isolate);
+                let context = v8::Context::new(handle_scope, Default::default());
+                let scope = &mut v8::ContextScope::new(handle_scope, context);
+                let state = HostState::new(Rc::clone(&shared));
+                scope.get_current_context().set_slot(state);
+                let registry = Rc::new(ModuleRegistry {
+                    sources: modules,
+                    compiled: RefCell::new(HashMap::new()),
+                });
+                scope.get_current_context().set_slot(registry);
+                install_browser_environment(scope, &url);
+
+                // Compile, instantiate, and evaluate each entry module in order.
+                for entry in &entries {
+                    let outcome = run_one_entry(scope, entry);
+                    results.push(outcome);
+                }
+
+                drain_event_loop(scope, &mut results);
+            }
+            drop(isolate);
+            let doc = match Rc::try_unwrap(shared) {
+                Ok(cell) => cell.into_inner(),
+                Err(rc) => rc.borrow().clone(),
+            };
+            let _ = tx.send((doc, results));
+        });
+
+    match worker {
+        Ok(_handle) => {
+            let budget = std::time::Duration::from_secs(20);
+            match rx.recv_timeout(budget) {
+                Ok(result) => result,
+                Err(_) => (
+                    fallback,
+                    vec![EvalOutput {
+                        value: None,
+                        console: Vec::new(),
+                        error: Some("module execution timed out or aborted".to_string()),
+                    }],
+                ),
+            }
+        }
+        Err(e) => (
+            fallback,
+            vec![EvalOutput {
+                value: None,
+                console: Vec::new(),
+                error: Some(format!("could not start JS worker thread: {e}")),
+            }],
+        ),
+    }
+}
+
+/// Compile + instantiate + evaluate a single entry module, returning its [`EvalOutput`] (console
+/// captured, error set on any compile/link/evaluate failure).
+fn run_one_entry(scope: &mut v8::PinScope, entry: &str) -> EvalOutput {
+    if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
+        state.console.borrow_mut().clear();
+    }
+
+    let error: Option<String> = {
+        v8::tc_scope!(let tc, scope);
+        let registry = tc.get_current_context().get_slot::<ModuleRegistry>();
+        let source = registry.as_ref().and_then(|r| r.sources.get(entry).cloned());
+        match source {
+            None => Some(format!("entry module not found: {entry}")),
+            Some(src) => match compile_and_register(tc, entry, &src) {
+                None => Some(format_exception(tc)),
+                Some(module) => {
+                    match module.instantiate_module(tc, resolve_module_callback) {
+                        Some(true) => {
+                            let result = module.evaluate(tc);
+                            if module.get_status() == v8::ModuleStatus::Errored {
+                                let exc = module.get_exception();
+                                Some(render_value(tc, exc))
+                            } else if let Some(val) = result {
+                                // Top-level-await: if the module returned a rejected promise, surface it.
+                                if let Ok(promise) = v8::Local::<v8::Promise>::try_from(val) {
+                                    if promise.state() == v8::PromiseState::Rejected {
+                                        let reason = promise.result(tc);
+                                        Some(render_value(tc, reason))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => {
+                            if tc.has_caught() {
+                                Some(format_exception(tc))
+                            } else {
+                                Some(format!("could not instantiate module: {entry}"))
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    };
+
+    let console = scope
+        .get_current_context()
+        .get_slot::<HostState>()
+        .map(|s| std::mem::take(&mut *s.console.borrow_mut()))
+        .unwrap_or_default();
+
+    EvalOutput { value: None, console, error }
 }
 
 #[cfg(test)]
@@ -3039,9 +3120,10 @@ mod tests {
 
     #[test]
     fn deeply_nested_input_does_not_overflow() {
-        // Regression: Boa's recursive-descent parser overflowed a small thread stack on
-        // deeply-nested real-world JS (e.g. youtube.com). `eval_batch` runs on a large stack
-        // so this must not crash the process — it either parses or errors, but never faults.
+        // Regression: a recursive-descent parser can overflow a small thread stack on
+        // deeply-nested real-world JS (e.g. youtube.com). `eval_batch` runs on a large stack and
+        // V8 caps its own stack depth, so this must not crash the process — it either parses or
+        // errors (V8 reports "Maximum call stack size exceeded"), but never faults.
         let depth = 4_000;
         let src = format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
         let out = eval_batch(vec![src]);

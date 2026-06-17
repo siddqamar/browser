@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# Reused JS engine (pure Rust). Walled off behind our own Runtime API so it can be
-# replaced by a hand-written engine later — same pattern as net/ureq and paint/fontdue.
-# Pinned past 0.21.1 to clear a VM panic ("must be declarative environment") that the
-# released version hits when running Vue 3's full component/template codegen.
-boa_engine = { git = "https://github.com/boa-dev/boa", rev = "de2221a09c132951c2ebad36e62ecd20b9987215" }
+# The V8 JavaScript engine (Google's production engine). Walled off behind our own Runtime API
+# so it can be replaced later — same pattern as net/ureq and paint/fontdue. Nothing outside this
+# crate knows V8 exists. V8 gives us full JS speed + complete language support, including real
+# ES modules and dynamic import.
+v8 = "150"
 # The real DOM, so page scripts can read and mutate the live document tree.
 dom = { path = "../dom" }
 # HTML parsing, so the `innerHTML` setter can build real child nodes from markup.
