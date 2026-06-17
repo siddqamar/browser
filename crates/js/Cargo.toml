@@ -12,3 +12,5 @@ license.workspace = true
 boa_engine = { git = "https://github.com/boa-dev/boa", rev = "de2221a09c132951c2ebad36e62ecd20b9987215" }
 # The real DOM, so page scripts can read and mutate the live document tree.
 dom = { path = "../dom" }
+# HTML parsing, so the `innerHTML` setter can build real child nodes from markup.
+html = { path = "../html" }

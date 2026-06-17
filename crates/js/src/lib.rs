@@ -541,6 +541,49 @@ fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
     doc.append_child(id, dom::NodeData::Text(text.to_string()));
 }
 
+/// Parse `html` and replace `target`'s children with the resulting real element/text/comment
+/// nodes in the live `doc`. This makes `el.innerHTML = "<div foo=...>"` produce navigable child
+/// nodes (Vue's template compiler relies on this: `decoder.innerHTML = ...; decoder.children[0]
+/// .getAttribute(...)`). Best-effort and never panics on malformed input.
+fn set_inner_html(doc: &mut dom::Document, target: dom::NodeId, html: &str) {
+    // Detach existing children (orphan them; the arena keeps the slots, which is fine).
+    let old: Vec<dom::NodeId> = std::mem::take(&mut doc.get_mut(target).children);
+    for child in old {
+        doc.get_mut(child).parent = None;
+    }
+
+    // Parse the fragment into its own document, then deep-copy the meaningful top-level nodes
+    // under `target`. The page parser appends directly under its root and does not synthesize
+    // html/head/body wrappers, but if a fragment does contain them we descend into them so the
+    // first real child (e.g. the `<div>`) lands directly under `target`.
+    let frag = html::parse(html);
+    let frag_root = frag.root();
+    copy_children_into(doc, target, &frag, frag_root);
+}
+
+/// Recursively copy the children of `src_node` (in document `frag`) as children of `dst_parent`
+/// in `doc`. Synthesized structural wrappers (`html`/`head`/`body`) are transparently descended
+/// into rather than copied, so fragment content lands at the expected depth.
+fn copy_children_into(
+    doc: &mut dom::Document,
+    dst_parent: dom::NodeId,
+    frag: &dom::Document,
+    src_node: dom::NodeId,
+) {
+    for &child in &frag.get(src_node).children {
+        match &frag.get(child).data {
+            dom::NodeData::Element(e) if matches!(e.tag.as_str(), "html" | "head" | "body") => {
+                // Transparent wrapper: descend without copying the wrapper itself.
+                copy_children_into(doc, dst_parent, frag, child);
+            }
+            data => {
+                let new_id = doc.append_child(dst_parent, data.clone());
+                copy_children_into(doc, new_id, frag, child);
+            }
+        }
+    }
+}
+
 /// Depth-first search for the first element whose tag equals `tag` (ASCII case-insensitive).
 fn find_by_tag(doc: &dom::Document, root: dom::NodeId, tag: &str) -> Option<dom::NodeId> {
     if let dom::NodeData::Element(e) = &doc.get(root).data {
@@ -855,7 +898,7 @@ fn make_element(id: dom::NodeId, doc: &SharedDoc, context: &mut Context) -> JsOb
     // --- innerHTML: get serializes children back to HTML markup (tags + attrs + text), so code
     // that reads `el.innerHTML` as a template (e.g. Vue's `mount` uses the mount container's
     // innerHTML as the component template) recovers structural directives like `v-for`/`v-if`
-    // instead of a flattened text run. set replaces with a single text node. ---
+    // instead of a flattened text run. set parses the HTML into real child nodes. ---
     let html_get = {
         let doc = Rc::clone(doc);
         unsafe {
@@ -877,7 +920,7 @@ fn make_element(id: dom::NodeId, doc: &SharedDoc, context: &mut Context) -> JsOb
                         .first()
                         .map(|a| render_value(a, ctx))
                         .unwrap_or_default();
-                    set_text_content(&mut doc.borrow_mut(), n, &text);
+                    set_inner_html(&mut doc.borrow_mut(), n, &text);
                 }
                 Ok(JsValue::undefined())
             })
@@ -3043,6 +3086,28 @@ mod tests {
             other => panic!("expected span element, got {other:?}"),
         }
         assert_eq!(text_content(&doc, span), "hi");
+    }
+
+    #[test]
+    fn inner_html_setter_parses_into_real_child_nodes() {
+        // Vue's template compiler relies on this: assigning markup must build navigable
+        // element/text nodes, not a single flattened Text node.
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var el = document.createElement("div");
+                   el.innerHTML = '<div foo="bar">hi</div>';
+                   [el.children.length,
+                    el.children[0].tagName,
+                    el.children[0].getAttribute("foo"),
+                    el.children[0].textContent].join("|")"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|DIV|bar|hi"));
     }
 
     // --- Timer / event-loop APIs --------------------------------------------------------
