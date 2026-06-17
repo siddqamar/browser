@@ -1801,19 +1801,52 @@ fn layout_inline_children(
             TextAlignLocal::Right => content.x + (avail - line.width).max(0.0),
         };
 
-        // Words on this line: collect contiguous word runs into a single Text box (joined),
-        // matching the previous behavior, plus emit each atomic box positioned at its offset.
-        let mut word_texts: Vec<&str> = Vec::new();
-        let mut first_word_style: Option<PaintStyle> = None;
+        // Words on this line: emit a `Text` box per contiguous run of words sharing the same
+        // DOM node, so painted text can be traced back to its element (e.g. an `<a>`). Each run's
+        // box is positioned at the run's starting x offset within the line (the offset of its
+        // first word, which already accounts for inter-word/inter-run spacing). Visual output is
+        // unchanged: the same words at the same positions, only split where the source node
+        // changes. Atomic boxes are repositioned at their offset as before.
+        //
+        // A "run" accumulates the words' joined text, the run's start x offset (line-relative),
+        // its node, the paint style of its first word, and the font size to measure at.
+        struct Run {
+            texts: Vec<String>,
+            start_off: f32,
+            node: Option<dom::NodeId>,
+            style: PaintStyle,
+        }
+        let mut run: Option<Run> = None;
+        let flush = |run: &mut Option<Run>, out: &mut Vec<LayoutBox>| {
+            if let Some(r) = run.take() {
+                let text = r.texts.join(" ");
+                let mut tb = LayoutBox::new(BoxContent::Text(text), r.style, r.node);
+                let w = measurer.text_width(&tb_text(&tb), line_font, false);
+                tb.dimensions.content =
+                    Rect { x: line_x + r.start_off, y, width: w, height: text_lh };
+                out.push(tb);
+            }
+        };
         for (item, off) in &line.items {
             match item {
-                InlineItem::Word { text, style } => {
-                    if first_word_style.is_none() {
-                        first_word_style = Some(style.clone());
+                InlineItem::Word { text, style, node } => {
+                    match &mut run {
+                        // Continue the current run only if the node matches.
+                        Some(r) if r.node == *node => r.texts.push(text.clone()),
+                        _ => {
+                            flush(&mut run, &mut new_children);
+                            run = Some(Run {
+                                texts: vec![text.clone()],
+                                start_off: *off,
+                                node: *node,
+                                style: style.clone(),
+                            });
+                        }
                     }
-                    word_texts.push(text.as_str());
                 }
                 InlineItem::Atomic(b) => {
+                    // An atomic box interrupts any word run.
+                    flush(&mut run, &mut new_children);
                     let mut ab = (**b).clone();
                     // Reposition so the atomic box's margin-box sits at (line_x + off, y).
                     let mb = ab.dimensions.margin_box();
@@ -1824,15 +1857,7 @@ fn layout_inline_children(
                 }
             }
         }
-        if !word_texts.is_empty() {
-            let text = word_texts.join(" ");
-            let style = first_word_style.unwrap_or_default();
-            let mut tb = LayoutBox::new(BoxContent::Text(text), style, None);
-            // Width: best effort using the joined text at the line font.
-            let w = measurer.text_width(&tb_text(&tb), line_font, false);
-            tb.dimensions.content = Rect { x: line_x, y, width: w, height: text_lh };
-            new_children.push(tb);
-        }
+        flush(&mut run, &mut new_children);
         y += lh;
         total_h += lh;
     }
@@ -1854,11 +1879,16 @@ fn tb_text(b: &LayoutBox) -> String {
 struct InlineWord {
     text: String,
     style: PaintStyle,
+    /// The DOM node of the source text box this word came from. Carried for parity with
+    /// `InlineItem::Word`; the intrinsic-sizing path that builds `InlineWord`s doesn't read it.
+    #[allow(dead_code)]
+    node: Option<dom::NodeId>,
 }
 
 /// An inline-level item participating in line layout: either a word or an atomic inline-block.
 enum InlineItem {
-    Word { text: String, style: PaintStyle },
+    /// A word carrying the DOM node of its source text box (used for hit-testing).
+    Word { text: String, style: PaintStyle, node: Option<dom::NodeId> },
     /// An atomic box (inline-block / inline-flex / inline-grid) already laid out at a tentative
     /// origin; it advances the pen by its margin-box width and is repositioned on its line.
     Atomic(Box<LayoutBox>),
@@ -1868,7 +1898,7 @@ impl InlineItem {
     /// Returns (advance_width, font_size, height, leads_with_space).
     fn metrics(&self, measurer: &dyn TextMeasurer) -> (f32, f32, f32, bool) {
         match self {
-            InlineItem::Word { text, style } => {
+            InlineItem::Word { text, style, .. } => {
                 let w = measurer.text_width(text, style.font_size, style.bold);
                 (w, style.font_size, measurer.line_height(style.font_size), true)
             }
@@ -1922,10 +1952,14 @@ fn collect_inline_items(
         }
         match &child.content {
             BoxContent::Text(text) => {
+                // Carry the source text box's DOM node onto each word so emitted line `Text`
+                // boxes can be traced back to their element for hit-testing.
+                let node = child.node;
                 for word in text.split_whitespace() {
                     out.push(InlineItem::Word {
                         text: word.to_string(),
                         style: child.style.clone(),
+                        node,
                     });
                 }
             }
@@ -1954,7 +1988,11 @@ fn collect_inline_words(children: &[LayoutBox], out: &mut Vec<InlineWord>) {
         match &child.content {
             BoxContent::Text(text) => {
                 for word in text.split_whitespace() {
-                    out.push(InlineWord { text: word.to_string(), style: child.style.clone() });
+                    out.push(InlineWord {
+                        text: word.to_string(),
+                        style: child.style.clone(),
+                        node: child.node,
+                    });
                 }
             }
             BoxContent::Inline => {
@@ -2107,6 +2145,67 @@ mod tests {
         // Total height = lines * line_height(16) = lines * 20.8.
         let expected_h = lines as f32 * 16.0 * 1.3;
         assert!((pbox.dimensions.content.height - expected_h).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_anchor_text_box_carries_node() {
+        // p > "foo " <a>"bar baz qux"</a> " end"  — the <a> wraps; its emitted line Text box(es)
+        // must carry the <a>'s text node id so clicks map back to the link.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("foo ".into()));
+        let a = doc.append_element(p, "a");
+        let a_text = doc.append_child(a, dom::NodeData::Text("bar baz qux".into()));
+        doc.append_child(p, dom::NodeData::Text(" end".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(p, block_style(true));
+        // <a> is inline by default.
+        styles.insert(a, style::ComputedStyle::default());
+
+        // Narrow width forces wrapping so we exercise multi-line runs.
+        let root_box = layout_document(&doc, &styles, 80.0, 600.0, &Stub, &HashMap::new());
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+
+        // Some emitted Text box must carry the <a>'s text node.
+        let carries_a_text =
+            count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)) && x.node == Some(a_text));
+        assert!(
+            carries_a_text >= 1,
+            "expected at least one Text box carrying the <a>'s text node id"
+        );
+
+        // The <a>'s text boxes only contain the anchor's words (no "foo"/"end" leakage).
+        for tb in collect_text_boxes(pbox) {
+            if tb.node == Some(a_text) {
+                if let BoxContent::Text(t) = &tb.content {
+                    for w in t.split_whitespace() {
+                        assert!(
+                            ["bar", "baz", "qux"].contains(&w),
+                            "anchor text run leaked non-anchor word: {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Collect references to all `Text` boxes in a subtree (DFS).
+    fn collect_text_boxes(b: &LayoutBox) -> Vec<&LayoutBox> {
+        let mut out = Vec::new();
+        fn go<'a>(b: &'a LayoutBox, out: &mut Vec<&'a LayoutBox>) {
+            if matches!(b.content, BoxContent::Text(_)) {
+                out.push(b);
+            }
+            for c in &b.children {
+                go(c, out);
+            }
+        }
+        go(b, &mut out);
+        out
     }
 
     #[test]

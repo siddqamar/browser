@@ -10,8 +10,18 @@ final class BitmapView: NSView {
     var image: CGImage?
     /// Called with a vertical delta in points (positive = scroll content toward the end).
     var onScroll: ((CGFloat) -> Void)?
+    /// Called with a view-local click point (points, bottom-left origin) on a simple click
+    /// (mouse-up that didn't travel far from the mouse-down — i.e. not a drag/selection).
+    var onClick: ((CGPoint) -> Void)?
+    /// Asked whether a view-local point (points, bottom-left origin) is over a link, so the
+    /// cursor can switch to a pointing hand on hover. Returns true if a link is there.
+    var isLinkAt: ((CGPoint) -> Bool)?
 
     private static let emptyColor = NSColor(calibratedRed: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
+
+    /// The mouse-down location (view-local), used to distinguish a click from a drag.
+    private var mouseDownPoint: CGPoint?
+    private var trackingArea: NSTrackingArea?
 
     override var isOpaque: Bool { true }
 
@@ -30,6 +40,49 @@ final class BitmapView: NSView {
         if !event.hasPreciseScrollingDeltas { dy *= 16 }
         // Scrolling down (finger/wheel) should reveal content further down the page.
         onScroll?(-dy)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownPoint = convert(event.locationInWindow, from: nil)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let up = convert(event.locationInWindow, from: nil)
+        defer { mouseDownPoint = nil }
+        // Treat as a click only if the pointer barely moved (not a drag / text selection).
+        if let down = mouseDownPoint {
+            let dx = up.x - down.x
+            let dy = up.y - down.y
+            if (dx * dx + dy * dy) > 16 { return } // moved > 4pt: a drag, ignore
+        }
+        onClick?(up)
+    }
+
+    // Pointing-hand cursor when hovering a link (nice-to-have).
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea = trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if isLinkAt?(p) == true {
+            NSCursor.pointingHand.set()
+        } else {
+            NSCursor.arrow.set()
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
     }
 }
 
@@ -439,6 +492,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView = BitmapView()
         bitmapView.translatesAutoresizingMaskIntoConstraints = false
         bitmapView.onScroll = { [weak self] dyPoints in self?.scrollActiveTab(dyPoints) }
+        bitmapView.onClick = { [weak self] point in self?.handleContentClick(point) }
+        bitmapView.isLinkAt = { [weak self] point in self?.linkURL(at: point) != nil }
         content.addSubview(bitmapView)
 
         // MARK: Auto Layout
@@ -820,6 +875,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let engine = activeTab?.engine else { return }
         let scale = Float(window?.backingScaleFactor ?? 1)
         browser_engine_scroll_by(engine, Float(dyPoints) * scale)
+        refresh()
+    }
+
+    // MARK: Link hit-testing
+
+    /// Map a view-local point (points, bottom-left origin because the view is NOT flipped) to the
+    /// framebuffer's device-pixel coordinate space (top-left origin) and ask the engine whether a
+    /// link is there. Returns the absolute URL string, or nil.
+    private func linkURL(at localPoint: CGPoint) -> String? {
+        guard let engine = activeTab?.engine, let bitmapView = bitmapView else { return nil }
+        let scale = CGFloat(window?.backingScaleFactor ?? 1)
+        // The framebuffer is top-origin, the view is bottom-origin: flip y, then scale to device px.
+        let fyTop = bitmapView.bounds.height - localPoint.y
+        let fxDevice = Float(localPoint.x * scale)
+        let fyDevice = Float(fyTop * scale)
+        guard let cstr = browser_engine_link_at(engine, fxDevice, fyDevice) else { return nil }
+        return String(cString: cstr)
+    }
+
+    /// A simple click on the page content: if it landed on a link, navigate to it (recording
+    /// history so Back works), reusing the same path as entering a URL.
+    private func handleContentClick(_ localPoint: CGPoint) {
+        guard let url = linkURL(at: localPoint) else { return }
+        urlField.stringValue = url
+        load(urlString: url, recordHistory: true)
         refresh()
     }
 

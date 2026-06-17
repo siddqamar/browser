@@ -7,9 +7,17 @@
 
 use std::ffi::c_char;
 use std::ffi::CStr;
+use std::ffi::CString;
 
 /// Opaque engine handle. cbindgen emits this as a forward-declared struct.
-pub struct Engine(engine::Engine);
+///
+/// `last_link` retains the most recent `browser_engine_link_at` result so the `*const c_char`
+/// returned to the caller stays valid until the next `browser_engine_link_at` call on this handle
+/// (or until `browser_engine_free`).
+pub struct Engine {
+    inner: engine::Engine,
+    last_link: Option<CString>,
+}
 
 /// A borrowed view of the engine's RGBA8 (straight-alpha) framebuffer.
 /// `stride` is bytes per row. A null `pixels` means "nothing rendered".
@@ -30,7 +38,7 @@ impl Framebuffer {
 /// Create a new engine. Release with [`browser_engine_free`].
 #[no_mangle]
 pub extern "C" fn browser_engine_new() -> *mut Engine {
-    Box::into_raw(Box::new(Engine(engine::Engine::new())))
+    Box::into_raw(Box::new(Engine { inner: engine::Engine::new(), last_link: None }))
 }
 
 /// Free an engine created by [`browser_engine_new`]. Null is a no-op.
@@ -56,7 +64,7 @@ pub unsafe extern "C" fn browser_engine_set_viewport(
     scale: f32,
 ) {
     if let Some(e) = engine.as_mut() {
-        e.0.set_viewport(width, height, scale);
+        e.inner.set_viewport(width, height, scale);
     }
 }
 
@@ -72,7 +80,7 @@ pub unsafe extern "C" fn browser_engine_load_url(engine: *mut Engine, url: *cons
         return -2;
     }
     match CStr::from_ptr(url).to_str() {
-        Ok(s) => e.0.load_url(s),
+        Ok(s) => e.inner.load_url(s),
         Err(_) => -2,
     }
 }
@@ -85,7 +93,7 @@ pub unsafe extern "C" fn browser_engine_load_url(engine: *mut Engine, url: *cons
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_scroll_by(engine: *mut Engine, dy: f32) {
     if let Some(e) = engine.as_mut() {
-        e.0.scroll_by(dy);
+        e.inner.scroll_by(dy);
     }
 }
 
@@ -97,11 +105,43 @@ pub unsafe extern "C" fn browser_engine_scroll_by(engine: *mut Engine, dy: f32) 
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_render(engine: *mut Engine) -> Framebuffer {
     let Some(e) = engine.as_mut() else { return Framebuffer::empty() };
-    let fb = e.0.render();
+    let fb = e.inner.render();
     Framebuffer {
         pixels: fb.pixels.as_ptr(),
         width: fb.width,
         height: fb.height,
         stride: fb.stride,
+    }
+}
+
+/// Hit-test the most recently rendered page at framebuffer device-pixel `(x, y)`. If a link
+/// (`<a href>`) is under that point, returns a NUL-terminated UTF-8 C string with the resolved
+/// absolute URL; otherwise returns null.
+///
+/// Lifetime: the returned pointer is owned by the engine handle (stored in `last_link`) and stays
+/// valid until the next `browser_engine_link_at` call on this handle, or until
+/// `browser_engine_free`. Copy it (e.g. via `String(cString:)`) before calling again.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_link_at(
+    engine: *mut Engine,
+    x: f32,
+    y: f32,
+) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    match e.inner.link_at(x, y).and_then(|s| CString::new(s).ok()) {
+        Some(cstr) => {
+            let ptr = cstr.as_ptr();
+            // Retain so the pointer stays valid until the next call / free.
+            e.last_link = Some(cstr);
+            ptr
+        }
+        None => {
+            // Drop any previously retained link; nothing here.
+            e.last_link = None;
+            std::ptr::null()
+        }
     }
 }

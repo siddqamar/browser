@@ -9,6 +9,10 @@
 
 /**
  * Opaque engine handle. cbindgen emits this as a forward-declared struct.
+ *
+ * `last_link` retains the most recent `browser_engine_link_at` result so the `*const c_char`
+ * returned to the caller stays valid until the next `browser_engine_link_at` call on this handle
+ * (or until `browser_engine_free`).
  */
 typedef struct Engine Engine;
 
@@ -77,6 +81,20 @@ void browser_engine_scroll_by(struct Engine *engine, float dy);
  * `engine` must be a valid handle from [`browser_engine_new`].
  */
 struct Framebuffer browser_engine_render(struct Engine *engine);
+
+/**
+ * Hit-test the most recently rendered page at framebuffer device-pixel `(x, y)`. If a link
+ * (`<a href>`) is under that point, returns a NUL-terminated UTF-8 C string with the resolved
+ * absolute URL; otherwise returns null.
+ *
+ * Lifetime: the returned pointer is owned by the engine handle (stored in `last_link`) and stays
+ * valid until the next `browser_engine_link_at` call on this handle, or until
+ * `browser_engine_free`. Copy it (e.g. via `String(cString:)`) before calling again.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_link_at(struct Engine *engine, float x, float y);
 
 #ifdef __cplusplus
 }  // extern "C"

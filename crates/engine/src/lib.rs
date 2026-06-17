@@ -29,9 +29,6 @@ enum LoadState {
     Empty,
     Loaded {
         url: String,
-        status: u16,
-        content_type: String,
-        bytes: usize,
         /// Parsed DOM, present when the response was HTML.
         doc: Option<dom::Document>,
         /// Author stylesheets parsed from the page's `<style>` elements, in document order.
@@ -150,9 +147,6 @@ impl Engine {
 
                 self.state = LoadState::Loaded {
                     url: resp.final_url,
-                    status: resp.status,
-                    content_type: resp.content_type,
-                    bytes: resp.body.len(),
                     doc,
                     styles,
                     console,
@@ -274,6 +268,49 @@ impl Engine {
         self.framebuffer.as_ref()
     }
 
+    /// Hit-test the painted page at framebuffer device-pixel `(x, y)` and, if the deepest box
+    /// hit belongs to (or descends from) an `<a href>`, return the absolute link URL.
+    ///
+    /// Coordinate mapping mirrors `render`/`paint_box`: page content is painted at
+    /// `(left, header_h - scroll_y)`, so we invert that to get layout coordinates. Returns `None`
+    /// when there's no cached layout, no DOM, no box hit, no enclosing link, or the href can't be
+    /// resolved to a fetchable absolute URL (in-page `#frag` / `javascript:` are rejected by
+    /// `resolve_url`).
+    pub fn link_at(&self, x: f32, y: f32) -> Option<String> {
+        // SAME constants as render/paint_box.
+        let left = 16.0 * self.scale;
+        let header_h = 8.0 * self.scale;
+
+        let cache = self.layout_cache.as_ref()?;
+        let (doc, page_url) = match &self.state {
+            LoadState::Loaded { doc: Some(d), url, .. } => (d, url),
+            _ => return None,
+        };
+
+        // Device pixels -> layout coordinates.
+        let lx = x - left;
+        let ly = y - (header_h - self.scroll_y);
+
+        // Find the deepest box containing the point that carries a DOM node.
+        let node = deepest_node_at(&cache.root, lx, ly)?;
+
+        // Walk up the DOM to the nearest ancestor-or-self <a> with a non-empty href.
+        let mut cur = Some(node);
+        while let Some(id) = cur {
+            if let dom::NodeData::Element(el) = &doc.get(id).data {
+                if el.tag.eq_ignore_ascii_case("a") {
+                    if let Some(href) = el.attrs.get("href") {
+                        if !href.trim().is_empty() {
+                            return resolve_url(page_url, href);
+                        }
+                    }
+                }
+            }
+            cur = doc.get(id).parent;
+        }
+        None
+    }
+
     /// Test-only: number of decoded `<img>` images for the current page.
     #[cfg(test)]
     fn decoded_image_count(&self) -> usize {
@@ -356,6 +393,26 @@ impl layout::TextMeasurer for FontMeasurer<'_> {
 
     fn line_height(&self, px: f32) -> f32 {
         px * 1.3
+    }
+}
+
+/// Hit-test a layout subtree at layout coordinates `(x, y)`, returning the DOM node of the
+/// deepest box whose border box contains the point and that carries a `node`. Children are
+/// searched first (and in order) so the deepest / topmost box wins; a box's own border box is
+/// its hit area.
+fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<dom::NodeId> {
+    // Recurse into children first so a deeper hit takes precedence over this box.
+    for c in &b.children {
+        if let Some(n) = deepest_node_at(c, x, y) {
+            return Some(n);
+        }
+    }
+    let r = b.dimensions.border_box();
+    let inside = x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+    if inside {
+        b.node
+    } else {
+        None
     }
 }
 
@@ -1208,6 +1265,62 @@ mod tests {
         assert_eq!(fb.height, 100);
         // The gradient guarantees some non-zero blue somewhere.
         assert!(fb.pixels.iter().skip(2).step_by(4).any(|&b| b > 0));
+    }
+
+    #[test]
+    fn link_at_returns_resolved_url_for_anchor_text() {
+        // A page with a single anchor. The engine needs a font to lay text out; if none is
+        // available in this environment, skip (layout produces no text boxes).
+        if SystemFont::load().is_none() {
+            eprintln!("no system font; skipping link_at test");
+            return;
+        }
+        let html = "<html><body><a href=\"https://example.com/x\">link</a></body></html>";
+        let path = std::env::temp_dir().join("browser_link_at_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(400, 300, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        // Render to build the layout cache.
+        let _ = e.render();
+
+        // Find the anchor's Text box in the cached layout (the only one, content "link").
+        fn find_text<'a>(b: &'a layout::LayoutBox, want: &str) -> Option<&'a layout::LayoutBox> {
+            if let layout::BoxContent::Text(t) = &b.content {
+                if t.contains(want) {
+                    return Some(b);
+                }
+            }
+            for c in &b.children {
+                if let Some(f) = find_text(c, want) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let cache = e.layout_cache.as_ref().expect("layout cache built");
+        let tb = find_text(&cache.root, "link").expect("anchor text box present");
+        let r = tb.dimensions.border_box();
+        // Layout-space center of the text box.
+        let lx = r.x + r.width / 2.0;
+        let ly = r.y + r.height / 2.0;
+        // Convert to device pixels (inverse of the layout->device mapping in render): with
+        // scale 1.0 and scroll 0, device = layout + (left=16, header_h=8).
+        let left = 16.0 * e.scale;
+        let header_h = 8.0 * e.scale;
+        let dx = lx + left;
+        let dy = ly + (header_h - e.scroll_y);
+
+        assert_eq!(
+            e.link_at(dx, dy).as_deref(),
+            Some("https://example.com/x"),
+            "click inside the anchor returns its resolved URL"
+        );
+        // A click far away in empty space returns no link.
+        assert_eq!(e.link_at(5.0, 290.0), None, "empty space has no link");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
