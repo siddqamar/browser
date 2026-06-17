@@ -1354,75 +1354,117 @@ pub fn collect_module_graph(
         }
     }
 
-    // BFS the graph, fetching each new module once. Inline entries are already in `raw`.
-    while let Some(url) = queue.pop_front() {
-        if sources.len() >= MAX_MODULES {
-            notes.push(format!("[skipped module (limit {MAX_MODULES} reached): {url}]"));
-            continue;
+    // BFS the graph level-by-level, fetching each level's modules CONCURRENTLY (a Vue app pulls
+    // 200+ modules — sequential fetch dominated load time). `seen` dedups everything ever queued.
+    let mut seen: std::collections::HashSet<String> = entry_urls.iter().cloned().collect();
+    let mut frontier: Vec<String> = queue.into_iter().collect();
+
+    while !frontier.is_empty() {
+        // Cap the total module count, trimming this level's overflow with a note.
+        let remaining = MAX_MODULES.saturating_sub(sources.len());
+        if remaining == 0 {
+            for u in &frontier {
+                notes.push(format!("[skipped module (limit {MAX_MODULES} reached): {u}]"));
+            }
+            break;
         }
-        // Fetch the source unless it's an inline entry already present in `raw`.
-        let body = if let Some(src) = raw.remove(&url) {
-            src
-        } else if url.contains("#inline-module-") {
-            // Already-consumed inline; nothing to fetch.
-            continue;
-        } else {
-            match net::fetch(&url) {
-                Ok(resp) if resp.body.len() > MAX_MODULE_BYTES => {
-                    notes.push(format!("[skipped large module: {} ({} bytes)]", url, resp.body.len()));
-                    continue;
-                }
-                Ok(resp) => String::from_utf8_lossy(&resp.body).into_owned(),
-                Err(e) => {
-                    notes.push(format!("[failed to load module: {url} — {e}]"));
-                    continue;
-                }
+        if frontier.len() > remaining {
+            for u in frontier.split_off(remaining) {
+                notes.push(format!("[skipped module (limit {MAX_MODULES} reached): {u}]"));
             }
-        };
+        }
 
-        // The base for resolving this module's imports: an inline entry uses the page URL; a
-        // fetched module uses its own canonical URL.
-        let base = if url.contains("#inline-module-") { page_url } else { &url };
-
-        // Extract specifiers, then rewrite each in place (right-to-left so earlier byte offsets
-        // stay valid) to the resolved canonical URL. Enqueue newly-discovered modules.
-        let specs = extract_specifiers(&body);
-        let mut rewritten = body.clone();
-        // Resolve first (left-to-right) so notes read in source order, collecting replacements.
-        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
-        for s in &specs {
-            if is_bare_specifier(&s.spec) {
-                notes.push(format!("[skipped bare import: {}]", s.spec));
-                continue;
+        // Separate inline sources (already in `raw`) from network URLs to fetch.
+        let mut bodies: Vec<(String, Result<String, String>)> = Vec::new();
+        let mut net_urls: Vec<String> = Vec::new();
+        for url in frontier.drain(..) {
+            if let Some(src) = raw.remove(&url) {
+                bodies.push((url, Ok(src)));
+            } else if !url.contains("#inline-module-") {
+                net_urls.push(url);
             }
-            let resolved = match url::Url::parse(base).ok().and_then(|b| b.join(s.spec.trim()).ok()) {
-                Some(u) => u.to_string(),
-                None => {
-                    notes.push(format!("[failed to resolve import: {} (in {url})]", s.spec));
+        }
+
+        // Fetch this level concurrently across a small scoped thread pool.
+        if !net_urls.is_empty() {
+            let n = net_urls.len().min(16).max(1);
+            let mut chunks: Vec<Vec<String>> = (0..n).map(|_| Vec::new()).collect();
+            for (i, u) in net_urls.into_iter().enumerate() {
+                chunks[i % n].push(u);
+            }
+            std::thread::scope(|s| {
+                let handles: Vec<_> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            chunk
+                                .into_iter()
+                                .map(|u| {
+                                    let r = match net::fetch(&u) {
+                                        Ok(resp) if resp.body.len() > MAX_MODULE_BYTES => Err(
+                                            format!("[skipped large module: {} ({} bytes)]", u, resp.body.len()),
+                                        ),
+                                        Ok(resp) => Ok(String::from_utf8_lossy(&resp.body).into_owned()),
+                                        Err(e) => Err(format!("[failed to load module: {u} — {e}]")),
+                                    };
+                                    (u, r)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    bodies.extend(h.join().unwrap_or_default());
+                }
+            });
+        }
+
+        // Process each fetched module: rewrite specifiers to canonical URLs, discover next level.
+        let mut next: Vec<String> = Vec::new();
+        for (url, body_res) in bodies {
+            let body = match body_res {
+                Ok(b) => b,
+                Err(note) => {
+                    notes.push(note);
                     continue;
                 }
             };
-            // Only http(s)/file modules are loadable; others (data:, etc.) are skipped.
-            let scheme = resolved.split(':').next().unwrap_or("");
-            if !matches!(scheme, "http" | "https" | "file") {
-                notes.push(format!("[skipped non-loadable import: {}]", s.spec));
-                continue;
+            // Imports resolve against the page URL for inline entries, else the module's own URL.
+            let base = if url.contains("#inline-module-") { page_url.to_string() } else { url.clone() };
+            let specs = extract_specifiers(&body);
+            let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+            for sp in &specs {
+                if is_bare_specifier(&sp.spec) {
+                    notes.push(format!("[skipped bare import: {}]", sp.spec));
+                    continue;
+                }
+                let resolved = match url::Url::parse(&base).ok().and_then(|b| b.join(sp.spec.trim()).ok()) {
+                    Some(u) => u.to_string(),
+                    None => {
+                        notes.push(format!("[failed to resolve import: {} (in {url})]", sp.spec));
+                        continue;
+                    }
+                };
+                let scheme = resolved.split(':').next().unwrap_or("");
+                if !matches!(scheme, "http" | "https" | "file") {
+                    notes.push(format!("[skipped non-loadable import: {}]", sp.spec));
+                    continue;
+                }
+                let quote = &body[sp.start..sp.start + 1];
+                replacements.push((sp.start, sp.end, format!("{quote}{resolved}{quote}")));
+                if !seen.contains(&resolved) {
+                    seen.insert(resolved.clone());
+                    next.push(resolved);
+                }
             }
-            // Replace the quoted specifier (keep the original quote characters).
-            let quote = &body[s.start..s.start + 1];
-            let replacement = format!("{quote}{resolved}{quote}");
-            replacements.push((s.start, s.end, replacement));
-            if !sources.contains_key(&resolved) && resolved != url && !queue.contains(&resolved) {
-                queue.push_back(resolved);
+            replacements.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut rewritten = body;
+            for (start, end, rep) in replacements {
+                rewritten.replace_range(start..end, &rep);
             }
+            sources.insert(url, rewritten);
         }
-        // Apply replacements right-to-left so byte offsets remain valid.
-        replacements.sort_by(|a, b| b.0.cmp(&a.0));
-        for (start, end, rep) in replacements {
-            rewritten.replace_range(start..end, &rep);
-        }
-
-        sources.insert(url, rewritten);
+        frontier = next;
     }
 
     (entry_urls, sources, notes)
