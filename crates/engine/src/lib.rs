@@ -202,7 +202,8 @@ impl Engine {
     pub fn render(&mut self) -> &Framebuffer {
         let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
         let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
-        let header_h = 28.0 * self.scale;
+        // Small top inset so page content isn't flush against the toolbar (no debug bar).
+        let header_h = 8.0 * self.scale;
 
         // Expensive: cascade + layout (cached across scrolls / repeated renders at this size).
         self.ensure_layout(dw, dh, header_h);
@@ -211,10 +212,6 @@ impl Engine {
         let mut scroll_y = self.scroll_y;
 
         paint_gradient(&mut fb);
-
-        // Slim header band so it's unmistakably our paint, not a blank surface.
-        fb.fill_rect(Rect { x: 0, y: 0, w: dw as i32, h: header_h as i32 },
-                     Color::rgb(20, 22, 30));
 
         let px = 16.0 * self.scale;
         if let Some(font) = self.font.as_ref() {
@@ -225,13 +222,7 @@ impl Engine {
                     draw_text(&mut fb, font, "Enter a URL and press Go.",
                               12.0 * self.scale, 60.0 * self.scale, px, Color::WHITE);
                 }
-                LoadState::Loaded { url, status, content_type, bytes, doc, console, images, .. } => {
-                    // Header line: HTTP status, content type, size, and URL.
-                    let head =
-                        format!("HTTP {status}   |   {content_type}   |   {bytes}B   |   {url}");
-                    draw_text(&mut fb, font, &head, 12.0 * self.scale,
-                              19.0 * self.scale, 13.0 * self.scale, Color::rgb(120, 200, 255));
-
+                LoadState::Loaded { url, doc, console, images, .. } => {
                     let left = 16.0 * self.scale;
                     let page_max_y = if console.is_empty() {
                         dh as f32

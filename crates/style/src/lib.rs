@@ -267,35 +267,44 @@ pub fn cascade(
     let mut out = HashMap::new();
     // The root inherits from a fresh default style.
     let initial = ComputedStyle::default();
-    cascade_node(doc, doc.root(), &initial, false, &ua, sheets, &mut out);
+    // Custom properties (`--name`) inherit; the root starts with an empty environment.
+    let initial_vars: HashMap<String, String> = HashMap::new();
+    cascade_node(doc, doc.root(), &initial, &initial_vars, false, &ua, sheets, &mut out);
     out
 }
 
+/// Assumed viewport width (px) used to evaluate `min-width`/`max-width` media queries during
+/// the cascade, since the real viewport isn't part of [`cascade`]'s signature.
+const ASSUMED_VIEWPORT_WIDTH: f32 = 1280.0;
+
 /// Recursively compute styles. `parent` is the parent's computed style (the inheritance
-/// source); `parent_hidden` is true if any ancestor was `display: none`.
+/// source); `parent_vars` is the set of custom properties inherited from ancestors;
+/// `parent_hidden` is true if any ancestor was `display: none`.
 #[allow(clippy::too_many_arguments)]
 fn cascade_node(
     doc: &dom::Document,
     id: dom::NodeId,
     parent: &ComputedStyle,
+    parent_vars: &HashMap<String, String>,
     parent_hidden: bool,
     ua: &css::Stylesheet,
     author: &[css::Stylesheet],
     out: &mut HashMap<dom::NodeId, ComputedStyle>,
 ) {
     let node = doc.get(id);
-    let computed = if let dom::NodeData::Element(el) = &node.data {
-        let style = compute_element_style(el, parent, parent_hidden, ua, author);
+    let (computed, vars) = if let dom::NodeData::Element(el) = &node.data {
+        let (style, vars) =
+            compute_element_style(el, parent, parent_vars, parent_hidden, ua, author);
         out.insert(id, style.clone());
-        style
+        (style, vars)
     } else {
         // Non-elements inherit the parent style so text runs can read color/size off the
         // nearest element ancestor via the parent passed down.
-        parent.clone()
+        (parent.clone(), parent_vars.clone())
     };
     let hidden = parent_hidden || computed.display_none;
     for &child in &node.children {
-        cascade_node(doc, child, &computed, hidden, ua, author, out);
+        cascade_node(doc, child, &computed, &vars, hidden, ua, author, out);
     }
 }
 
@@ -304,10 +313,11 @@ fn cascade_node(
 fn compute_element_style(
     el: &dom::ElementData,
     parent: &ComputedStyle,
+    parent_vars: &HashMap<String, String>,
     parent_hidden: bool,
     ua: &css::Stylesheet,
     author: &[css::Stylesheet],
-) -> ComputedStyle {
+) -> (ComputedStyle, HashMap<String, String>) {
     // Start from inherited values; non-inherited properties get reset below.
     let mut style = ComputedStyle {
         color: parent.color,
@@ -367,15 +377,19 @@ fn compute_element_style(
     let mut order = 0usize;
 
     for rule in &ua.rules {
-        if let Some(spec) = rule_specificity(&rule.selectors, el) {
-            matches.push(MatchEntry { origin: 0, specificity: spec, order, decls: &rule.declarations });
+        if media_applies(rule.media.as_deref()) {
+            if let Some(spec) = rule_specificity(&rule.selectors, el) {
+                matches.push(MatchEntry { origin: 0, specificity: spec, order, decls: &rule.declarations });
+            }
         }
         order += 1;
     }
     for sheet in author {
         for rule in &sheet.rules {
-            if let Some(spec) = rule_specificity(&rule.selectors, el) {
-                matches.push(MatchEntry { origin: 1, specificity: spec, order, decls: &rule.declarations });
+            if media_applies(rule.media.as_deref()) {
+                if let Some(spec) = rule_specificity(&rule.selectors, el) {
+                    matches.push(MatchEntry { origin: 1, specificity: spec, order, decls: &rule.declarations });
+                }
             }
             order += 1;
         }
@@ -399,9 +413,29 @@ fn compute_element_style(
             .then(a.order.cmp(&b.order))
     });
 
+    // Build this element's custom-property environment: inherit the ancestors' vars, then
+    // override with any `--name: value` declared on this element (in cascade order, so the
+    // winning declaration applies last).
+    let mut vars = parent_vars.clone();
     for m in &matches {
         for (prop, val) in m.decls {
-            apply_declaration(&mut style, prop, val, parent);
+            if let Some(name) = prop.strip_prefix("--") {
+                vars.insert(format!("--{name}"), val.clone());
+            }
+        }
+    }
+
+    // Now apply the regular declarations, resolving any `var(...)` references against `vars`
+    // and supplying the current/inherited color for `currentColor`/`inherit`.
+    let inherited_color = parent.color;
+    for m in &matches {
+        for (prop, val) in m.decls {
+            if prop.starts_with("--") {
+                continue; // custom properties are environment, not applied directly
+            }
+            let resolved = resolve_vars(val, &vars);
+            let current_color = style.color;
+            apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color);
         }
     }
 
@@ -424,7 +458,171 @@ fn compute_element_style(
         Display::Block | Display::Flex | Display::Grid | Display::None
     );
 
-    style
+    (style, vars)
+}
+
+/// Resolve `var(--name, fallback)` references in `value` against `vars`, recursively (vars can
+/// reference vars). Bounded against cyclic references by a recursion-depth cap.
+fn resolve_vars(value: &str, vars: &HashMap<String, String>) -> String {
+    resolve_vars_depth(value, vars, 0)
+}
+
+const VAR_MAX_DEPTH: usize = 32;
+
+fn resolve_vars_depth(value: &str, vars: &HashMap<String, String>, depth: usize) -> String {
+    if depth >= VAR_MAX_DEPTH || !value.contains("var(") {
+        return value.to_string();
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // Detect `var(` at a token boundary.
+        if chars[i] == 'v'
+            && chars[i..].len() >= 4
+            && chars[i + 1] == 'a'
+            && chars[i + 2] == 'r'
+            && chars[i + 3] == '('
+        {
+            // Find the matching close paren for this `var(`.
+            let args_start = i + 4;
+            let mut j = args_start;
+            let mut pdepth = 1i32;
+            while j < chars.len() && pdepth > 0 {
+                match chars[j] {
+                    '(' => pdepth += 1,
+                    ')' => pdepth -= 1,
+                    _ => {}
+                }
+                if pdepth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            // chars[j] is the matching ')'.
+            let args: String = chars[args_start..j].iter().collect();
+            let replacement = resolve_one_var(&args, vars, depth);
+            out.push_str(&replacement);
+            i = j + 1; // skip past ')'
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Resolve the args of a single `var(...)`: `--name` or `--name, fallback`. Returns the
+/// resolved (and recursively var-expanded) value, or the (expanded) fallback, or empty.
+fn resolve_one_var(args: &str, vars: &HashMap<String, String>, depth: usize) -> String {
+    // Split into name and optional fallback at the first top-level comma.
+    let (name, fallback) = split_first_comma(args);
+    let name = name.trim();
+    if let Some(v) = vars.get(name) {
+        // The looked-up value may itself contain var() references.
+        return resolve_vars_depth(v, vars, depth + 1);
+    }
+    match fallback {
+        Some(fb) => resolve_vars_depth(fb.trim(), vars, depth + 1),
+        None => String::new(),
+    }
+}
+
+/// Split `s` at the first top-level comma (not inside nested parens). Returns `(before, after)`.
+fn split_first_comma(s: &str) -> (&str, Option<&str>) {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (idx, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => return (&s[..idx], Some(&s[idx + 1..])),
+            _ => {}
+        }
+    }
+    (s, None)
+}
+
+/// Decide whether a rule with the given raw `@media` query applies at the assumed desktop
+/// viewport ([`ASSUMED_VIEWPORT_WIDTH`]). `None` (no media) always applies. We parse the
+/// common Tailwind shapes: `screen`/`all` match, `print` does not, and single
+/// `min-width`/`max-width` px thresholds are compared against the assumed width. Multiple
+/// `and`-joined conditions must all pass. Unrecognized features are treated as matching
+/// (best-effort, so we don't drop rules we can't fully parse).
+fn media_applies(media: Option<&str>) -> bool {
+    let query = match media {
+        None => return true,
+        Some(q) => q.trim(),
+    };
+    if query.is_empty() {
+        return true;
+    }
+    // A comma-separated media query list matches if ANY component matches.
+    query.split(',').any(|component| media_component_matches(component))
+}
+
+fn media_component_matches(component: &str) -> bool {
+    let lower = component.trim().to_ascii_lowercase();
+    // Split on `and`; each part is a media type or a `(feature: value)` condition.
+    for raw in lower.split(" and ") {
+        let part = raw.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Media types.
+        if part == "screen" || part == "all" {
+            continue;
+        }
+        if part == "print" {
+            return false;
+        }
+        // Feature conditions like `(min-width: 768px)`.
+        if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+            if let Some((feature, value)) = inner.split_once(':') {
+                let feature = feature.trim();
+                let value = value.trim();
+                match feature {
+                    "min-width" => {
+                        if let Some(px) = length_px(value) {
+                            if ASSUMED_VIEWPORT_WIDTH < px {
+                                return false;
+                            }
+                        }
+                    }
+                    "max-width" => {
+                        if let Some(px) = length_px(value) {
+                            if ASSUMED_VIEWPORT_WIDTH > px {
+                                return false;
+                            }
+                        }
+                    }
+                    // Unrecognized features (orientation, prefers-*, …): treat as matching.
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        // Bare `not`/`only` prefixes or unknown tokens: be permissive (treat as matching),
+        // except an explicit leading `not` which we honor crudely.
+        if part.starts_with("not ") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse a media-query length to px. Supports `px`, `rem`/`em` (×16), bare numbers (px).
+fn length_px(value: &str) -> Option<f32> {
+    let v = value.trim().to_ascii_lowercase();
+    if let Some(n) = v.strip_suffix("px") {
+        n.trim().parse::<f32>().ok()
+    } else if let Some(n) = v.strip_suffix("rem") {
+        n.trim().parse::<f32>().ok().map(|x| x * 16.0)
+    } else if let Some(n) = v.strip_suffix("em") {
+        n.trim().parse::<f32>().ok().map(|x| x * 16.0)
+    } else {
+        v.parse::<f32>().ok()
+    }
 }
 
 /// Block-level-by-default tags (mirrors the layout UA list).
@@ -646,15 +844,29 @@ fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
 }
 
 /// Apply a single declaration to `style`. Unknown properties/values are ignored silently.
-fn apply_declaration(style: &mut ComputedStyle, prop: &str, val: &str, parent: &ComputedStyle) {
+fn apply_declaration(
+    style: &mut ComputedStyle,
+    prop: &str,
+    val: &str,
+    parent: &ComputedStyle,
+    current_color: (u8, u8, u8),
+    inherited_color: (u8, u8, u8),
+) {
     match prop {
         "color" => {
-            if let Some(c) = parse_color(val) {
+            let trimmed = val.trim().to_ascii_lowercase();
+            if trimmed == "inherit" {
+                style.color = inherited_color;
+            } else if trimmed == "initial" || trimmed == "unset" {
+                style.color = ComputedStyle::default().color;
+            } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.color = c;
             }
         }
         "background-color" | "background" => {
-            if let Some(c) = parse_color(val) {
+            // For `background`, only attempt a solid-color interpretation; gradients/images
+            // and `transparent`/`none` leave the background unchanged (None stays None).
+            if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.background_color = Some(c);
             }
         }
@@ -851,11 +1063,11 @@ fn apply_declaration(style: &mut ComputedStyle, prop: &str, val: &str, parent: &
         "padding-left" => set_edge(&mut style.padding, EdgeSide::Left, val),
 
         // --- Box model: border ---
-        "border" => apply_border_shorthand(style, val, EdgeSide::All),
-        "border-top" => apply_border_shorthand(style, val, EdgeSide::Top),
-        "border-right" => apply_border_shorthand(style, val, EdgeSide::Right),
-        "border-bottom" => apply_border_shorthand(style, val, EdgeSide::Bottom),
-        "border-left" => apply_border_shorthand(style, val, EdgeSide::Left),
+        "border" => apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color),
+        "border-top" => apply_border_shorthand(style, val, EdgeSide::Top, current_color, inherited_color),
+        "border-right" => apply_border_shorthand(style, val, EdgeSide::Right, current_color, inherited_color),
+        "border-bottom" => apply_border_shorthand(style, val, EdgeSide::Bottom, current_color, inherited_color),
+        "border-left" => apply_border_shorthand(style, val, EdgeSide::Left, current_color, inherited_color),
         "border-width" => {
             if let Some(e) = parse_edges_shorthand(val) {
                 style.border = e;
@@ -866,7 +1078,7 @@ fn apply_declaration(style: &mut ComputedStyle, prop: &str, val: &str, parent: &
         "border-bottom-width" => set_edge(&mut style.border, EdgeSide::Bottom, val),
         "border-left-width" => set_edge(&mut style.border, EdgeSide::Left, val),
         "border-color" => {
-            if let Some(c) = parse_color(val) {
+            if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.border_color = c;
             }
         }
@@ -969,7 +1181,13 @@ fn parse_edges_shorthand(val: &str) -> Option<Edges> {
 /// Apply a `border` (or per-side `border-top` etc.) shorthand: extract a width (the first
 /// length token; `none`/`0` → 0) and a color (the first parseable color token). Border style
 /// is ignored. Tokens that are neither are skipped.
-fn apply_border_shorthand(style: &mut ComputedStyle, val: &str, side: EdgeSide) {
+fn apply_border_shorthand(
+    style: &mut ComputedStyle,
+    val: &str,
+    side: EdgeSide,
+    current_color: (u8, u8, u8),
+    inherited_color: (u8, u8, u8),
+) {
     let mut width: Option<f32> = None;
     let mut color: Option<(u8, u8, u8)> = None;
     let mut saw_none = false;
@@ -993,7 +1211,7 @@ fn apply_border_shorthand(style: &mut ComputedStyle, val: &str, side: EdgeSide) 
             }
         }
         if color.is_none() {
-            if let Some(c) = parse_color(tok) {
+            if let Some(c) = parse_color_ctx(tok, current_color, inherited_color) {
                 color = Some(c);
             }
         }
@@ -1042,13 +1260,210 @@ fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
     }
 }
 
-/// Parse a color: `#rgb`, `#rrggbb`, or a small set of named colors. `None` if unrecognized.
-fn parse_color(val: &str) -> Option<(u8, u8, u8)> {
+/// Parse a color to opaque `(r, g, b)`. Supports hex (`#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa`),
+/// named colors, and the functional forms `rgb()`/`rgba()`, `hsl()`/`hsla()`, `oklch()`, and
+/// `oklab()`. Alpha is parsed but dropped (treated as opaque). Returns `None` if unrecognized.
+///
+/// `current` supplies the value of `currentColor`; `inherited` supplies the value used for
+/// `inherit`. Keywords `transparent`/`initial` return `None` (caller treats as "no change /
+/// no color").
+fn parse_color_ctx(
+    val: &str,
+    current: (u8, u8, u8),
+    inherited: (u8, u8, u8),
+) -> Option<(u8, u8, u8)> {
     let v = val.trim();
+    let lower = v.to_ascii_lowercase();
+
+    // Keywords.
+    match lower.as_str() {
+        "currentcolor" => return Some(current),
+        "inherit" => return Some(inherited),
+        "transparent" | "initial" | "unset" | "none" | "revert" => return None,
+        _ => {}
+    }
+
     if let Some(hex) = v.strip_prefix('#') {
         return parse_hex(hex);
     }
-    let named = match v.to_ascii_lowercase().as_str() {
+
+    // Functional color: name( args ).
+    if let Some(open) = v.find('(') {
+        if v.ends_with(')') {
+            let func = v[..open].trim().to_ascii_lowercase();
+            let inner = &v[open + 1..v.len() - 1];
+            return parse_color_function(&func, inner);
+        }
+    }
+
+    parse_named_color(&lower)
+}
+
+/// Convenience wrapper used where no element context is needed (currentColor/inherit map to a
+/// neutral default). Prefer [`parse_color_ctx`] in the cascade.
+#[cfg(test)]
+fn parse_color(val: &str) -> Option<(u8, u8, u8)> {
+    parse_color_ctx(val, (0, 0, 0), (0, 0, 0))
+}
+
+/// Parse a functional color body (the text between the parens), given the lowercased function
+/// name. Handles `rgb`/`rgba`/`hsl`/`hsla`/`oklch`/`oklab`.
+fn parse_color_function(func: &str, inner: &str) -> Option<(u8, u8, u8)> {
+    // Relative-color syntax (`rgb(from red r g b)`) and other exotic forms are not supported;
+    // bail out so the caller can fall back rather than mis-parse.
+    if inner.trim_start().to_ascii_lowercase().starts_with("from ") {
+        return None;
+    }
+    // Split on commas and/or whitespace; also strip an optional `/ alpha` segment.
+    let main = inner.split('/').next().unwrap_or(inner);
+    let toks: Vec<&str> = main
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    match func {
+        "rgb" | "rgba" => {
+            if toks.len() < 3 {
+                return None;
+            }
+            Some((
+                parse_rgb_component(toks[0])?,
+                parse_rgb_component(toks[1])?,
+                parse_rgb_component(toks[2])?,
+            ))
+        }
+        "hsl" | "hsla" => {
+            if toks.len() < 3 {
+                return None;
+            }
+            let h = parse_number(toks[0])?;
+            let s = parse_percent_or_unit(toks[1])?; // 0..1
+            let l = parse_percent_or_unit(toks[2])?; // 0..1
+            Some(hsl_to_rgb(h, s, l))
+        }
+        "oklch" => {
+            if toks.len() < 3 {
+                return None;
+            }
+            let l = parse_percent_or_unit(toks[0])?; // 0..1 (or %)
+            let c = parse_number(toks[1])?;
+            let h = parse_number(toks[2])?;
+            Some(oklch_to_srgb(l, c, h))
+        }
+        "oklab" => {
+            if toks.len() < 3 {
+                return None;
+            }
+            let l = parse_percent_or_unit(toks[0])?;
+            let a = parse_number(toks[1])?;
+            let b = parse_number(toks[2])?;
+            Some(oklab_to_srgb(l, a, b))
+        }
+        _ => None,
+    }
+}
+
+/// Parse an rgb channel: `0..255` integer/float, or a percentage `0%..100%`.
+fn parse_rgb_component(tok: &str) -> Option<u8> {
+    if let Some(p) = tok.strip_suffix('%') {
+        let pct = p.trim().parse::<f32>().ok()?;
+        return Some((pct / 100.0 * 255.0).round().clamp(0.0, 255.0) as u8);
+    }
+    let n = tok.parse::<f32>().ok()?;
+    Some(n.round().clamp(0.0, 255.0) as u8)
+}
+
+/// Parse a bare number (drops a trailing `deg`/`rad`/`turn` unit on angles, treating the value
+/// as already in the natural unit for the caller — degrees for hue, etc.).
+fn parse_number(tok: &str) -> Option<f32> {
+    let t = tok.trim();
+    for unit in ["deg", "grad", "rad", "turn"] {
+        if let Some(stripped) = t.strip_suffix(unit) {
+            let v = stripped.trim().parse::<f32>().ok()?;
+            return Some(match unit {
+                "deg" => v,
+                "grad" => v * 0.9,
+                "rad" => v.to_degrees(),
+                "turn" => v * 360.0,
+                _ => v,
+            });
+        }
+    }
+    t.parse::<f32>().ok()
+}
+
+/// Parse a value that may be a percentage (`50%` → 0.5) or a unitless number used as-is.
+fn parse_percent_or_unit(tok: &str) -> Option<f32> {
+    if let Some(p) = tok.strip_suffix('%') {
+        return p.trim().parse::<f32>().ok().map(|v| v / 100.0);
+    }
+    tok.trim().parse::<f32>().ok()
+}
+
+/// HSL (h in degrees, s/l in 0..1) → sRGB 8-bit.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let h = ((h % 360.0) + 360.0) % 360.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (((h / 60.0) % 2.0) - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = match (h / 60.0) as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        (((r1 + m) * 255.0).round()).clamp(0.0, 255.0) as u8,
+        (((g1 + m) * 255.0).round()).clamp(0.0, 255.0) as u8,
+        (((b1 + m) * 255.0).round()).clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// OKLCH (L 0..1, C chroma, H degrees) → sRGB 8-bit.
+fn oklch_to_srgb(l: f32, c: f32, h: f32) -> (u8, u8, u8) {
+    let hr = h.to_radians();
+    oklab_to_srgb(l, c * hr.cos(), c * hr.sin())
+}
+
+/// OKLab (L 0..1, a, b) → sRGB 8-bit. Uses the standard OKLab→linear-sRGB matrices, then the
+/// sRGB transfer function, clamped to [0, 255].
+fn oklab_to_srgb(l: f32, a: f32, b: f32) -> (u8, u8, u8) {
+    // OKLab → LMS' (cube of intermediate).
+    let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+
+    let lc = l_ * l_ * l_;
+    let mc = m_ * m_ * m_;
+    let sc = s_ * s_ * s_;
+
+    // LMS → linear sRGB.
+    let lr = 4.076_741_7 * lc - 3.307_711_6 * mc + 0.230_969_94 * sc;
+    let lg = -1.268_438 * lc + 2.609_757_4 * mc - 0.341_319_38 * sc;
+    let lb = -0.004_196_086 * lc - 0.703_418_6 * mc + 1.707_614_7 * sc;
+
+    (
+        srgb_encode(lr),
+        srgb_encode(lg),
+        srgb_encode(lb),
+    )
+}
+
+/// Linear sRGB component (0..1, may be out of range) → gamma-encoded 8-bit, clamped.
+fn srgb_encode(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let v = if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (v * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn parse_named_color(lower: &str) -> Option<(u8, u8, u8)> {
+    let named = match lower {
         "black" => (0, 0, 0),
         "white" => (255, 255, 255),
         "red" => (255, 0, 0),
@@ -1075,17 +1490,34 @@ fn parse_color(val: &str) -> Option<(u8, u8, u8)> {
 
 fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
     let h = hex.trim();
+    let hx = |s: &str| u8::from_str_radix(s, 16).ok();
     match h.len() {
+        // #rgb
         3 => {
-            let r = u8::from_str_radix(&h[0..1], 16).ok()?;
-            let g = u8::from_str_radix(&h[1..2], 16).ok()?;
-            let b = u8::from_str_radix(&h[2..3], 16).ok()?;
+            let r = hx(&h[0..1])?;
+            let g = hx(&h[1..2])?;
+            let b = hx(&h[2..3])?;
             Some((r * 17, g * 17, b * 17))
         }
+        // #rgba — drop alpha.
+        4 => {
+            let r = hx(&h[0..1])?;
+            let g = hx(&h[1..2])?;
+            let b = hx(&h[2..3])?;
+            Some((r * 17, g * 17, b * 17))
+        }
+        // #rrggbb
         6 => {
-            let r = u8::from_str_radix(&h[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&h[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+            let r = hx(&h[0..2])?;
+            let g = hx(&h[2..4])?;
+            let b = hx(&h[4..6])?;
+            Some((r, g, b))
+        }
+        // #rrggbbaa — drop alpha.
+        8 => {
+            let r = hx(&h[0..2])?;
+            let g = hx(&h[2..4])?;
+            let b = hx(&h[4..6])?;
             Some((r, g, b))
         }
         _ => None,
@@ -1114,6 +1546,11 @@ fn match_simple_selector(sel: &str, el: &dom::ElementData) -> Option<u32> {
     }
     if sel == "*" {
         return Some(0);
+    }
+    // `:root` matches the document root element (the `<html>` element). We approximate by
+    // matching any `html` element. Specificity of a pseudo-class is class-level (10).
+    if sel.eq_ignore_ascii_case(":root") {
+        return if el.tag.eq_ignore_ascii_case("html") { Some(10) } else { None };
     }
 
     // Split a compound selector into its components: a leading optional type, then a run of
@@ -1568,6 +2005,137 @@ mod tests {
     }
 
     #[test]
+    fn rgb_function_parses() {
+        assert_eq!(parse_color("rgb(255 0 0)"), Some((255, 0, 0)));
+        assert_eq!(parse_color("rgb(255, 0, 0)"), Some((255, 0, 0)));
+        assert_eq!(parse_color("rgba(0, 0, 255, 0.5)"), Some((0, 0, 255)));
+        assert_eq!(parse_color("rgb(100% 0% 0%)"), Some((255, 0, 0)));
+    }
+
+    #[test]
+    fn hsl_function_parses_to_red() {
+        let (r, g, b) = parse_color("hsl(0 100% 50%)").unwrap();
+        assert!(r > 250, "r={r}");
+        assert!(g < 5 && b < 5, "g={g} b={b}");
+    }
+
+    #[test]
+    fn oklch_red_is_roughly_red() {
+        // Tailwind-ish red: high lightness/chroma at ~29deg hue.
+        let (r, g, b) = parse_color("oklch(0.628 0.2577 29.23)").unwrap();
+        assert!(r > 200, "expected high R, got {r}");
+        assert!(g < 120 && b < 120, "expected low-ish G/B, got g={g} b={b}");
+        assert!(r > g && r > b, "red should dominate: {r},{g},{b}");
+    }
+
+    #[test]
+    fn oklab_parses() {
+        // Should not panic and stay in range.
+        let c = parse_color("oklab(0.5 0.1 0.1)");
+        assert!(c.is_some());
+    }
+
+    #[test]
+    fn hex_alpha_drops_alpha() {
+        assert_eq!(parse_color("#ff000080"), Some((255, 0, 0)));
+        assert_eq!(parse_color("#f008"), Some((255, 0, 0)));
+    }
+
+    #[test]
+    fn transparent_yields_no_color() {
+        assert_eq!(parse_color("transparent"), None);
+    }
+
+    #[test]
+    fn var_resolves_from_root_to_descendant() {
+        // :root sets --x; a descendant uses color: var(--x).
+        let sheet = css::parse(":root { --x: #0000ff } span { color: var(--x) }");
+        let doc = html::parse(r#"<html><body><div><span>t</span></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&span].color, (0, 0, 255));
+    }
+
+    #[test]
+    fn var_fallback_used_when_undefined() {
+        let sheet = css::parse("p { color: var(--missing, #00ff00) }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (0, 255, 0));
+    }
+
+    #[test]
+    fn var_referencing_var_resolves() {
+        let sheet = css::parse(":root { --a: #ff0000; --b: var(--a) } p { color: var(--b) }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (255, 0, 0));
+    }
+
+    #[test]
+    fn cyclic_var_does_not_hang() {
+        let sheet = css::parse(":root { --a: var(--b); --b: var(--a) } p { color: var(--a) }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        // Should terminate (depth cap) and simply not set a color.
+        let _ = cascade(&doc, &[sheet]);
+    }
+
+    #[test]
+    fn current_color_uses_element_color() {
+        let sheet = css::parse("p { color: #ff0000; border: 1px solid currentColor }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].border_color, (255, 0, 0));
+    }
+
+    #[test]
+    fn inherit_keyword_takes_parent_color() {
+        let sheet = css::parse("#wrap { color: #ff0000 } span { color: inherit }");
+        let doc = html::parse(
+            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&span].color, (255, 0, 0));
+    }
+
+    #[test]
+    fn media_min_width_rule_applies_at_desktop() {
+        // min-width:768px applies at the assumed 1280px viewport.
+        let sheet = css::parse("@media (min-width: 768px) { p { color: #00ff00 } }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (0, 255, 0));
+    }
+
+    #[test]
+    fn media_min_width_above_viewport_does_not_apply() {
+        let sheet = css::parse(
+            "p { color: #ff0000 } @media (min-width: 2000px) { p { color: #00ff00 } }",
+        );
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        // 2000px > 1280px assumed width, so the media rule does not apply: stays red.
+        assert_eq!(map[&p].color, (255, 0, 0));
+    }
+
+    #[test]
+    fn media_max_width_below_viewport_does_not_apply() {
+        let sheet = css::parse(
+            "p { color: #ff0000 } @media (max-width: 600px) { p { color: #00ff00 } }",
+        );
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (255, 0, 0));
+    }
+
+    #[test]
     fn box_props_do_not_inherit() {
         let sheet = css::parse("#wrap { margin: 30px; padding: 10px; width: 300px }");
         let doc = html::parse(
@@ -1580,3 +2148,4 @@ mod tests {
         assert_eq!(map[&span].width, None);
     }
 }
+
