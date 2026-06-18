@@ -410,6 +410,10 @@ fn build_children(
     // First, produce a flat list of child boxes (each tagged block vs inline).
     let mut flat: Vec<LayoutBox> = Vec::new();
     for &child in &doc.get(parent_id).children {
+        // Defensive: never index the arena with a stale/garbage child id (see prune_invalid).
+        if child.0 >= doc.len() {
+            continue;
+        }
         build_box(doc, child, styles, intrinsic_sizes, &mut flat);
     }
 

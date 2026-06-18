@@ -463,6 +463,11 @@ fn cascade_node(
     };
     let hidden = parent_hidden || computed.display_none;
     for &child in &node.children {
+        // Defensive: skip any child id that points outside the arena. The engine prunes these
+        // after JS runs, but guarding here too means a stale id can never panic the renderer.
+        if child.0 >= doc.len() {
+            continue;
+        }
         cascade_node(doc, child, &computed, &vars, hidden, index, out);
     }
 }
