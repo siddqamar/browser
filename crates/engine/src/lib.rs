@@ -653,8 +653,10 @@ pub fn extract_visible_text(doc: &dom::Document) -> String {
 const MAX_EXTERNAL_STYLESHEETS: usize = 100;
 /// Maximum number of external scripts fetched per page; the rest are skipped with a note.
 const MAX_EXTERNAL_SCRIPTS: usize = 24;
-/// Skip fetched script bodies larger than this (mirrors the inline-script cap).
-const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
+/// Skip fetched script bodies larger than this (mirrors the inline-script cap). Large SPA
+/// frameworks ship multi-MB bundles (e.g. youtube's main app bundle is ~10.5 MB), so the cap is
+/// generous; V8 parses lazily and the per-run execution budget bounds the time.
+const MAX_SCRIPT_BYTES: usize = 32 * 1024 * 1024;
 
 /// One author stylesheet source in document order: either an inline `<style>` body or an
 /// external `<link rel=stylesheet href>` whose `href` resolved to an absolute URL.

@@ -2291,6 +2291,38 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
                get lastChild() { return kids[kids.length - 1] || null; }, get children() { return kids; } };
     });
   }
+  // document.implementation.createHTMLDocument — used to build/parse HTML off to the side (e.g.
+  // sanitizers, template parsing). We back it with real (detached) arena nodes so innerHTML /
+  // appendChild / querySelector work on the returned document's tree.
+  if (typeof document.implementation === "undefined" || !document.implementation) {
+    def(document, "implementation", {
+      hasFeature: function () { return true; },
+      createDocumentType: function (name, pub, sys) { return { nodeType: 10, name: String(name), publicId: pub || "", systemId: sys || "" }; },
+      createHTMLDocument: function (title) {
+        var htmlEl = document.createElement("html");
+        var headEl = document.createElement("head");
+        var bodyEl = document.createElement("body");
+        htmlEl.appendChild(headEl); htmlEl.appendChild(bodyEl);
+        if (title !== undefined && title !== null) {
+          var t = document.createElement("title"); t.textContent = String(title); headEl.appendChild(t);
+        }
+        return {
+          nodeType: 9, documentElement: htmlEl, head: headEl, body: bodyEl, title: title ? String(title) : "",
+          createElement: function (tag) { return document.createElement(tag); },
+          createElementNS: function (ns, tag) { return document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag); },
+          createTextNode: function (s) { return document.createTextNode(s); },
+          createComment: function (s) { return document.createComment(s); },
+          createDocumentFragment: function () { return document.createDocumentFragment(); },
+          importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
+          getElementById: function (id) { return htmlEl.querySelector ? htmlEl.querySelector('#' + id) : null; },
+          querySelector: function (s) { return htmlEl.querySelector ? htmlEl.querySelector(s) : null; },
+          querySelectorAll: function (s) { return htmlEl.querySelectorAll ? htmlEl.querySelectorAll(s) : []; },
+          getElementsByTagName: function (t) { return htmlEl.getElementsByTagName ? htmlEl.getElementsByTagName(t) : []; },
+        };
+      },
+      createDocument: function () { return this.createHTMLDocument(""); },
+    });
+  }
   if (typeof document.getElementsByName !== "function") {
     def(document, "getElementsByName", function (n) { try { return document.querySelectorAll('[name="' + String(n) + '"]'); } catch (e) { return []; } });
   }
@@ -2440,6 +2472,27 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // HTMLMediaElement should sit under HTMLElement; audio/video under it. Keep flat-under-HTMLElement
   // for simplicity except a couple that pages explicitly chain.
   for (var hi = 0; hi < htmlSubclasses.length; hi++) { defClass(htmlSubclasses[hi], HTMLElementCtor); }
+
+  // Document / Window and the other DOM interface constructors pages reference as globals
+  // (e.g. `x instanceof Document`, `Node.prototype`, `HTMLCollection`). Defined so references and
+  // instanceof checks don't throw ReferenceError.
+  var DocumentCtor = defClass("Document", NodeCtor);
+  defClass("HTMLDocument", DocumentCtor);
+  defClass("XMLDocument", DocumentCtor);
+  defClass("Window", globalThis.EventTarget);
+  defClass("AbstractRange"); defClass("Range", globalThis.AbstractRange); defClass("StaticRange", globalThis.AbstractRange);
+  var domIfaces = [
+    "HTMLCollection", "NodeList", "DOMTokenList", "NamedNodeMap", "DOMStringMap", "DOMRectList",
+    "CSSStyleDeclaration", "StyleSheet", "CSSStyleSheet", "StyleSheetList", "MediaList",
+    "CSSRule", "CSSStyleRule", "CSSMediaRule", "CSSKeyframesRule", "CSSKeyframeRule",
+    "CSSImportRule", "CSSFontFaceRule", "CSSSupportsRule", "CSSGroupingRule",
+    "DOMRect", "DOMRectReadOnly", "DOMPoint", "DOMPointReadOnly", "DOMMatrix", "DOMMatrixReadOnly",
+    "DOMQuad", "DOMException", "DOMParser", "XMLSerializer", "XPathResult", "XPathEvaluator",
+    "MutationRecord", "AnimationEffect", "KeyframeEffect", "Animation", "AnimationTimeline",
+    "CSSStyleValue", "StylePropertyMap", "VisualViewport", "Selection", "TextMetrics",
+    "TimeRanges", "ValidityState", "HTMLFormControlsCollection", "RadioNodeList",
+  ];
+  for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
 
   // --- Image / Audio / media element constructors ------------------------------------------
   if (typeof globalThis.Image !== "function") {
@@ -2774,6 +2827,48 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   if (typeof globalThis.CustomEvent !== "function") {
     def(globalThis, "CustomEvent", function (type, init) { this.type = String(type); this.detail = init ? init.detail : null; this.bubbles = !!(init && init.bubbles); this.preventDefault = fn; this.stopPropagation = fn; });
   }
+  // Event subclasses (UIEvent/MouseEvent/KeyboardEvent/etc.). Each extends Event with its init
+  // fields copied through, so `new MouseEvent('click', {...})` and friends construct without error.
+  (function () {
+    function makeEventClass(extraDefaults) {
+      return function (type, init) {
+        init = init || {};
+        globalThis.Event.call(this, type, init);
+        for (var k in extraDefaults) { this[k] = (k in init) ? init[k] : extraDefaults[k]; }
+        this.detail = init.detail || 0;
+        this.view = init.view || globalThis.window || null;
+      };
+    }
+    var classes = {
+      UIEvent: {},
+      FocusEvent: { relatedTarget: null },
+      MouseEvent: { screenX: 0, screenY: 0, clientX: 0, clientY: 0, pageX: 0, pageY: 0, button: 0, buttons: 0, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, relatedTarget: null, movementX: 0, movementY: 0, getModifierState: undefined },
+      PointerEvent: { pointerId: 0, width: 1, height: 1, pressure: 0, pointerType: "", isPrimary: false, clientX: 0, clientY: 0, button: 0, buttons: 0 },
+      KeyboardEvent: { key: "", code: "", keyCode: 0, which: 0, charCode: 0, location: 0, repeat: false, isComposing: false, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, getModifierState: undefined },
+      WheelEvent: { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0, clientX: 0, clientY: 0 },
+      InputEvent: { data: null, inputType: "", isComposing: false },
+      TouchEvent: { touches: [], targetTouches: [], changedTouches: [], ctrlKey: false, shiftKey: false, altKey: false, metaKey: false },
+      PopStateEvent: { state: null },
+      HashChangeEvent: { oldURL: "", newURL: "" },
+      MessageEvent: { data: null, origin: "", lastEventId: "", source: null, ports: [] },
+      ProgressEvent: { lengthComputable: false, loaded: 0, total: 0 },
+      ErrorEvent: { message: "", filename: "", lineno: 0, colno: 0, error: null },
+      AnimationEvent: { animationName: "", elapsedTime: 0, pseudoElement: "" },
+      TransitionEvent: { propertyName: "", elapsedTime: 0, pseudoElement: "" },
+      CloseEvent: { code: 0, reason: "", wasClean: false },
+    };
+    for (var name in classes) {
+      if (typeof globalThis[name] !== "function") {
+        var ctor = makeEventClass(classes[name]);
+        ctor.prototype = Object.create(globalThis.Event.prototype || Object.prototype);
+        def(globalThis, name, ctor);
+      }
+    }
+    if (typeof globalThis.getModifierState === "undefined") {
+      try { globalThis.MouseEvent.prototype.getModifierState = function () { return false; };
+            globalThis.KeyboardEvent.prototype.getModifierState = function () { return false; }; } catch (e) {}
+    }
+  })();
 })();
 "#;
 
