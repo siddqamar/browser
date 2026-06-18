@@ -897,13 +897,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return String(cString: cstr)
     }
 
-    /// A simple click on the page content: if it landed on a link, navigate to it (recording
-    /// history so Back works), reusing the same path as entering a URL.
+    /// A click on the page content. First dispatches a `click` into the live page JS (so the
+    /// page's own handlers run — interactivity); then, if the click landed on a link, navigates
+    /// (recording history so Back works). If JS mutated the DOM but it wasn't a link, re-renders.
     private func handleContentClick(_ localPoint: CGPoint) {
-        guard let url = linkURL(at: localPoint) else { return }
-        urlField.stringValue = url
-        load(urlString: url, recordHistory: true)
-        refresh()
+        guard let engine = activeTab?.engine, let bitmapView = bitmapView else { return }
+        let scale = CGFloat(window?.backingScaleFactor ?? 1)
+        let fyTop = bitmapView.bounds.height - localPoint.y
+        let fxDevice = Float(localPoint.x * scale)
+        let fyDevice = Float(fyTop * scale)
+
+        // 1. Fire the page's JS click handlers (bubbling). Returns 1 if the DOM changed.
+        let changed = browser_engine_dispatch_click(engine, fxDevice, fyDevice)
+
+        // 2. If it landed on a link, navigate (supersedes a re-render).
+        if let cstr = browser_engine_link_at(engine, fxDevice, fyDevice) {
+            let url = String(cString: cstr)
+            urlField.stringValue = url
+            load(urlString: url, recordHistory: true)
+            refresh()
+            return
+        }
+
+        // 3. Otherwise, repaint if the JS handler changed the page.
+        if changed != 0 { refresh() }
     }
 
     // MARK: Rendering

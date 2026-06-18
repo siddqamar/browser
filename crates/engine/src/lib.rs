@@ -65,6 +65,10 @@ pub struct Engine {
     /// Retained so the FFI layer can hand out a pointer that stays valid until the next
     /// render or until the engine is dropped.
     framebuffer: Option<Framebuffer>,
+    /// Live per-page JS runtime (persistent V8 isolate) kept alive after load so page event
+    /// handlers fire and timers keep running — i.e. the page is interactive. Replaced (old one
+    /// dropped → its thread stops) on each navigation; `None` for pages without scripts.
+    session: Option<js::Session>,
 }
 
 impl Default for Engine {
@@ -84,6 +88,7 @@ impl Engine {
             scroll_y: 0.0,
             layout_cache: None,
             framebuffer: None,
+            session: None,
         }
     }
 
@@ -122,21 +127,20 @@ impl Engine {
                     None => resp.final_url.clone(),
                 };
 
-                // Execute the page's scripts (inline + external `<script src>`, fetched and run
-                // in document order through the real DOM so mutations stick) and capture console.
+                // Start a persistent JS runtime: runs the page's classic scripts + ES modules and
+                // stays alive so event handlers/timers keep working (interactivity). Returns the
+                // initial DOM snapshot. Replaces the old run-once-and-drop path.
                 let mut console: Vec<String> = Vec::new();
+                self.session = None; // drop the previous page's runtime (stops its thread)
                 let doc = match doc {
                     Some(d) => {
-                        let (d, script_console) = run_scripts(d, &base);
-                        console.extend(script_console);
-                        // ES modules are deferred: run them after classic scripts, sharing the
-                        // same DOM. Builds + rewrites the module graph and executes it.
-                        let (mut d, module_console) = run_modules(d, &base);
-                        console.extend(module_console);
+                        let (session, mut snapshot, sess_console) = start_session(d, &base);
+                        console.extend(sess_console);
                         // Page JS can leave stale/garbage node ids in the tree; drop any that
                         // point outside the arena so layout/paint can't hit an out-of-bounds id.
-                        d.prune_invalid();
-                        Some(d)
+                        snapshot.prune_invalid();
+                        self.session = session;
+                        Some(snapshot)
                     }
                     None => None,
                 };
@@ -358,6 +362,65 @@ impl Engine {
             cur = doc.get(id).parent;
         }
         None
+    }
+
+    /// Dispatch a synthetic `click` (device pixel coords, viewport-relative) into the live page
+    /// JS: hit-tests the cached layout for the deepest node, fires the page's `click` handlers
+    /// (with bubbling) in the persistent runtime, then replaces the rendered DOM with the updated
+    /// snapshot and invalidates the layout cache. Returns `true` if a re-render is warranted.
+    pub fn dispatch_click(&mut self, x: f32, y: f32) -> bool {
+        // Hit-test in layout (document) coordinates: header_h = 0, left = 0, so add scroll_y.
+        let node = match self.layout_cache.as_ref() {
+            Some(cache) => match deepest_node_at(&cache.root, x, y + self.scroll_y) {
+                Some(n) => n,
+                None => return false,
+            },
+            None => return false,
+        };
+        let session = match &self.session {
+            Some(s) => s,
+            None => return false,
+        };
+        // clientX/clientY are logical (CSS) px relative to the viewport.
+        let cx = (x / self.scale) as f64;
+        let cy = (y / self.scale) as f64;
+        let (mut snapshot, console) = session.dispatch_event(node.0, "click", cx, cy);
+        snapshot.prune_invalid();
+        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            *doc = Some(snapshot);
+            c.extend(console);
+            self.layout_cache = None; // DOM may have changed → re-cascade/layout/paint
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Run any due timers / microtasks in the live page JS (e.g. deferred work, animation steps)
+    /// and adopt the updated DOM snapshot. Returns `true` if a re-render is warranted.
+    pub fn tick(&mut self) -> bool {
+        let session = match &self.session {
+            Some(s) => s,
+            None => return false,
+        };
+        let (mut snapshot, console) = session.tick();
+        snapshot.prune_invalid();
+        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            *doc = Some(snapshot);
+            c.extend(console);
+            self.layout_cache = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Visible text of the currently-loaded document (empty if none). Handy for tests/diagnostics.
+    pub fn visible_text(&self) -> String {
+        match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => extract_visible_text(d),
+            _ => String::new(),
+        }
     }
 
     /// Test-only: number of decoded `<img>` images for the current page.
@@ -1643,6 +1706,72 @@ pub fn run_scripts(doc: dom::Document, base: &str) -> (dom::Document, Vec<String
         }
     }
     (doc, out)
+}
+
+/// Gather the page's classic script sources (inline + external `<script src>`) and its ES-module
+/// graph, then start a persistent [`js::Session`] that runs them and stays alive for interactivity.
+/// Returns the session (None if the page has no scripts/modules), the initial DOM snapshot, and
+/// console/error/note lines. Mirrors the gathering in [`run_scripts`]/[`run_modules`] but hands the
+/// work to a long-lived runtime instead of a run-once worker.
+fn start_session(
+    doc: dom::Document,
+    base: &str,
+) -> (Option<js::Session>, dom::Document, Vec<String>) {
+    let mut notes: Vec<String> = Vec::new();
+
+    // Classic scripts, in document order.
+    let mut classic: Vec<String> = Vec::new();
+    let mut fetched = 0usize;
+    for item in collect_script_sources(&doc, base) {
+        match item {
+            ScriptSource::Inline(src) => {
+                if src.len() > MAX_SCRIPT_BYTES {
+                    notes.push(format!("[skipped large script: {} bytes]", src.len()));
+                } else {
+                    classic.push(src);
+                }
+            }
+            ScriptSource::External(url) => {
+                if fetched >= MAX_EXTERNAL_SCRIPTS {
+                    notes.push(format!(
+                        "[skipped script (limit {MAX_EXTERNAL_SCRIPTS} reached): {url}]"
+                    ));
+                    continue;
+                }
+                fetched += 1;
+                match net::fetch(&url) {
+                    Ok(resp) if resp.body.len() > MAX_SCRIPT_BYTES => notes.push(format!(
+                        "[skipped large script: {} ({} bytes)]",
+                        url,
+                        resp.body.len()
+                    )),
+                    Ok(resp) => classic.push(String::from_utf8_lossy(&resp.body).into_owned()),
+                    Err(e) => notes.push(format!("[failed to load script: {url} — {e}]")),
+                }
+            }
+        }
+    }
+
+    // ES module graph.
+    let (entries, module_sources, mod_notes) = collect_module_graph(&doc, base);
+    notes.extend(mod_notes);
+
+    if classic.is_empty() && entries.is_empty() {
+        return (None, doc, notes);
+    }
+
+    let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
+        net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())
+    });
+    let (session, snapshot, results) =
+        js::Session::new(doc, classic, entries, module_sources, base, fetcher);
+    for result in results {
+        notes.extend(result.console);
+        if let Some(err) = result.error {
+            notes.push(format!("⚠ {err}"));
+        }
+    }
+    (Some(session), snapshot, notes)
 }
 
 fn collect_text(doc: &dom::Document, id: dom::NodeId, out: &mut String) {

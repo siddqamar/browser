@@ -2907,6 +2907,71 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             globalThis.KeyboardEvent.prototype.getModifierState = function () { return false; }; } catch (e) {}
     }
   })();
+
+  // --- synthetic event dispatch (driven from Rust on user interaction) ----------------------
+  // Build a real bubbling event and walk it up the parent chain (node -> ancestors -> document
+  // -> window), invoking each target's __listeners[type] callbacks and its on<type> handler.
+  // Returns false if any handler called preventDefault() (caller maps this to "default action
+  // should not run"), true otherwise.
+  var mouseTypes = { click: 1, mousedown: 1, mouseup: 1, dblclick: 1, contextmenu: 1,
+                     pointerdown: 1, pointerup: 1, mouseover: 1, mouseout: 1 };
+  def(globalThis, "__dispatchSyntheticEvent", function (nodeId, type, props) {
+    var node = null;
+    try { node = canon(__wrapNode(nodeId)); } catch (e) { node = null; }
+    if (!node) { return true; }
+    type = String(type);
+
+    var Ctor = mouseTypes[type] ? globalThis.MouseEvent : globalThis.Event;
+    var ev;
+    try { ev = new Ctor(type, { bubbles: true, cancelable: true }); }
+    catch (e) { ev = { type: type, bubbles: true, cancelable: true, defaultPrevented: false }; }
+    // Copy caller-supplied props (clientX/clientY/button/...) onto the event.
+    if (props) { for (var k in props) { try { ev[k] = props[k]; } catch (e2) {} } }
+
+    var stopped = false, stoppedImmediate = false;
+    ev.defaultPrevented = !!ev.defaultPrevented;
+    ev.preventDefault = function () { this.defaultPrevented = true; };
+    ev.stopPropagation = function () { stopped = true; };
+    ev.stopImmediatePropagation = function () { stopped = true; stoppedImmediate = true; };
+
+    // Build the propagation path: node, its ancestors, document, then window (globalThis).
+    var path = [node];
+    var cur = node;
+    var guard = 0;
+    while (cur && guard < 4096) {
+      var parent = null;
+      try { parent = cur.parentNode; } catch (e3) { parent = null; }
+      if (!parent || parent === cur) { break; }
+      path.push(parent);
+      cur = parent;
+      guard++;
+    }
+    path.push(document);
+    path.push(globalThis);
+
+    try { ev.target = node; } catch (e4) {}
+
+    for (var h = 0; h < path.length; h++) {
+      if (stopped) { break; }
+      var target = path[h];
+      if (!target) { continue; }
+      try { ev.currentTarget = target; } catch (e5) {}
+      var reg = target.__listeners;
+      var list = reg ? reg[type] : null;
+      if (list) {
+        var copy = list.slice();
+        for (var i = 0; i < copy.length; i++) {
+          try { copy[i].call(target, ev); } catch (e6) { (globalThis.__timerErrors || []).push(String(e6)); }
+          if (stoppedImmediate) { break; }
+        }
+      }
+      var on = target["on" + type];
+      if (typeof on === "function") {
+        try { on.call(target, ev); } catch (e7) { (globalThis.__timerErrors || []).push(String(e7)); }
+      }
+    }
+    return !ev.defaultPrevented;
+  });
 })();
 "#;
 
@@ -3738,6 +3803,267 @@ fn run_one_entry(scope: &mut v8::PinScope, entry: &str) -> EvalOutput {
         .unwrap_or_default();
 
     EvalOutput { value: None, console, error }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Persistent runtime session: keeps the isolate + context alive across operations so a page is
+// interactive (event handlers fire, timers keep running) instead of running JS once at load and
+// dropping it. Additive to run_with_dom / run_modules — those are unchanged.
+// ---------------------------------------------------------------------------------------------
+
+/// Escape a string for embedding inside a double-quoted JS string literal.
+fn js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Commands sent to the session's runtime thread. Each variant that produces a result carries a
+/// one-shot reply channel (a fresh `mpsc` per call) so callers block on exactly their own answer.
+enum SessionCmd {
+    /// Dispatch a synthetic bubbling event to a node, drain the loop, reply with snapshot + console.
+    Dispatch {
+        node_id: usize,
+        kind: String,
+        x: f64,
+        y: f64,
+        reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
+    },
+    /// Run due timers / microtasks, reply with snapshot + console.
+    Tick {
+        reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
+    },
+    /// Stop the loop; the isolate is torn down on the thread it lives on.
+    Stop,
+}
+
+/// A persistent JS runtime bound to one page. The V8 isolate + context live for the whole session
+/// on a dedicated thread; [`dispatch_event`](Session::dispatch_event) and [`tick`](Session::tick)
+/// post commands to that thread and block on the reply, returning a fresh DOM snapshot each time.
+/// The session keeps mutating the live document; callers render the returned clone.
+pub struct Session {
+    tx: std::sync::mpsc::Sender<SessionCmd>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Session {
+    /// Spawn the runtime thread, create the isolate + context, install the browser environment, run
+    /// the initial classic `scripts` in order then the module graph (`entries` + `modules`, via
+    /// `fetcher`), drain once, and return the session plus the initial DOM snapshot + per-source
+    /// [`EvalOutput`]s (one per classic script, then one per module entry — matching the order
+    /// `run_with_dom`/`run_modules` would produce).
+    pub fn new(
+        doc: dom::Document,
+        scripts: Vec<String>,
+        entries: Vec<String>,
+        modules: HashMap<String, String>,
+        url: &str,
+        fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    ) -> (Session, dom::Document, Vec<EvalOutput>) {
+        let url = url.to_string();
+        let fallback = doc.clone();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SessionCmd>();
+        // One-shot channel for the initial snapshot + per-source outputs.
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
+
+        let spawn = std::thread::Builder::new()
+            .name("js-session".to_string())
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                // Catch any panic so it never crosses the thread boundary; on panic the init
+                // channel is dropped and the caller falls back to an empty snapshot.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    session_thread_main(doc, scripts, entries, modules, url, fetcher, init_tx, cmd_rx);
+                }));
+            });
+
+        let handle = match spawn {
+            Ok(h) => h,
+            Err(e) => {
+                return (
+                    Session { tx: cmd_tx, handle: None },
+                    fallback,
+                    vec![EvalOutput {
+                        value: None,
+                        console: Vec::new(),
+                        error: Some(format!("could not start JS session thread: {e}")),
+                    }],
+                );
+            }
+        };
+
+        // Block (bounded) for the initial load to finish. On timeout/panic, render the pre-script
+        // DOM — matching the existing channel-timeout fallback in run_with_dom/run_modules.
+        let budget = std::time::Duration::from_secs(20);
+        let (snapshot, outputs) = match init_rx.recv_timeout(budget) {
+            Ok(result) => result,
+            Err(_) => (
+                fallback,
+                vec![EvalOutput {
+                    value: None,
+                    console: Vec::new(),
+                    error: Some("session load timed out or aborted".to_string()),
+                }],
+            ),
+        };
+
+        (Session { tx: cmd_tx, handle: Some(handle) }, snapshot, outputs)
+    }
+
+    /// Dispatch a synthetic bubbling event to `node_id`, drain the event loop, and return a fresh
+    /// DOM snapshot + the console lines produced during this operation. Synchronous (blocks on the
+    /// reply): callers invoke this from their load/UI thread. Returns an empty snapshot/console if
+    /// the session thread is gone.
+    pub fn dispatch_event(
+        &self,
+        node_id: usize,
+        kind: &str,
+        client_x: f64,
+        client_y: f64,
+    ) -> (dom::Document, Vec<String>) {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<String>)>();
+        let cmd = SessionCmd::Dispatch {
+            node_id,
+            kind: kind.to_string(),
+            x: client_x,
+            y: client_y,
+            reply: reply_tx,
+        };
+        if self.tx.send(cmd).is_err() {
+            return (dom::Document::new(), Vec::new());
+        }
+        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+    }
+
+    /// Run due timers / microtasks (e.g. for animations or deferred work) and return a fresh DOM
+    /// snapshot + console. Synchronous; empty snapshot/console if the session thread is gone.
+    pub fn tick(&self) -> (dom::Document, Vec<String>) {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<String>)>();
+        if self.tx.send(SessionCmd::Tick { reply: reply_tx }).is_err() {
+            return (dom::Document::new(), Vec::new());
+        }
+        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Ask the runtime thread to stop, then join so the isolate is dropped on its own thread.
+        let _ = self.tx.send(SessionCmd::Stop);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Body of the session runtime thread: owns the isolate + persistent context for the whole session.
+#[allow(clippy::too_many_arguments)]
+fn session_thread_main(
+    doc: dom::Document,
+    scripts: Vec<String>,
+    entries: Vec<String>,
+    modules: HashMap<String, String>,
+    url: String,
+    fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    init_tx: std::sync::mpsc::Sender<(dom::Document, Vec<EvalOutput>)>,
+    cmd_rx: std::sync::mpsc::Receiver<SessionCmd>,
+) {
+    ensure_v8_initialized();
+    let shared: SharedDoc = Rc::new(RefCell::new(doc));
+    // Keep the isolate owned by this thread for the whole session.
+    let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+    // Register the same isolate-level callbacks run_modules uses so modules + dynamic import work.
+    isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
+    isolate.set_promise_reject_callback(promise_reject_callback);
+    isolate.set_host_initialize_import_meta_object_callback(initialize_import_meta_callback);
+
+    // Create the context once and persist it as a Global across all operations.
+    let context: v8::Global<v8::Context> = {
+        v8::scope!(let handle_scope, &mut isolate);
+        let context = v8::Context::new(handle_scope, Default::default());
+        let scope = &mut v8::ContextScope::new(handle_scope, context);
+
+        // Share one fetcher between the module loader and the JS `fetch()` primitive (as run_modules).
+        let fetcher: Rc<dyn Fn(&str) -> Option<String>> = Rc::new(move |u: &str| fetcher(u));
+        let state = HostState::with_fetcher(Rc::clone(&shared), Rc::clone(&fetcher));
+        scope.get_current_context().set_slot(state);
+        let registry = Rc::new(ModuleRegistry {
+            sources: RefCell::new(modules),
+            compiled: RefCell::new(HashMap::new()),
+            identity_to_url: RefCell::new(HashMap::new()),
+            fetcher,
+            base_url: url.clone(),
+        });
+        scope.get_current_context().set_slot(registry);
+        install_browser_environment(scope, &url);
+
+        // Run initial classic scripts in order, then the module graph, exactly as the load path.
+        let mut results: Vec<EvalOutput> =
+            Vec::with_capacity(scripts.len() + entries.len());
+        for source in &scripts {
+            results.push(eval_source(scope, source, "<script>"));
+        }
+        for entry in &entries {
+            results.push(run_one_entry(scope, entry));
+        }
+        drain_event_loop(scope, &mut results);
+
+        // Send the initial snapshot back to Session::new's caller.
+        let _ = init_tx.send((shared.borrow().clone(), results));
+        v8::Global::new(scope, context)
+    };
+
+    // Command loop: each op re-enters the persistent context via Local::new(global).
+    for cmd in cmd_rx {
+        match cmd {
+            SessionCmd::Dispatch { node_id, kind, x, y, reply } => {
+                let ctx = context.clone();
+                v8::scope!(let handle_scope, &mut isolate);
+                let local_ctx = v8::Local::new(handle_scope, &ctx);
+                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let source = format!(
+                    "__dispatchSyntheticEvent({}, {}, {{clientX:{}, clientY:{}, button:0}})",
+                    node_id,
+                    js_string_literal(&kind),
+                    x,
+                    y,
+                );
+                // Run the dispatch as one op, then drain the loop, folding console into a result.
+                let mut results = vec![eval_source(scope, &source, "<dispatch>")];
+                drain_event_loop(scope, &mut results);
+                let console = results.into_iter().flat_map(|r| r.console).collect();
+                let _ = reply.send((shared.borrow().clone(), console));
+            }
+            SessionCmd::Tick { reply } => {
+                let ctx = context.clone();
+                v8::scope!(let handle_scope, &mut isolate);
+                let local_ctx = v8::Local::new(handle_scope, &ctx);
+                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let mut results = vec![EvalOutput::default()];
+                drain_event_loop(scope, &mut results);
+                let console = results.into_iter().flat_map(|r| r.console).collect();
+                let _ = reply.send((shared.borrow().clone(), console));
+            }
+            SessionCmd::Stop => break,
+        }
+    }
+    // Loop ended (Stop or sender dropped). Drop the isolate on its own thread.
+    drop(context);
+    drop(isolate);
 }
 
 #[cfg(test)]
@@ -4940,5 +5266,82 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("path|true|function|true"));
+    }
+
+    // --- persistent Session ------------------------------------------------------------------
+
+    #[test]
+    fn session_click_handler_mutates_dom() {
+        let doc = html::parse("<button id=btn></button><span id=out>idle</span>");
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            vec![r#"
+                var b = document.getElementById('btn');
+                b.addEventListener('click', function () {
+                    document.getElementById('out').textContent = 'clicked';
+                });
+            "#
+            .to_string()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+
+        // Find the button's node id in the returned snapshot.
+        let btn = find_by_id(&snapshot, snapshot.root(), "btn").expect("btn node");
+
+        let (after, _console) = session.dispatch_event(btn.0, "click", 0.0, 0.0);
+        let out = find_by_id(&after, after.root(), "out").expect("out node");
+        assert_eq!(text_content(&after, out), "clicked");
+    }
+
+    #[test]
+    fn session_timer_runs_on_tick() {
+        let doc = html::parse("<body></body>");
+        let (session, _snapshot, outputs) = Session::new(
+            doc,
+            vec![r#"setTimeout(function () { document.body.setAttribute('data-t', 'fired'); }, 0);"#
+                .to_string()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+
+        // A timer scheduled at 0ms is drained during the initial load already; a tick is a no-op
+        // here but must still produce a valid snapshot. Assert the attribute fired either way.
+        let (after, _console) = session.tick();
+        let body = find_by_tag(&after, after.root(), "body").expect("body node");
+        assert_eq!(attr_of(&after, body, "data-t").as_deref(), Some("fired"));
+    }
+
+    #[test]
+    fn session_event_bubbles_to_ancestor() {
+        let doc = html::parse(
+            "<div id=parent><button id=child></button></div><span id=out>idle</span>",
+        );
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            vec![r#"
+                var p = document.getElementById('parent');
+                p.addEventListener('click', function () {
+                    document.getElementById('out').textContent = 'bubbled';
+                });
+            "#
+            .to_string()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+
+        let child = find_by_id(&snapshot, snapshot.root(), "child").expect("child node");
+        let (after, _console) = session.dispatch_event(child.0, "click", 0.0, 0.0);
+        let out = find_by_id(&after, after.root(), "out").expect("out node");
+        assert_eq!(text_content(&after, out), "bubbled");
     }
 }

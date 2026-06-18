@@ -107,6 +107,16 @@ struct Framebuffer browser_engine_render(struct Engine *engine);
  */
 const char *browser_engine_link_at(struct Engine *engine, float x, float y);
 
+/**
+ * Dispatch a `click` into the live page JS at framebuffer device-pixel `(x, y)` (viewport-
+ * relative). Fires the page's click handlers (with bubbling); if the DOM changed, returns 1 to
+ * signal the caller should re-render. Returns 0 if nothing changed / no live runtime.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+int32_t browser_engine_dispatch_click(struct Engine *engine, float x, float y);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

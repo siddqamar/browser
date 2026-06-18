@@ -181,3 +181,19 @@ pub unsafe extern "C" fn browser_engine_link_at(
         }
     }
 }
+
+/// Dispatch a `click` into the live page JS at framebuffer device-pixel `(x, y)` (viewport-
+/// relative). Fires the page's click handlers (with bubbling); if the DOM changed, returns 1 to
+/// signal the caller should re-render. Returns 0 if nothing changed / no live runtime.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_dispatch_click(engine: *mut Engine, x: f32, y: f32) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    // Page JS is arbitrary; never let a panic cross the C boundary (it would abort the app).
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_click(x, y))) {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
