@@ -2784,6 +2784,56 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     });
   }
 
+  // --- Request / Response (Fetch API classes) ----------------------------------------------
+  if (typeof globalThis.Request !== "function") {
+    var RequestCtor = function (input, init) {
+      init = init || {};
+      var fromReq = input && typeof input === "object" && input.__isRequest;
+      this.url = fromReq ? input.url : ((input && input.url) ? String(input.url) : String(input));
+      this.method = String(init.method || (fromReq && input.method) || "GET").toUpperCase();
+      this.headers = new globalThis.Headers(init.headers || (fromReq ? input.headers : null) || {});
+      this.body = init.body !== undefined ? init.body : (fromReq ? input.body : null);
+      this.credentials = init.credentials || "same-origin";
+      this.mode = init.mode || "cors";
+      this.cache = init.cache || "default";
+      this.redirect = init.redirect || "follow";
+      this.referrer = init.referrer || "about:client";
+      this.signal = init.signal || (fromReq ? input.signal : null) || null;
+      this.__isRequest = true;
+    };
+    RequestCtor.prototype.clone = function () { return new globalThis.Request(this.url, this); };
+    RequestCtor.prototype.text = function () { return Promise.resolve(this.body == null ? "" : String(this.body)); };
+    RequestCtor.prototype.json = function () { try { return Promise.resolve(JSON.parse(this.body == null ? "null" : String(this.body))); } catch (e) { return Promise.reject(e); } };
+    def(globalThis, "Request", RequestCtor);
+  }
+
+  if (typeof globalThis.Response !== "function") {
+    var ResponseCtor = function (body, init) {
+      init = init || {};
+      this.status = init.status !== undefined ? (init.status | 0) : 200;
+      this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
+      this.ok = this.status >= 200 && this.status < 300;
+      this.headers = (init.headers && init.headers.entries) ? init.headers : new globalThis.Headers(init.headers || {});
+      this.url = init.url ? String(init.url) : "";
+      this.redirected = !!init.redirected;
+      this.type = init.type || "default";
+      this.bodyUsed = false;
+      this.body = null;
+      this.__body = (body == null) ? "" : (typeof body === "string" ? body : (typeof body.toString === "function" ? body.toString() : String(body)));
+      this.__isResponse = true;
+    };
+    ResponseCtor.prototype.text = function () { this.bodyUsed = true; return Promise.resolve(this.__body); };
+    ResponseCtor.prototype.json = function () { this.bodyUsed = true; try { return Promise.resolve(JSON.parse(this.__body)); } catch (e) { return Promise.reject(e); } };
+    ResponseCtor.prototype.arrayBuffer = function () { return Promise.resolve(new ArrayBuffer(0)); };
+    ResponseCtor.prototype.blob = function () { return Promise.resolve({ size: this.__body.length, type: (this.headers.get && this.headers.get("content-type")) || "" }); };
+    ResponseCtor.prototype.formData = function () { return Promise.reject(new TypeError("formData not supported")); };
+    ResponseCtor.prototype.clone = function () { return new globalThis.Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, type: this.type, redirected: this.redirected }); };
+    ResponseCtor.json = function (data, init) { init = init || {}; var h = new globalThis.Headers(init.headers || {}); if (!h.has("content-type")) { h.set("content-type", "application/json"); } return new globalThis.Response(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h }); };
+    ResponseCtor.error = function () { var r = new globalThis.Response("", { status: 0 }); r.type = "error"; return r; };
+    ResponseCtor.redirect = function (url, status) { var r = new globalThis.Response("", { status: status || 302 }); r.headers.set("location", String(url)); r.redirected = true; return r; };
+    def(globalThis, "Response", ResponseCtor);
+  }
+
   // --- URLSearchParams ---------------------------------------------------------------------
   if (typeof globalThis.URLSearchParams !== "function") {
     def(globalThis, "URLSearchParams", function (init) {
@@ -3159,41 +3209,16 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 
       var respBody = env.body != null ? String(env.body) : "";
       var contentType = env.contentType != null ? String(env.contentType) : "";
-      var respHeaders = {};
-      if (contentType) { respHeaders["content-type"] = contentType; }
-      var headersObj = {
-        get: function (n) { n = String(n).toLowerCase(); return respHeaders[n] != null ? respHeaders[n] : null; },
-        has: function (n) { n = String(n).toLowerCase(); return respHeaders[n] != null; },
-        forEach: function (cb, thisArg) { for (var n in respHeaders) { cb.call(thisArg, respHeaders[n], n, this); } },
-        keys: function () { return Object.keys(respHeaders)[Symbol.iterator](); },
-        values: function () { return Object.keys(respHeaders).map(function (n) { return respHeaders[n]; })[Symbol.iterator](); },
-        entries: function () { return Object.keys(respHeaders).map(function (n) { return [n, respHeaders[n]]; })[Symbol.iterator](); }
-      };
-      var response = {
-        ok: !!env.ok,
-        status: env.status != null ? env.status : 200,
+      var rh = new globalThis.Headers();
+      if (contentType) { rh.set("content-type", contentType); }
+      // Return a real Response instance (so `instanceof Response`, prototype methods work).
+      var response = new globalThis.Response(respBody, {
+        status: env.status != null ? (env.status | 0) : 200,
         statusText: env.statusText != null ? String(env.statusText) : "",
+        headers: rh,
         url: env.url != null ? String(env.url) : url,
-        redirected: false, type: "basic", bodyUsed: false,
-        headers: headersObj,
-        text: function () { return Promise.resolve(respBody); },
-        json: function () { return Promise.resolve(JSON.parse(respBody)); },
-        arrayBuffer: function () { return Promise.resolve(new ArrayBuffer(0)); },
-        blob: function () { return Promise.resolve({ size: respBody.length, type: contentType }); },
-        formData: function () {
-          var fd = new globalThis.FormData();
-          var parts = respBody ? respBody.split("&") : [];
-          for (var i = 0; i < parts.length; i++) {
-            if (!parts[i]) { continue; }
-            var eq = parts[i].indexOf("=");
-            var k = eq < 0 ? parts[i] : parts[i].slice(0, eq);
-            var v = eq < 0 ? "" : parts[i].slice(eq + 1);
-            try { fd.append(decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))); } catch (e) { fd.append(k, v); }
-          }
-          return Promise.resolve(fd);
-        },
-        clone: function () { return response; }
-      };
+        type: "basic"
+      });
       return Promise.resolve(response);
     });
   }
