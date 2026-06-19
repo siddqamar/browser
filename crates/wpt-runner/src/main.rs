@@ -167,6 +167,8 @@ fn main() {
     );
 
     let (mut files_ok, mut sub_pass, mut sub_fail, mut harness_err, mut timeouts) = (0, 0u64, 0u64, 0u64, 0u64);
+    // (name, pass, fail, state, detail) for the HTML report. pass/fail = -1 for timeout/harness-err.
+    let mut rows: Vec<(String, i64, i64, &'static str, String)> = Vec::new();
     for path in &tests {
         let rel = path.strip_prefix(&*root).unwrap().to_string_lossy().replace(' ', "%20");
         let url = format!("http://127.0.0.1:{port}/{rel}");
@@ -192,6 +194,7 @@ fn main() {
         if !done {
             timeouts += 1;
             println!("TIMEOUT  {short}");
+            rows.push((short, -1, -1, "timeout", String::new()));
             continue;
         }
         let harness = e.console_eval("window.__wpt_harness");
@@ -199,6 +202,7 @@ fn main() {
             harness_err += 1;
             let msg = e.console_eval("window.__wpt_harness_msg");
             println!("HARNESS-ERR  {short}  — {msg}");
+            rows.push((short, -1, -1, "error", msg));
             continue;
         }
         let p: u64 = e.console_eval("window.__wpt_pass").parse().unwrap_or(0);
@@ -207,12 +211,13 @@ fn main() {
         sub_fail += f;
         files_ok += 1;
         let mark = if f == 0 { "PASS" } else { "FAIL" };
+        let detail = if f == 0 { String::new() } else { e.console_eval("window.__wpt_firstfail") };
         if f == 0 {
             println!("{mark} [{p}/{}]  {short}", p + f);
         } else {
-            let ff = e.console_eval("window.__wpt_firstfail");
-            println!("{mark} [{p}/{}]  {short}  — {ff}", p + f);
+            println!("{mark} [{p}/{}]  {short}  — {detail}", p + f);
         }
+        rows.push((short, p as i64, f as i64, if f == 0 { "pass" } else { "fail" }, detail));
     }
 
     println!("\n==== WPT summary: {subpath} ====");
@@ -220,4 +225,61 @@ fn main() {
     let total = sub_pass + sub_fail;
     let pct = if total > 0 { 100.0 * sub_pass as f64 / total as f64 } else { 0.0 };
     println!("subtests: {sub_pass}/{total} passed ({pct:.1}%)");
+
+    // Emit an HTML report (viewable in our own browser). Path via WPT_REPORT or default.
+    let report_path = std::env::var("WPT_REPORT").unwrap_or_else(|_| "/tmp/wpt-report.html".into());
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let mut body = String::new();
+    for (name, p, f, state, detail) in &rows {
+        let (badge, cells) = match *state {
+            "pass" => ("pass", format!("<td class=num>{p}</td><td class=num>0</td>")),
+            "fail" => ("fail", format!("<td class=num>{p}</td><td class=num bad>{f}</td>")),
+            "timeout" => ("timeout", "<td class=num>–</td><td class=num>–</td>".into()),
+            _ => ("error", "<td class=num>–</td><td class=num>–</td>".into()),
+        };
+        let det = if detail.is_empty() { String::new() } else { format!("<div class=det>{}</div>", esc(detail)) };
+        body.push_str(&format!(
+            "<tr class={badge}><td><span class='b {badge}'>{}</span></td><td class=name>{}{}</td>{cells}</tr>\n",
+            badge.to_uppercase(), esc(name), det
+        ));
+    }
+    let bar = pct.round() as u64;
+    let html = format!(
+        r#"<!doctype html><html><head><meta charset=utf-8><title>WPT — {subpath}</title><style>
+:root{{color-scheme:light dark}}
+body{{font-family:system-ui,sans-serif;margin:0;background:#fff;color:#1a1a1a}}
+header{{padding:28px 32px;border-bottom:1px solid #ddd}}
+h1{{margin:0 0 4px;font-size:22px}}
+.sub{{color:#666;font-size:14px}}
+.score{{font-size:56px;font-weight:700;margin:14px 0 6px}}
+.score small{{font-size:22px;color:#666;font-weight:400}}
+.track{{height:10px;border-radius:5px;background:#eee;overflow:hidden;max-width:520px}}
+.fill{{height:100%;background:linear-gradient(90deg,#d33,#e90,#2a2);width:{bar}%}}
+.meta{{margin-top:10px;color:#555;font-size:13px}}
+table{{border-collapse:collapse;width:100%;font-size:13px}}
+td,th{{padding:7px 12px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}
+th{{position:sticky;top:0;background:#fafafa;font-size:12px;color:#666}}
+.num{{text-align:right;font-variant-numeric:tabular-nums;width:60px}}
+.num.bad{{color:#d33;font-weight:600}}
+.name{{font-family:ui-monospace,monospace;color:#222}}
+.det{{color:#b00;font-size:12px;margin-top:3px;font-family:ui-monospace,monospace}}
+.b{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;color:#fff}}
+.b.pass{{background:#2a2}} .b.fail{{background:#d33}} .b.timeout{{background:#999}} .b.error{{background:#a0a}}
+tr.pass td.name{{color:#444}}
+</style></head><body>
+<header>
+<h1>Web Platform Tests — <code>{subpath}</code></h1>
+<div class=sub>run in-process against our own engine via <code>wpt-runner</code></div>
+<div class=score>{pct:.1}% <small>{sub_pass} / {total} subtests</small></div>
+<div class=track><div class=fill></div></div>
+<div class=meta>{files_ok} files ran · {harness_err} harness errors · {timeouts} timeouts · {} testharness files</div>
+</header>
+<table><thead><tr><th>Status</th><th>Test</th><th class=num>Pass</th><th class=num>Fail</th></tr></thead>
+<tbody>
+{body}</tbody></table>
+</body></html>"#,
+        rows.len()
+    );
+    std::fs::write(&report_path, html).expect("write report");
+    println!("HTML report: {report_path}");
 }
