@@ -445,11 +445,33 @@ private struct NetRow {
 /// The bottom devtools panel: a Console tab (page console output + a REPL) and a Network tab
 /// (a request table). Hidden by default; toggled with ⌘⌥I. Reaches the active tab's engine and
 /// the app's refresh() via injected closures.
+/// A thin draggable strip (top edge of the DevTools panel) that reports vertical drag deltas in
+/// window points; positive delta = dragged UP = the panel should grow taller.
+final class ResizeHandle: NSView {
+    var onDrag: ((CGFloat) -> Void)?
+    private var lastY: CGFloat?
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeUpDown) }
+    override func mouseDown(with event: NSEvent) { lastY = event.locationInWindow.y }
+    override func mouseDragged(with event: NSEvent) {
+        guard let l = lastY else { return }
+        let y = event.locationInWindow.y
+        onDrag?(y - l) // window coords are bottom-origin: dragging up increases y → grow
+        lastY = y
+    }
+    override func mouseUp(with event: NSEvent) { lastY = nil }
+}
+
 final class DevToolsView: NSView {
     /// Returns the active tab's engine, or nil if there is none / a load is in flight.
     var engineProvider: (() -> OpaquePointer?)?
     /// Ask the app to re-render the page (an eval may have mutated the DOM).
     var onRefreshPage: (() -> Void)?
+    /// Close the panel (the ✕ button).
+    var onCloseDevTools: (() -> Void)?
+    /// Drag on the top resize handle: `delta` points (positive = make the panel taller).
+    var onResizeDrag: ((CGFloat) -> Void)?
+
+    private let closeButton = NSButton(title: "✕", target: nil, action: nil)
 
     /// REPL input/output lines, kept Swift-side so they survive console-text refreshes. Cleared
     /// on navigation (a REPL session is per page).
@@ -504,6 +526,22 @@ final class DevToolsView: NSView {
         divider.translatesAutoresizingMaskIntoConstraints = false
         addSubview(divider)
 
+        // Draggable resize handle across the top edge (resize-up-down cursor).
+        let resize = ResizeHandle()
+        resize.onDrag = { [weak self] delta in self?.onResizeDrag?(delta) }
+        resize.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(resize)
+
+        // Close (✕) button, top-right.
+        closeButton.bezelStyle = .inline
+        closeButton.isBordered = false
+        closeButton.font = NSFont.systemFont(ofSize: 13)
+        closeButton.contentTintColor = NSColor.secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(closeDevToolsClicked)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(closeButton)
+
         // Tab switcher + header count.
         segmented.selectedSegment = 0
         segmented.target = self
@@ -526,11 +564,20 @@ final class DevToolsView: NSView {
             divider.trailingAnchor.constraint(equalTo: trailingAnchor),
             divider.heightAnchor.constraint(equalToConstant: 1),
 
+            resize.topAnchor.constraint(equalTo: topAnchor),
+            resize.leadingAnchor.constraint(equalTo: leadingAnchor),
+            resize.trailingAnchor.constraint(equalTo: trailingAnchor),
+            resize.heightAnchor.constraint(equalToConstant: 6),
+
             segmented.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 6),
             segmented.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
 
+            closeButton.centerYAnchor.constraint(equalTo: segmented.centerYAnchor),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            closeButton.widthAnchor.constraint(equalToConstant: 22),
+
             header.centerYAnchor.constraint(equalTo: segmented.centerYAnchor),
-            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            header.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -10),
 
             consoleContainer.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 6),
             consoleContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -691,6 +738,7 @@ final class DevToolsView: NSView {
     // MARK: Tab switching
 
     @objc private func tabChanged() { showTab(segmented.selectedSegment) }
+    @objc private func closeDevToolsClicked() { onCloseDevTools?() }
 
     private func showTab(_ index: Int) {
         consoleContainer.isHidden = index != 0
@@ -1311,6 +1359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return engine
         }
         devTools.onRefreshPage = { [weak self] in self?.refresh() }
+        devTools.onCloseDevTools = { [weak self] in if self?.devToolsVisible == true { self?.toggleDevTools() } }
+        devTools.onResizeDrag = { [weak self] delta in self?.resizeDevTools(by: delta) }
         content.addSubview(devTools)
 
         // MARK: Auto Layout
@@ -2026,6 +2076,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Returning focus to the page lets page typing work again.
             window.makeFirstResponder(bitmapView)
         }
+    }
+
+    /// Resize the DevTools panel from a top-edge drag (`delta` points, positive = grow taller).
+    /// Clamped so neither the panel nor the page area collapses.
+    private func resizeDevTools(by delta: CGFloat) {
+        guard devToolsVisible, let content = window.contentView else { return }
+        let maxH = max(140, content.bounds.height - 160) // leave room for the page + toolbar
+        let newH = min(max(devToolsHeightConstraint.constant + delta, 120), maxH)
+        guard abs(newH - devToolsHeightConstraint.constant) > 0.5 else { return }
+        devToolsHeightConstraint.constant = newH
+        window.layoutIfNeeded()
+        updateViewport()
+        refresh()
     }
 
     /// The view-local point of the most recent right-click (so the menu's Inspect/Paste actions,
