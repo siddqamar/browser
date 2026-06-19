@@ -3233,7 +3233,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
   }
   // Called from Rust's drain phase, in order, to advance readyState and fire lifecycle events.
+  // MUST be idempotent: the drain calls it on every tick, but `DOMContentLoaded`/`load`/`pageshow`
+  // are one-shot — firing them repeatedly breaks non-idempotent handlers (analytics init, jQuery
+  // ready, testharness.js completion, etc.). Guard so the sequence runs exactly once.
+  var __lifecycleFired = false;
   def(globalThis, "__fireLifecycleEvents", function () {
+    if (__lifecycleFired) { return; }
+    __lifecycleFired = true;
     readyState = "interactive";
     fireOn(document, "readystatechange");
     fireOn(document, "DOMContentLoaded");
