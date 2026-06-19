@@ -7,6 +7,7 @@
 
 mod canvas;
 mod font;
+mod svg;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -154,6 +155,9 @@ pub struct Engine {
     /// Rasterized `<canvas>` bitmaps keyed by canvas node id. Rebuilt each `render` from the JS
     /// 2D-context display lists (pulled via `Session::canvas_lists`); composited like decoded images.
     canvas_bitmaps: HashMap<dom::NodeId, DecodedImage>,
+    /// Rasterized inline `<svg>` bitmaps keyed by the `<svg>` node id. Rebuilt each `render` by
+    /// walking the SVG DOM subtree directly (no JS); composited like decoded images / canvas.
+    svg_bitmaps: HashMap<dom::NodeId, DecodedImage>,
 }
 
 impl Default for Engine {
@@ -183,6 +187,7 @@ impl Engine {
             selection: None,
             inspect_node: None,
             canvas_bitmaps: HashMap::new(),
+            svg_bitmaps: HashMap::new(),
         }
     }
 
@@ -433,6 +438,9 @@ impl Engine {
             // canvas branch reads attrs directly too, but seeding this keeps aspect-ratio scaling
             // (one CSS dimension set) consistent with how <img> is handled.
             collect_canvas_intrinsics(d, &mut intrinsic_sizes);
+            // Inline <svg> is a replaced element too: its intrinsic size is its width/height attrs
+            // (or its viewBox w/h, else 300x150). The engine rasterizes the SVG subtree to a bitmap.
+            collect_svg_intrinsics(d, &mut intrinsic_sizes);
             let computed = style::cascade(d, styles);
             let root =
                 layout::layout_document(d, &computed, vw, vh, &measurer, &intrinsic_sizes, self.focused_node);
@@ -472,6 +480,60 @@ impl Engine {
             next.insert(dom::NodeId(cv.id), bmp);
         }
         self.canvas_bitmaps = next;
+    }
+
+    /// Rebuild [`Self::svg_bitmaps`] by walking each inline `<svg>` DOM subtree and rasterizing it
+    /// into an RGBA bitmap (composited below exactly like a decoded `<img>` / canvas). Rasterizes at
+    /// the laid-out content-box's device size (so the SVG is crisp at any scale), falling back to the
+    /// element's intrinsic size when no layout box exists yet. Guarded: pages with no `<svg>` clear
+    /// the cache and pay nothing. Call AFTER `ensure_layout` so box rects are available.
+    fn update_svg_bitmaps(&mut self) {
+        let doc = match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => d,
+            _ => {
+                if !self.svg_bitmaps.is_empty() {
+                    self.svg_bitmaps.clear();
+                }
+                return;
+            }
+        };
+        // Collect every <svg> element's node id (top-level svgs only render once; nested ones are
+        // drawn by their ancestor's walk, but rasterizing them standalone is harmless).
+        let svg_ids: Vec<dom::NodeId> = (0..doc.len())
+            .map(dom::NodeId)
+            .filter(|&id| matches!(&doc.get(id).data,
+                dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("svg")))
+            .collect();
+        if svg_ids.is_empty() {
+            if !self.svg_bitmaps.is_empty() {
+                self.svg_bitmaps.clear();
+            }
+            return;
+        }
+        // Laid-out content-box pixel sizes (device px) keyed by node id, for crisp rasterization.
+        let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
+        if let Some(cache) = &self.layout_cache {
+            collect_content_rects(&cache.root, &mut rects);
+        }
+        let font = self.font.as_ref();
+        let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        for id in svg_ids {
+            let el = match &doc.get(id).data {
+                dom::NodeData::Element(e) => e,
+                _ => continue,
+            };
+            let (iw, ih) = svg::intrinsic_size(el);
+            let (mut w, mut h) = match rects.get(&id.0) {
+                Some(r) if r.width >= 1.0 && r.height >= 1.0 => (r.width, r.height),
+                // No box yet: rasterize at intrinsic size × scale.
+                _ => (iw * self.scale, ih * self.scale),
+            };
+            w = w.round().clamp(1.0, 4096.0);
+            h = h.round().clamp(1.0, 4096.0);
+            let bmp = svg::rasterize_svg(doc, id, w as u32, h as u32, font);
+            next.insert(id, bmp);
+        }
+        self.svg_bitmaps = next;
     }
 
     /// Push the freshly-built layout to the JS Session so `getBoundingClientRect()` /
@@ -518,6 +580,9 @@ impl Engine {
         // Pull each <canvas>'s JS display list and rasterize it into a bitmap (composited below
         // exactly like a decoded <img>). Guarded so script-free / canvas-free pages pay nothing.
         self.update_canvas_bitmaps();
+        // Rasterize each inline <svg> subtree to a bitmap (also composited like a decoded <img>).
+        // After ensure_layout so each SVG's content-box device size is known for crisp output.
+        self.update_svg_bitmaps();
 
         let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;
@@ -556,7 +621,8 @@ impl Engine {
                         let mut run_idx = 0usize;
                         paint_box(
                             &mut fb, font, &cache.root, left, header_h - scroll_y, header_h,
-                            page_max_y, images, &self.canvas_bitmaps, &sel_ranges, &mut run_idx,
+                            page_max_y, images, &self.canvas_bitmaps, &self.svg_bitmaps,
+                            &sel_ranges, &mut run_idx,
                         );
                     } else if doc.is_none() {
                         draw_text(
@@ -2000,6 +2066,17 @@ fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Re
     }
 }
 
+/// Like [`collect_node_rects`] but records each replaced-image box's **content** rect (device px) —
+/// used to rasterize each inline `<svg>` at its exact on-screen size for crisp output.
+fn collect_content_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
+    if let (Some(node), layout::BoxContent::Image(_)) = (b.node, &b.content) {
+        out.entry(node.0).or_insert(b.dimensions.content);
+    }
+    for c in &b.children {
+        collect_content_rects(c, out);
+    }
+}
+
 /// Seed `out` with the intrinsic size of every `<canvas>` element: its `width`/`height` attributes,
 /// or the spec default 300×150 when absent. Layout treats `<canvas>` as a replaced element and uses
 /// this (the same way an `<img>`'s decoded size is used) for aspect-ratio-preserving sizing.
@@ -2011,6 +2088,20 @@ fn collect_canvas_intrinsics(doc: &dom::Document, out: &mut HashMap<dom::NodeId,
                 let w = e.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(300.0);
                 let h = e.attrs.get("height").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(150.0);
                 out.insert(id, (w.max(1.0), h.max(1.0)));
+            }
+        }
+    }
+}
+
+/// Seed `out` with the intrinsic size of every inline `<svg>` element: its `width`/`height` attrs,
+/// else its `viewBox` width/height, else the spec default 300×150. Layout treats `<svg>` as a
+/// replaced element and uses this for sizing (the same way an `<img>`'s decoded size is used).
+fn collect_svg_intrinsics(doc: &dom::Document, out: &mut HashMap<dom::NodeId, (f32, f32)>) {
+    for i in 0..doc.len() {
+        let id = dom::NodeId(i);
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("svg") {
+                out.insert(id, svg::intrinsic_size(e));
             }
         }
     }
@@ -2256,13 +2347,14 @@ fn paint_box(
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
     canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
+    svg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
 ) {
     // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
     // declarations compose additional affines on top per-box.
     let xf = Affine::translate(ox, oy);
-    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, canvas_bitmaps, 1.0, sel_ranges, run_idx);
+    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, 1.0, sel_ranges, run_idx);
 }
 
 /// A 2D affine mapping a CSS-space point `(x, y)` to a device-space point: `x' = a*x + c*y + e`,
@@ -2335,6 +2427,7 @@ fn paint_box_opacity(
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
     canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
+    svg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     parent_opacity: f32,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
@@ -2539,9 +2632,14 @@ fn paint_box_opacity(
         if let layout::BoxContent::Image(node) = &b.content {
             let dst = xf_rect(xf, content.x, content.y, content.width, content.height);
             if dst.y < clip_bottom as i32 {
-                // A <canvas> resolves to its rasterized display-list bitmap; everything else to a
-                // decoded <img>. Both composite identically.
-                match canvas_bitmaps.get(node).or_else(|| images.get(node)) {
+                // A <canvas> resolves to its rasterized display-list bitmap, an inline <svg> to its
+                // rasterized subtree bitmap, everything else to a decoded <img>. All composite
+                // identically.
+                match canvas_bitmaps
+                    .get(node)
+                    .or_else(|| svg_bitmaps.get(node))
+                    .or_else(|| images.get(node))
+                {
                     Some(img) if opacity >= 0.999 => fb.blit_rgba(dst, &img.rgba, img.w, img.h),
                     Some(img) => {
                         let mut scaled = img.rgba.clone();
@@ -2574,7 +2672,7 @@ fn paint_box_opacity(
     }
 
     for child in &b.children {
-        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, canvas_bitmaps, opacity, sel_ranges, run_idx);
+        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, opacity, sel_ranges, run_idx);
     }
 }
 
@@ -5465,7 +5563,7 @@ mod tests {
         let mut fb = Framebuffer::new(400, 300);
         let images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &no_canvas, &[], &mut 0);
+        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &no_canvas, &no_canvas, &[], &mut 0);
 
         // The root box should exist; with the parallel layout stub it may have no children yet,
         // so only assert the path completed and the root carries the viewport width.
@@ -5509,7 +5607,7 @@ mod tests {
             paint_gradient(&mut fb);
             let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
             let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &no_canvas, &[], &mut 0);
+            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &no_canvas, &no_canvas, &[], &mut 0);
             // Sample a pixel inside the div.
             let i = (50 * fb.stride + 50 * 4) as usize;
             [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
@@ -5555,7 +5653,7 @@ mod tests {
         fb.clear(Color::BLACK);
         let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &no_canvas, &[], &mut 0);
+        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &no_canvas, &no_canvas, &[], &mut 0);
         fb
     }
 

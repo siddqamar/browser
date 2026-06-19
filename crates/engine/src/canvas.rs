@@ -436,6 +436,12 @@ fn apply_alpha(c: Color, alpha: f32) -> Color {
     Color { a: ((c.a as f32) * alpha.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8, ..c }
 }
 
+/// Public re-export of the canvas CSS color parser so the SVG module can reuse it (named/hex/
+/// rgb/hsl/transparent) instead of duplicating the table.
+pub fn parse_css_color_pub(s: &str) -> Option<Color> {
+    parse_css_color(s)
+}
+
 /// Parse a CSS color: `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa`, `rgb()`/`rgba()`, `hsl()`/`hsla()`,
 /// `transparent`, and a set of common named colors. Returns `None` if unrecognized.
 fn parse_css_color(s: &str) -> Option<Color> {

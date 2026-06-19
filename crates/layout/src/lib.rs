@@ -822,10 +822,15 @@ fn build_replaced_or_control(
     ) || (cs.display == style::Display::Inline && cs.display_block);
     let is_block = out_of_flow || block_display;
 
-    // <img> / <canvas>: a replaced box sized from CSS width/height and/or intrinsic dimensions.
+    // <img> / <canvas> / <svg>: a replaced box sized from CSS width/height and/or intrinsic dims.
     // <canvas> is a replaced element whose intrinsic size is its width/height attributes (default
     // 300x150); the engine rasterizes its display list into a bitmap and composites it like an img.
-    if el.tag.eq_ignore_ascii_case("img") || el.tag.eq_ignore_ascii_case("canvas") {
+    // Inline <svg>'s intrinsic size is seeded into `intrinsic_sizes` by the engine (width/height
+    // attrs, else its viewBox, else 300x150); the engine rasterizes the SVG subtree to a bitmap.
+    if el.tag.eq_ignore_ascii_case("img")
+        || el.tag.eq_ignore_ascii_case("canvas")
+        || el.tag.eq_ignore_ascii_case("svg")
+    {
         let is_canvas = el.tag.eq_ignore_ascii_case("canvas");
         let intrinsic = if is_canvas {
             // Prefer the explicit width/height attributes; fall back to the spec default 300x150.
@@ -1052,6 +1057,7 @@ fn build_box(
             // which recurses for deep DOM nesting — stays small.
             if el.tag.eq_ignore_ascii_case("img")
                 || el.tag.eq_ignore_ascii_case("canvas")
+                || el.tag.eq_ignore_ascii_case("svg")
                 || el.tag.eq_ignore_ascii_case("input")
                 || el.tag.eq_ignore_ascii_case("textarea")
                 || el.tag.eq_ignore_ascii_case("select")
