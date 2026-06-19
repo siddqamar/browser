@@ -98,8 +98,13 @@ final class BitmapView: NSView {
         if event.clickCount == 2 { onMouseEvent?("dblclick", up) }
     }
 
-    override func rightMouseUp(with event: NSEvent) {
-        onMouseEvent?("contextmenu", convert(event.locationInWindow, from: nil))
+    /// Builds the page context menu (Copy / Paste / Inspect / nav). AppKit calls this on a
+    /// right-click and pops up the returned menu; we also fire the JS `contextmenu` event.
+    var contextMenuProvider: ((CGPoint) -> NSMenu?)?
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let p = convert(event.locationInWindow, from: nil)
+        onMouseEvent?("contextmenu", p)
+        return contextMenuProvider?(p)
     }
 
     // Pointing-hand cursor when hovering a link (nice-to-have).
@@ -1264,6 +1269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.onSelectExtend = { [weak self] point in self?.handleSelectExtend(point) }
         bitmapView.onSelectEnd = { [weak self] point in self?.handleSelectExtend(point) }
         bitmapView.onSelectCancel = { [weak self] in self?.handleSelectCancel() }
+        bitmapView.contextMenuProvider = { [weak self] point in self?.buildContextMenu(at: point) }
         content.addSubview(bitmapView)
 
         // MARK: DevTools panel (hidden by default; ⌘⌥I toggles)
@@ -1992,8 +1998,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    /// The view-local point of the most recent right-click (so the menu's Inspect/Paste actions,
+    /// which carry no point, can act where the user clicked).
+    private var lastContextPoint: CGPoint = .zero
+
+    /// Build the page right-click menu: Copy (if a selection exists), Paste (if a text field is
+    /// focused + the clipboard has text), Inspect Element, and Back/Forward/Reload.
+    private func buildContextMenu(at localPoint: CGPoint) -> NSMenu {
+        lastContextPoint = localPoint
+        let menu = NSMenu()
+        guard let tab = activeTab, let engine = tab.engine, tab.pendingLoads == 0 else { return menu }
+
+        let canCopy = browser_engine_has_selection(engine) != 0
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(ctxCopy), keyEquivalent: "")
+        copyItem.target = self; copyItem.isEnabled = canCopy
+        menu.addItem(copyItem)
+
+        let canPaste = browser_engine_has_text_focus(engine) != 0 && NSPasteboard.general.string(forType: .string) != nil
+        let pasteItem = NSMenuItem(title: "Paste", action: #selector(ctxPaste), keyEquivalent: "")
+        pasteItem.target = self; pasteItem.isEnabled = canPaste
+        menu.addItem(pasteItem)
+
+        menu.addItem(.separator())
+        let backItem = NSMenuItem(title: "Back", action: #selector(goBack), keyEquivalent: "")
+        backItem.target = self; backItem.isEnabled = tab.canGoBack
+        menu.addItem(backItem)
+        let fwdItem = NSMenuItem(title: "Forward", action: #selector(goForward), keyEquivalent: "")
+        fwdItem.target = self; fwdItem.isEnabled = tab.canGoForward
+        menu.addItem(fwdItem)
+        let reloadItem = NSMenuItem(title: "Reload", action: #selector(reload), keyEquivalent: "")
+        reloadItem.target = self
+        menu.addItem(reloadItem)
+
+        menu.addItem(.separator())
+        let inspectItem = NSMenuItem(title: "Inspect Element", action: #selector(ctxInspect), keyEquivalent: "")
+        inspectItem.target = self
+        menu.addItem(inspectItem)
+        return menu
+    }
+
+    @objc private func ctxCopy() { copySelectionToPasteboard() }
+    @objc private func ctxInspect() { inspectElement(at: lastContextPoint) }
+
+    /// Paste clipboard text into the focused page text field by dispatching each character as a key.
+    @objc private func ctxPaste() {
+        guard let tab = activeTab, let engine = tab.engine, tab.pendingLoads == 0,
+              browser_engine_has_text_focus(engine) != 0,
+              let str = NSPasteboard.general.string(forType: .string), !str.isEmpty else { return }
+        var changed = false
+        for ch in str where ch != "\n" && ch != "\r" {
+            let s = String(ch)
+            let did = s.withCString { k in s.withCString { c in browser_engine_dispatch_key(engine, k, c) } }
+            if did != 0 { changed = true }
+        }
+        if changed { refresh() }
+    }
+
     /// Open DevTools (if hidden) on the Elements tab and inspect the element at a view-local point —
-    /// the "Inspect Element" entry point (the right-click menu that calls this is wired separately).
+    /// the "Inspect Element" entry point (called from the right-click menu).
     func inspectElement(at localPoint: CGPoint) {
         guard let tab = activeTab, let engine = tab.engine, let bitmapView = bitmapView,
               tab.pendingLoads == 0 else { return }
