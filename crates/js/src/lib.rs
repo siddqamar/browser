@@ -1799,10 +1799,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (target.__listeners) { return; } // already installed
     var registry = Object.create(null);
     def(target, "__listeners", registry);
-    def(target, "addEventListener", function (type, cb) {
+    def(target, "addEventListener", function (type, cb, options) {
       if (typeof cb !== "function") { return; }
       type = String(type);
       (registry[type] || (registry[type] = [])).push(cb);
+      // `{ signal }` option: auto-remove this listener when the AbortSignal aborts.
+      var sig = options && typeof options === "object" ? options.signal : null;
+      if (sig && typeof sig.addEventListener === "function") {
+        if (sig.aborted) { var l0 = registry[type]; var j0 = l0 ? l0.indexOf(cb) : -1; if (j0 >= 0) { l0.splice(j0, 1); } return; }
+        sig.addEventListener("abort", function () {
+          var l = registry[type]; if (!l) { return; }
+          var j = l.indexOf(cb); if (j >= 0) { l.splice(j, 1); }
+        });
+      }
     });
     def(target, "removeEventListener", function (type, cb) {
       type = String(type);
@@ -1824,6 +1833,60 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   installEvents(globalThis);
   installEvents(document);
+
+  // --- DOMException + AbortController/AbortSignal -------------------------------------------
+  // A real DOMException carrying `name`/`message` (AbortError, TimeoutError, …).
+  (function () {
+    var DOMExceptionCtor = function (message, name) {
+      this.message = message === undefined ? "" : String(message);
+      this.name = name === undefined ? "Error" : String(name);
+      this.code = 0;
+      try { this.stack = new Error(this.message).stack; } catch (e) {}
+    };
+    DOMExceptionCtor.prototype = Object.create(Error.prototype);
+    DOMExceptionCtor.prototype.constructor = DOMExceptionCtor;
+    DOMExceptionCtor.prototype.toString = function () { return this.name + ": " + this.message; };
+    def(globalThis, "DOMException", DOMExceptionCtor);
+  })();
+
+  function __makeAbortReason(reason) {
+    return reason !== undefined ? reason : new globalThis.DOMException("The operation was aborted.", "AbortError");
+  }
+  function __abortSignal(signal, reason) {
+    if (!signal || signal.aborted) { return; }
+    signal.aborted = true;
+    signal.reason = __makeAbortReason(reason);
+    var ev = { type: "abort", target: signal, currentTarget: signal, bubbles: false };
+    if (typeof signal.onabort === "function") { try { signal.onabort.call(signal, ev); } catch (e) { (globalThis.__timerErrors || []).push(String(e)); } }
+    if (typeof signal.dispatchEvent === "function") { try { signal.dispatchEvent(ev); } catch (e) {} }
+  }
+  function AbortSignal() {
+    this.aborted = false;
+    this.reason = undefined;
+    this.onabort = null;
+    installEvents(this);
+  }
+  AbortSignal.prototype.throwIfAborted = function () { if (this.aborted) { throw this.reason; } };
+  AbortSignal.abort = function (reason) { var s = new AbortSignal(); __abortSignal(s, reason); return s; };
+  AbortSignal.timeout = function (ms) {
+    var s = new AbortSignal();
+    setTimeout(function () { __abortSignal(s, new globalThis.DOMException("The operation timed out.", "TimeoutError")); }, Number(ms) || 0);
+    return s;
+  };
+  AbortSignal.any = function (signals) {
+    var s = new AbortSignal();
+    var list = Array.prototype.slice.call(signals || []);
+    for (var i = 0; i < list.length; i++) { if (list[i] && list[i].aborted) { __abortSignal(s, list[i].reason); return s; } }
+    list.forEach(function (sig) {
+      if (sig && typeof sig.addEventListener === "function") { sig.addEventListener("abort", function () { __abortSignal(s, sig.reason); }); }
+    });
+    return s;
+  };
+  def(globalThis, "AbortSignal", AbortSignal);
+
+  function AbortController() { this.signal = new AbortSignal(); }
+  AbortController.prototype.abort = function (reason) { __abortSignal(this.signal, reason); };
+  def(globalThis, "AbortController", AbortController);
 
   // --- DOM lifecycle dispatch (driven from Rust during the drain) --------------------------
   var readyState = "loading";
@@ -2887,6 +2950,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var url;
       try { url = (input && input.url) ? String(input.url) : String(input); }
       catch (e) { url = String(input); }
+      // Honor an AbortSignal: a fetch on an already-aborted signal rejects with AbortError. (Our
+      // fetch is synchronous, so only pre-abort is observable.)
+      var signal = init && init.signal;
+      if (signal && signal.aborted) {
+        return Promise.reject(signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError"));
+      }
       var body = (typeof __fetch === "function") ? __fetch(url) : null;
       if (body == null) {
         return Promise.reject(new TypeError("Failed to fetch"));
@@ -4882,6 +4951,32 @@ mod tests {
         let out = env_eval("https://example.com/", "atob(btoa('hello world'))");
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn abort_controller_aborts_and_fires_event() {
+        let out = env_eval(
+            "https://example.com/",
+            "var c = new AbortController(); var fired = false; \
+             c.signal.addEventListener('abort', function () { fired = true; }); \
+             var a0 = c.signal.aborted; c.abort(); \
+             [a0, c.signal.aborted, fired, c.signal.reason.name].join(',')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("false,true,true,AbortError"));
+    }
+
+    #[test]
+    fn add_event_listener_signal_option_removes_on_abort() {
+        let out = env_eval(
+            "https://example.com/",
+            "var c = new AbortController(); var n = 0; \
+             document.addEventListener('ping', function () { n++; }, { signal: c.signal }); \
+             document.dispatchEvent({ type: 'ping' }); c.abort(); document.dispatchEvent({ type: 'ping' }); \
+             String(n)",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("1"));
     }
 
     #[test]
