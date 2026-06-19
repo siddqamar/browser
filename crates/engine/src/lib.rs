@@ -8,9 +8,35 @@
 mod font;
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use font::SystemFont;
 use paint::{Color, Framebuffer, GlyphRasterizer, Rect};
+
+/// A borrowed, C-ABI view of the engine's RGBA8 (straight-alpha) framebuffer, handed to the
+/// progressive-load frame callback. `pixels` points at the engine's own buffer and is valid ONLY
+/// for the duration of the callback call (the engine reuses/reallocates it on the next paint), so a
+/// callback must copy synchronously. A null `pixels` means "nothing painted".
+///
+/// Layout matches the FFI crate's `Framebuffer` struct exactly (same field order/types) so the FFI
+/// layer can forward callbacks without conversion.
+#[repr(C)]
+pub struct FrameView {
+    pub pixels: *const u8,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+}
+
+/// A progressive-load frame callback: invoked synchronously (on the load thread) with a borrowed
+/// [`FrameView`] each time a new partial/final frame is painted during `load_url`. The opaque
+/// `ctx` pointer is passed through unchanged.
+pub type FrameCallback = extern "C" fn(*mut std::ffi::c_void, FrameView);
+
+/// Minimum wall-clock gap between progressive partial paints during a streaming load. Bounds the
+/// re-cascade/layout/paint cost so a fast multi-chunk download doesn't spend all its time painting
+/// intermediate frames.
+const PARTIAL_PAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// A decoded raster image ready to blit: straight-alpha RGBA8 pixels plus dimensions.
 struct DecodedImage {
@@ -86,6 +112,10 @@ pub struct Engine {
     /// ResizeObserver change-tracking: last reported (width, height) per (observerId, nodeId). A RO
     /// callback fires on the initial observation and whenever the size changes. Cleared on navigation.
     prev_size: HashMap<(u64, usize), (f32, f32)>,
+    /// Progressive-load frame callback `(fn, ctx)`: when set, invoked with a [`FrameView`] each time
+    /// a partial/final frame is painted during a streaming `load_url`. `None` = no progressive
+    /// frames (the caller only pulls the final frame via `render`).
+    frame_cb: Option<(FrameCallback, *mut std::ffi::c_void)>,
 }
 
 impl Default for Engine {
@@ -111,7 +141,16 @@ impl Engine {
             hovered_node: None,
             prev_intersecting: HashMap::new(),
             prev_size: HashMap::new(),
+            frame_cb: None,
         }
+    }
+
+    /// Install (or clear, with `None`) the progressive-load frame callback. When set, `load_url`
+    /// invokes `cb(ctx, frame_view)` synchronously on the load thread each time it paints a partial
+    /// or final frame as HTML streams in. The `FrameView` pixels are valid only for the duration of
+    /// the call (the engine reuses its buffer) — the callback must copy synchronously.
+    pub fn set_frame_callback(&mut self, cb: Option<(FrameCallback, *mut std::ffi::c_void)>) {
+        self.frame_cb = cb;
     }
 
     /// Scroll the page by `dy` device pixels (positive = down). The upper bound is clamped
@@ -129,7 +168,23 @@ impl Engine {
         js::set_device_metrics(self.vp_w, self.vp_h, self.scale);
     }
 
-    /// Fetch `url` and remember the outcome. Returns 0 on success, negative on error.
+    /// Fetch `url` (streaming) and remember the outcome, painting INCREMENTALLY as the HTML body
+    /// arrives so the page appears before the full download finishes. Returns 0 on success, -1 on
+    /// network error.
+    ///
+    /// Single-threaded by design: all streaming, partial parsing/rendering, and frame callbacks run
+    /// on the caller's thread inside this call. The caller owns the engine for the whole load and
+    /// does not tick/render concurrently.
+    ///
+    /// Streaming structure:
+    /// 1. Reset per-navigation state (scroll/caches/focus/hover/observers/network log).
+    /// 2. Feed each network chunk into a [`html::StreamParser`]; throttled to at most every
+    ///    [`PARTIAL_PAINT_INTERVAL`], take a partial DOM snapshot, install it as a PARTIAL loaded
+    ///    state with INLINE-ONLY styles (no blocking network), paint, and emit a frame.
+    /// 3. After the body finishes, run the EXACT same finalize as the non-streaming path
+    ///    (`finish` → base_url → `start_session` (V8) → full `collect_stylesheets` (external CSS) →
+    ///    `collect_images` → `prune_invalid` → `deliver_observations`), so the FINAL state and frame
+    ///    are byte-for-byte what the engine produced before — streaming only ADDS earlier frames.
     pub fn load_url(&mut self, url: &str) -> i32 {
         self.scroll_y = 0.0; // new navigation starts at the top
         self.layout_cache = None; // invalidate cached layout for the previous page
@@ -138,44 +193,71 @@ impl Engine {
         self.hovered_node = None; // and nothing is hovered
         self.prev_intersecting.clear(); // observer change-tracking is per-page
         self.prev_size.clear();
+        self.session = None; // drop the previous page's runtime (stops its thread)
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
-        match net::fetch(url) {
-            Ok(resp) => {
-                // Parse HTML responses into a DOM; other content types just record metadata.
-                let doc = if resp.content_type.to_ascii_lowercase().contains("html") {
-                    Some(html::parse(&String::from_utf8_lossy(&resp.body)))
+
+        // Stream the body: re-parse on each chunk and paint throttled partial frames. We also
+        // accumulate the raw bytes so the non-HTML branch / content sniffing below can inspect the
+        // full body without depending on the streaming parser's internal buffer.
+        let mut parser = html::StreamParser::new();
+        let mut last_paint: Option<Instant> = None;
+        let streaming = self.frame_cb.is_some();
+        let result = net::fetch_streaming(url, &mut |chunk| {
+            parser.feed(chunk);
+            // Partial frames are pure cost when nobody is listening — only paint when a frame
+            // callback is installed.
+            if !streaming {
+                return;
+            }
+            let now = Instant::now();
+            let due = match last_paint {
+                Some(t) => now.duration_since(t) >= PARTIAL_PAINT_INTERVAL,
+                None => true, // always emit the first partial frame
+            };
+            if !due {
+                return;
+            }
+            last_paint = Some(now);
+            // Partial frame: inline-only styles, no images/console, scripts have NOT run yet.
+            let snapshot = parser.snapshot();
+            self.install_partial(snapshot, url);
+            self.emit_partial_frame();
+        });
+
+        match result {
+            Ok(meta) => {
+                // HTML when the server says so, OR when the type is unknown/generic and the body
+                // sniffs as HTML (mirrors the old `content_type.contains("html")` gate, extended
+                // with a structural sniff for type-less responses).
+                let ct = meta.content_type.to_ascii_lowercase();
+                let final_doc = parser.finish();
+                let looks_html = ct.contains("html")
+                    || (ct.is_empty() || ct == "application/octet-stream")
+                        && document_looks_like_html(&final_doc);
+
+                // Build the FINAL state exactly as the non-streaming path did.
+                let base = if looks_html {
+                    base_url(&final_doc, &meta.final_url)
+                } else {
+                    meta.final_url.clone()
+                };
+
+                let mut console: Vec<String> = Vec::new();
+                let doc = if looks_html {
+                    // Start a persistent JS runtime: runs classic scripts + ES modules and stays
+                    // alive so event handlers/timers keep working. Returns the initial snapshot.
+                    let (session, mut snapshot, sess_console) = start_session(final_doc, &base);
+                    console.extend(sess_console);
+                    // Page JS can leave stale node ids; drop any out of the arena.
+                    snapshot.prune_invalid();
+                    self.session = session;
+                    Some(snapshot)
                 } else {
                     None
                 };
 
-                // Determine the page's base URL for resolving relative sub-resources: the
-                // response's final URL, overridden by a `<base href>` element if present.
-                let base = match &doc {
-                    Some(d) => base_url(d, &resp.final_url),
-                    None => resp.final_url.clone(),
-                };
-
-                // Start a persistent JS runtime: runs the page's classic scripts + ES modules and
-                // stays alive so event handlers/timers keep working (interactivity). Returns the
-                // initial DOM snapshot. Replaces the old run-once-and-drop path.
-                let mut console: Vec<String> = Vec::new();
-                self.session = None; // drop the previous page's runtime (stops its thread)
-                let doc = match doc {
-                    Some(d) => {
-                        let (session, mut snapshot, sess_console) = start_session(d, &base);
-                        console.extend(sess_console);
-                        // Page JS can leave stale/garbage node ids in the tree; drop any that
-                        // point outside the arena so layout/paint can't hit an out-of-bounds id.
-                        snapshot.prune_invalid();
-                        self.session = session;
-                        Some(snapshot)
-                    }
-                    None => None,
-                };
-
-                // Collect stylesheets AFTER scripts/modules run, so CSS injected at runtime
-                // (SPA frameworks add component `<style>` tags and fetch+inject CSS, e.g. Vue)
-                // is included in the cascade, not just the static `<style>`/`<link>` from parse.
+                // Collect stylesheets AFTER scripts run (runtime-injected CSS is included), and
+                // images after that (script-inserted/mutated `src` are seen). Full external fetches.
                 let styles = match &doc {
                     Some(d) => {
                         let (s, style_console) = collect_stylesheets(d, &base);
@@ -184,31 +266,83 @@ impl Engine {
                     }
                     None => Vec::new(),
                 };
-
-                // Fetch + decode `<img>` images (after scripts, so script-inserted images and
-                // mutated `src` attributes are seen). Reset on every navigation.
                 let images = match &doc {
                     Some(d) => collect_images(d, &base, &mut console),
                     None => HashMap::new(),
                 };
 
                 self.state = LoadState::Loaded {
-                    url: resp.final_url,
+                    url: meta.final_url,
                     doc,
                     styles,
                     console,
                     images,
                 };
-                // Fire the initial IntersectionObserver/ResizeObserver observations (each observer
-                // must deliver its initial state once, even before any scroll/resize).
+                self.layout_cache = None; // partial frames left a stale (inline-only) cache
+                // Fire the initial IntersectionObserver/ResizeObserver observations.
                 self.deliver_observations();
+                // Paint the FINAL frame and emit it (identical to the non-streaming render).
+                if self.frame_cb.is_some() {
+                    self.emit_final_frame();
+                }
                 0
             }
             Err(e) => {
                 self.state = LoadState::Failed { url: url.to_string(), error: e };
+                self.layout_cache = None;
+                if self.frame_cb.is_some() {
+                    self.emit_final_frame();
+                }
                 -1
             }
         }
+    }
+
+    /// Install `doc` as a PARTIAL loaded state for progressive rendering: inline `<style>`-only
+    /// stylesheets (NO `<link>`/`@import` network fetches), empty images, empty console. Scripts
+    /// have not run. Invalidates the layout cache so the next paint re-cascades against this DOM.
+    fn install_partial(&mut self, doc: dom::Document, url: &str) {
+        let styles = collect_inline_stylesheets(&doc);
+        self.state = LoadState::Loaded {
+            url: url.to_string(),
+            doc: Some(doc),
+            styles,
+            console: Vec::new(),
+            images: HashMap::new(),
+        };
+        self.layout_cache = None;
+    }
+
+    /// Paint the current state into `self.framebuffer` and hand a borrowed [`FrameView`] to the
+    /// installed frame callback. The borrow choreography: `render(&mut self)` finishes (releasing the
+    /// `&mut self` borrow) and stores the framebuffer on `self`; we then read the (now immutable)
+    /// buffer fields and the `Copy` callback tuple out of `self` and invoke it — so `self` is never
+    /// borrowed mutably while we read its framebuffer for the callback.
+    fn emit_partial_frame(&mut self) {
+        self.render();
+        self.dispatch_frame();
+    }
+
+    /// Like [`emit_partial_frame`] but named for the terminal paint; identical mechanics.
+    fn emit_final_frame(&mut self) {
+        self.render();
+        self.dispatch_frame();
+    }
+
+    /// Read the last-painted framebuffer and forward it to the frame callback (if any). Pulled out
+    /// so the `&mut self` render borrow is fully released before we read the buffer for the callback.
+    fn dispatch_frame(&mut self) {
+        let Some((cb, ctx)) = self.frame_cb else { return };
+        let view = match self.framebuffer.as_ref() {
+            Some(fb) => FrameView {
+                pixels: fb.pixels.as_ptr(),
+                width: fb.width,
+                height: fb.height,
+                stride: fb.stride,
+            },
+            None => FrameView { pixels: std::ptr::null(), width: 0, height: 0, stride: 0 },
+        };
+        cb(ctx, view);
     }
 
     /// Recompute the cascade + layout for the current viewport into `layout_cache`, unless a
@@ -2198,6 +2332,51 @@ pub fn collect_stylesheets(doc: &dom::Document, base: &str) -> (Vec<css::Stylesh
         }
     }
     (sheets, console)
+}
+
+/// Collect ONLY inline `<style>` stylesheets, parsed directly — NO `<link>`/`@import` network
+/// fetches. Used for PARTIAL frames during a streaming load so early paints never block on the
+/// network: they show page structure plus inline-CSS styling, and the final frame (built with the
+/// full [`collect_stylesheets`]) adds external CSS. Inline `@import`s are intentionally NOT followed
+/// here (they'd fetch); the cascade still applies its UA stylesheet on top of these.
+fn collect_inline_stylesheets(doc: &dom::Document) -> Vec<css::Stylesheet> {
+    fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut Vec<css::Stylesheet>) {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag == "style" {
+                let mut src = String::new();
+                for &child in &doc.get(id).children {
+                    if let dom::NodeData::Text(t) = &doc.get(child).data {
+                        src.push_str(t);
+                    }
+                }
+                out.push(css::parse(&src));
+                return; // a <style>'s text body isn't markup
+            }
+        }
+        for &child in &doc.get(id).children {
+            walk(doc, child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, doc.root(), &mut out);
+    out
+}
+
+/// Heuristic HTML sniff for responses with an absent/generic `content_type`: true if the parsed
+/// document contains any of the structural html/head/body/`<!doctype html>`-derived elements (the
+/// lenient parser synthesizes `<html>`/`<head>`/`<body>` for real markup, but a plain-text body
+/// parses to bare text under the root with no such elements).
+fn document_looks_like_html(doc: &dom::Document) -> bool {
+    fn walk(doc: &dom::Document, id: dom::NodeId) -> bool {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            let t = e.tag.as_str();
+            if t == "html" || t == "head" || t == "body" || t == "p" || t == "div" {
+                return true;
+            }
+        }
+        doc.get(id).children.iter().any(|&c| walk(doc, c))
+    }
+    walk(doc, doc.root())
 }
 
 /// Parse `text` (a CSS body fetched/found at URL `base_url`) and append its stylesheet to
@@ -4317,6 +4496,83 @@ mod tests {
             }
         }
         assert!(changed, "ResizeObserver callback must fire with the new size after a viewport change (was {initial:?}, now {:?})", e.body_attr("data-w"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Context the progressive-frame test callback writes into (count + last dims).
+    struct FrameProbe {
+        count: u32,
+        last_w: u32,
+        last_h: u32,
+    }
+
+    /// A C-ABI frame callback that records invocation count + the last framebuffer dimensions into
+    /// the `FrameProbe` pointed to by `ctx`.
+    extern "C" fn probe_cb(ctx: *mut std::ffi::c_void, fb: FrameView) {
+        // Safe: the test keeps the FrameProbe alive on its stack across the synchronous load_url
+        // call that invokes this callback, and passes a pointer to it as `ctx`.
+        let probe = unsafe { &mut *(ctx as *mut FrameProbe) };
+        probe.count += 1;
+        if !fb.pixels.is_null() {
+            probe.last_w = fb.width;
+            probe.last_h = fb.height;
+        }
+    }
+
+    #[test]
+    fn streaming_load_emits_frames_and_matches_final_render() {
+        let html = "<html><body>\
+            <style>div{height:30px;background-color:#3050a0}</style>\
+            <h1>Streaming</h1><p>hello progressive world</p>\
+            <div></div></body></html>";
+        let path = std::env::temp_dir().join("browser_streaming_test.html");
+        std::fs::write(&path, html).unwrap();
+        let url = format!("file://{}", path.display());
+
+        // Reference (non-streaming): no callback installed.
+        let mut reference = Engine::new();
+        reference.set_viewport(200, 150, 2.0);
+        assert_eq!(reference.load_url(&url), 0);
+        let ref_text = reference.visible_text();
+        let ref_fb_center = center_column(reference.render()).clone();
+
+        // Streaming: install a frame callback that counts invocations + records last dims.
+        let mut probe = FrameProbe { count: 0, last_w: 0, last_h: 0 };
+        let mut e = Engine::new();
+        e.set_viewport(200, 150, 2.0);
+        e.set_frame_callback(Some((probe_cb, &mut probe as *mut FrameProbe as *mut std::ffi::c_void)));
+        assert_eq!(e.load_url(&url), 0);
+
+        // file:// delivers one chunk → at least the first partial frame + the final frame.
+        assert!(probe.count >= 1, "frame callback must fire at least once, got {}", probe.count);
+        // The last frame's dims are the device viewport (200*2 x 150*2).
+        assert_eq!((probe.last_w, probe.last_h), (400, 300), "final frame dims = device viewport");
+
+        // The FINAL state/render is byte-for-byte the non-streaming result (streaming only adds
+        // earlier partial frames).
+        assert_eq!(e.visible_text(), ref_text, "streamed final text matches non-streaming");
+        let stream_fb_center = center_column(e.render()).clone();
+        assert_eq!(stream_fb_center, ref_fb_center, "streamed final render matches non-streaming");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_then_render_visible_text_unchanged() {
+        // Regression: loading a known local page then rendering yields the expected visible text,
+        // unaffected by the streaming rewrite (no frame callback installed = no partial frames).
+        let html = "<html><body><h1>Title</h1><p>Body text here.</p></body></html>";
+        let path = std::env::temp_dir().join("browser_regression_text_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(300, 200, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+        let text = e.visible_text();
+        assert!(text.contains("Title"), "visible text must contain the heading: {text:?}");
+        assert!(text.contains("Body text here."), "visible text must contain the paragraph: {text:?}");
 
         let _ = std::fs::remove_file(&path);
     }

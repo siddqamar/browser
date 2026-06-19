@@ -183,6 +183,22 @@ final class HoverButton: NSButton {
 
 /// A single browser tab. Owns its own engine handle and navigation history. The engine is
 /// created on init and must be freed exactly once via `freeEngine()` (idempotent).
+/// C callback the engine invokes (on the tab's load thread) each time it paints a partial or final
+/// frame while a page streams in — this is what makes the page paint progressively before the full
+/// download finishes. We copy the pixels synchronously (the pointer is only valid for the duration
+/// of the call), then hop to the main thread to display them if the tab is still the active one.
+/// A top-level non-capturing function so it bridges to a C function pointer.
+private func tabProgressFrame(_ ctx: UnsafeMutableRawPointer?, _ frame: FrameView) {
+    guard let ctx = ctx, let pixels = frame.pixels else { return }
+    let tab = Unmanaged<Tab>.fromOpaque(ctx).takeUnretainedValue()
+    let width = Int(frame.width), height = Int(frame.height), stride = Int(frame.stride)
+    let data = Data(bytes: pixels, count: stride * height)
+    DispatchQueue.main.async {
+        (NSApp.delegate as? AppDelegate)?.displayProgressFrame(
+            forTab: tab, data: data, width: width, height: height, stride: stride)
+    }
+}
+
 final class Tab {
     private(set) var engine: OpaquePointer?
     var urlString: String = ""
@@ -210,6 +226,11 @@ final class Tab {
 
     init() {
         engine = browser_engine_new()
+        // Receive progressive frames while pages stream in. ctx is this Tab (unretained: the Tab
+        // owns the engine, and we clear the callback in freeEngine before the engine is freed).
+        if let engine = engine {
+            browser_engine_set_progress_callback(engine, tabProgressFrame, Unmanaged.passUnretained(self).toOpaque())
+        }
     }
 
     /// Free the engine. Safe to call multiple times; subsequent calls are no-ops.
@@ -220,6 +241,7 @@ final class Tab {
             return
         }
         if let engine = engine {
+            browser_engine_set_progress_callback(engine, nil, nil) // stop frames before freeing
             browser_engine_free(engine)
         }
         engine = nil
@@ -1005,22 +1027,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // on the sides, like Safari) and shrink until the required nav/spinner gaps stop it.
         // The pill must NOT prefer any absolute width: a `pill.width == K` constraint (at ANY
         // priority > the fitting threshold ~50) contributes K to the window's enforced minimum
-        // width, so the window can't shrink below it. Instead the pill FILLS the space between the
-        // nav buttons and the spinner (so it grows with the window) and is merely CAPPED at 640.
-        // Because the fill constraints are relative to nav/progress (not absolute), they add no
-        // fixed floor — the window shrinks to minSize and grows freely.
+        // width, so the window can't shrink below it. So the pill is CENTERED and gets its width
+        // ONLY from RELATIVE constraints (symmetric toolbar-edge fills, capped at 640) — no absolute
+        // width preference, hence no fixed min-width floor.
         let pillMaxWidth = pill.widthAnchor.constraint(lessThanOrEqualToConstant: 640)
         pillMaxWidth.priority = .required
-        // Never overlap nav / spinner.
+        // Never overlap nav / spinner (required clearances). On a narrow window these push the
+        // centered pill smaller; the window can still shrink to ~where a 0-width centered pill clears
+        // the nav buttons (just above minSize).
         let pillLeadingGap = pill.leadingAnchor.constraint(greaterThanOrEqualTo: navStack.trailingAnchor, constant: 16)
         let pillTrailingGap = pill.trailingAnchor.constraint(lessThanOrEqualTo: progress.leadingAnchor, constant: -16)
-        // Fill: pin to nav on the left (slightly stronger so the pill stays left-anchored after the
-        // nav buttons) and stretch toward the spinner on the right — capped by the required max.
-        let pillFillLeading = pill.leadingAnchor.constraint(equalTo: navStack.trailingAnchor, constant: 16)
-        pillFillLeading.priority = NSLayoutConstraint.Priority(501)
-        let pillFillTrailing = pill.trailingAnchor.constraint(equalTo: progress.leadingAnchor, constant: -16)
+        // Centered (required) — symmetric, so it doesn't favor the nav side and doesn't pin a wide
+        // minimum the way an absolute width would.
+        let pillCenterX = pill.centerXAnchor.constraint(equalTo: toolbar.centerXAnchor)
+        // Width source: symmetric low-priority pulls toward BOTH toolbar edges (relative → no floor).
+        // They stretch the pill to the 640 cap when there's room and yield to the required clearances
+        // when narrow, keeping it centered throughout.
+        let pillFillLeading = pill.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 16)
+        pillFillLeading.priority = .defaultLow
+        let pillFillTrailing = pill.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -16)
         pillFillTrailing.priority = .defaultLow
-        NSLayoutConstraint.activate([pillMaxWidth, pillLeadingGap, pillTrailingGap, pillFillLeading, pillFillTrailing])
+        NSLayoutConstraint.activate([pillMaxWidth, pillLeadingGap, pillTrailingGap, pillCenterX, pillFillLeading, pillFillTrailing])
 
         // DevTools sits below the bitmap, splitting the content area vertically. We toggle which
         // of two bitmap-bottom constraints is active: when hidden the bitmap fills to the content
@@ -1516,31 +1543,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func refresh() {
         guard let engine = activeTab?.engine else { return }
         let fb = browser_engine_render(engine)
-        guard fb.pixels != nil else { return }
-
-        let count = Int(fb.stride * fb.height)
-        let data = Data(bytes: fb.pixels!, count: count) // copy out; pointer only valid until next render
-        guard let provider = CGDataProvider(data: data as CFData) else { return }
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-        let image = CGImage(
-            width: Int(fb.width),
-            height: Int(fb.height),
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: Int(fb.stride),
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo,
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
-        bitmapView.image = image
-        bitmapView.setNeedsDisplay(bitmapView.bounds)
+        guard let pixels = fb.pixels else { return }
+        let data = Data(bytes: pixels, count: Int(fb.stride * fb.height)) // copy; ptr valid until next render
+        setBitmapImage(data: data, width: Int(fb.width), height: Int(fb.height), stride: Int(fb.stride))
 
         // Refresh the visible devtools tab on the render path (console text / network entries
         // accumulate during load + async ticks). Guarded internally to be cheap when hidden.
         devTools?.refreshVisible()
+    }
+
+    /// Build a CGImage from an already-copied RGBA buffer and show it in the bitmap view. Shared by
+    /// the pull render (`refresh`) and the streaming progress callback (progressive first paint).
+    func setBitmapImage(data: Data, width: Int, height: Int, stride: Int) {
+        guard width > 0, height > 0, let provider = CGDataProvider(data: data as CFData) else { return }
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        let image = CGImage(
+            width: width, height: height,
+            bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: stride,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo,
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        )
+        bitmapView.image = image
+        bitmapView.setNeedsDisplay(bitmapView.bounds)
+    }
+
+    /// A progressive frame painted by the engine WHILE a page streams in (pushed from the load
+    /// thread via the C callback). Only show it if `tab` is still the visible tab.
+    func displayProgressFrame(forTab tab: Tab, data: Data, width: Int, height: Int, stride: Int) {
+        guard tab === activeTab else { return }
+        setBitmapImage(data: data, width: width, height: height, stride: stride)
     }
 
     // MARK: Navigation

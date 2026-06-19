@@ -6,6 +6,7 @@
 //! `browser_engine_render` or `browser_engine_free` call on the same handle.
 
 use std::ffi::c_char;
+use std::ffi::c_void;
 use std::ffi::CStr;
 use std::ffi::CString;
 
@@ -79,8 +80,32 @@ pub unsafe extern "C" fn browser_engine_set_viewport(
     }
 }
 
+/// Install (or clear, with a null `cb`) the progressive-load frame callback. While set, the engine
+/// invokes `cb(ctx, framebuffer)` SYNCHRONOUSLY from inside `browser_engine_load_url`, on the load
+/// thread, each time it paints a partial frame as the page's HTML streams in (and once more for the
+/// final frame). The `Framebuffer` pixels point at the engine's own buffer and are valid ONLY for
+/// the duration of the callback call — copy them synchronously; do not retain the pointer. `ctx` is
+/// passed through unchanged. Pass a null `cb` to disable progressive frames (the default).
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`]; `cb` (if non-null) must remain a
+/// valid function pointer and `ctx` valid for the lifetime of every `browser_engine_load_url` call
+/// made while the callback is installed.
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_set_progress_callback(
+    engine: *mut Engine,
+    cb: Option<extern "C" fn(*mut c_void, engine::FrameView)>,
+    ctx: *mut c_void,
+) {
+    let Some(e) = engine.as_mut() else { return };
+    e.inner.set_frame_callback(cb.map(|f| (f, ctx)));
+}
+
 /// Navigate to `url` (NUL-terminated UTF-8). Returns 0 on success, negative on error:
 /// -1 fetch/network failure, -2 bad arguments.
+///
+/// When a progress callback is installed via [`browser_engine_set_progress_callback`], this paints
+/// and delivers partial frames synchronously as the page streams in, then the final frame.
 ///
 /// # Safety
 /// `engine` must be a valid handle; `url` must be a valid NUL-terminated C string.
@@ -90,9 +115,15 @@ pub unsafe extern "C" fn browser_engine_load_url(engine: *mut Engine, url: *cons
     if url.is_null() {
         return -2;
     }
-    match CStr::from_ptr(url).to_str() {
-        Ok(s) => e.inner.load_url(s),
-        Err(_) => -2,
+    let s = match CStr::from_ptr(url).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    // Streaming runs page scripts + a user-supplied frame callback; never let a panic cross the C
+    // boundary (it would abort the app). Treat a panic as a load failure.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.load_url(s))) {
+        Ok(code) => code,
+        Err(_) => -1,
     }
 }
 

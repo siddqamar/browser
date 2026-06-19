@@ -29,7 +29,89 @@ fn is_rawtext(tag: &str) -> bool {
 
 /// Parse an HTML string into a [`dom::Document`].
 pub fn parse(html: &str) -> Document {
-    Parser::new(html).run()
+    // Single source of truth: delegate to the streaming parser. Feeding the whole input then
+    // finishing is equivalent to a one-shot parse of the full string.
+    let mut p = StreamParser::new();
+    p.feed(html.as_bytes());
+    p.finish()
+}
+
+/// Incremental HTML parser: feed bytes as they arrive, snapshot the partial DOM at any time, and
+/// finish to get the complete document.
+///
+/// Strategy (v1): re-parse the accumulated buffer. Each `feed` appends decoded text to an internal
+/// `String`; `snapshot`/`finish` run the existing one-shot [`Parser`] over everything accumulated
+/// so far. This guarantees the final DOM is byte-identical to `parse(full_input)` and yields
+/// correct progressive snapshots, at the cost of re-parsing. A resumable tokenizer is a future
+/// optimization.
+#[derive(Default)]
+pub struct StreamParser {
+    /// All input decoded as valid UTF-8 so far.
+    buffer: String,
+    /// Trailing bytes from the last `feed` that did not yet form a complete UTF-8 scalar; they
+    /// are prepended to the next chunk (or, in `finish`, decoded lossily as end-of-input).
+    carry: Vec<u8>,
+}
+
+impl StreamParser {
+    pub fn new() -> Self {
+        StreamParser { buffer: String::new(), carry: Vec::new() }
+    }
+
+    /// Append a chunk of raw bytes. Handles a UTF-8 multibyte sequence split across chunk
+    /// boundaries by buffering the trailing incomplete bytes until the next `feed`/`finish`.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        // Combine any carried-over partial sequence with the new chunk.
+        let mut bytes = std::mem::take(&mut self.carry);
+        bytes.extend_from_slice(chunk);
+
+        match std::str::from_utf8(&bytes) {
+            Ok(s) => self.buffer.push_str(s),
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                // Bytes before `valid_up_to` are complete, valid UTF-8.
+                // Safe: `valid_up_to` is a valid boundary by definition.
+                self.buffer
+                    .push_str(unsafe { std::str::from_utf8_unchecked(&bytes[..valid_up_to]) });
+                let remainder = &bytes[valid_up_to..];
+                // If the trailing error is an incomplete (but possibly valid) sequence, carry it
+                // over. Otherwise it is genuinely invalid bytes that completing won't fix, so
+                // decode them now (lossily) rather than carry forever.
+                if e.error_len().is_none() {
+                    self.carry.extend_from_slice(remainder);
+                } else {
+                    self.buffer
+                        .push_str(&String::from_utf8_lossy(remainder));
+                }
+            }
+        }
+    }
+
+    /// The current partial DOM — a well-formed, renderable tree of everything parsed so far (open
+    /// elements auto-closed by the lenient tree builder so layout/paint can walk it safely).
+    pub fn snapshot(&self) -> Document {
+        // Decode any carried-over trailing bytes lossily for this point-in-time view, without
+        // consuming them from the real carry-over.
+        if self.carry.is_empty() {
+            Parser::new(&self.buffer).run()
+        } else {
+            let mut s = self.buffer.clone();
+            s.push_str(&String::from_utf8_lossy(&self.carry));
+            Parser::new(&s).run()
+        }
+    }
+
+    /// Consume the parser and return the final complete document (decodes any buffered trailing
+    /// bytes as the end of input).
+    pub fn finish(mut self) -> Document {
+        if !self.carry.is_empty() {
+            // End of input: any leftover bytes can no longer be completed; decode lossily.
+            let decoded = String::from_utf8_lossy(&self.carry).into_owned();
+            self.buffer.push_str(&decoded);
+            self.carry.clear();
+        }
+        Parser::new(&self.buffer).run()
+    }
 }
 
 struct Parser<'a> {
@@ -672,5 +754,94 @@ mod tests {
         assert_eq!(tag_of(&doc, div), "div");
         let span = children(&doc, div)[0];
         assert_eq!(tag_of(&doc, span), "span");
+    }
+
+    // ---- StreamParser tests ----
+
+    /// Total node count, used to compare tree structure between parses.
+    fn node_count(doc: &Document) -> usize {
+        doc.len()
+    }
+
+    #[test]
+    fn stream_feed_in_two_halves_equals_one_shot() {
+        let whole = "<html><body><p>Hello, world</p><div class=\"x\">more</div></body></html>";
+        // Split mid-tag: the first half ends inside `<div`.
+        let split = whole.find("class").unwrap() - 4; // somewhere inside the <div tag
+        let (a, b) = whole.split_at(split);
+
+        let mut p = StreamParser::new();
+        p.feed(a.as_bytes());
+        p.feed(b.as_bytes());
+        let streamed = p.finish();
+
+        let one_shot = parse(whole);
+        assert_eq!(node_count(&streamed), node_count(&one_shot));
+
+        // Structural spot-check: html > body > p with text "Hello, world".
+        let html = children(&streamed, streamed.root())[0];
+        assert_eq!(tag_of(&streamed, html), "html");
+        let body = children(&streamed, html)[0];
+        let para = children(&streamed, body)[0];
+        let text = children(&streamed, para)[0];
+        assert_eq!(text_of(&streamed, text), Some("Hello, world"));
+    }
+
+    #[test]
+    fn stream_multibyte_utf8_split_across_feeds() {
+        let whole = "<p>café 🎉</p>";
+        let bytes = whole.as_bytes();
+        // Find a split point that lands in the middle of the emoji's 4-byte sequence.
+        let emoji_start = whole.find('🎉').unwrap();
+        let split = emoji_start + 2; // mid-emoji byte boundary
+
+        let mut p = StreamParser::new();
+        p.feed(&bytes[..split]);
+        p.feed(&bytes[split..]);
+        let doc = p.finish();
+
+        let para = children(&doc, doc.root())[0];
+        let text = children(&doc, para)[0];
+        assert_eq!(text_of(&doc, text), Some("café 🎉"));
+    }
+
+    #[test]
+    fn stream_snapshot_on_truncated_prefix_does_not_panic() {
+        let mut p = StreamParser::new();
+        p.feed(b"<html><body><p>Hello");
+        let doc = p.snapshot();
+
+        // The lenient tree builder auto-closes open elements; the partial text is present.
+        let html = children(&doc, doc.root())[0];
+        let body = children(&doc, html)[0];
+        let para = children(&doc, body)[0];
+        let text = children(&doc, para)[0];
+        assert_eq!(text_of(&doc, text), Some("Hello"));
+
+        // Snapshotting again with a truncated open tag must also not panic.
+        p.feed(b"<div class=\"");
+        let _ = p.snapshot();
+    }
+
+    #[test]
+    fn stream_regression_matches_parse() {
+        let cases = [
+            "<html><body><p>hi</p></body></html>",
+            r#"<input type="text" name='n' size=10 disabled>"#,
+            "<div><img src=x>after</div>",
+            "<script>if (a<b) { x = 0; }</script>",
+            "<span>a</b>b</span>c",
+        ];
+        for case in cases {
+            let mut p = StreamParser::new();
+            p.feed(case.as_bytes());
+            let streamed = p.finish();
+            let one_shot = parse(case);
+            assert_eq!(
+                node_count(&streamed),
+                node_count(&one_shot),
+                "node count mismatch for {case:?}"
+            );
+        }
     }
 }

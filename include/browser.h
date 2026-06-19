@@ -17,6 +17,22 @@
 typedef struct Engine Engine;
 
 /**
+ * A borrowed, C-ABI view of the engine's RGBA8 (straight-alpha) framebuffer, handed to the
+ * progressive-load frame callback. `pixels` points at the engine's own buffer and is valid ONLY
+ * for the duration of the callback call (the engine reuses/reallocates it on the next paint), so a
+ * callback must copy synchronously. A null `pixels` means "nothing painted".
+ *
+ * Layout matches the FFI crate's `Framebuffer` struct exactly (same field order/types) so the FFI
+ * layer can forward callbacks without conversion.
+ */
+typedef struct FrameView {
+  const uint8_t *pixels;
+  uint32_t width;
+  uint32_t height;
+  uint32_t stride;
+} FrameView;
+
+/**
  * A borrowed view of the engine's RGBA8 (straight-alpha) framebuffer.
  * `stride` is bytes per row. A null `pixels` means "nothing rendered".
  */
@@ -56,8 +72,28 @@ void browser_engine_set_viewport(struct Engine *engine,
                                  float scale);
 
 /**
+ * Install (or clear, with a null `cb`) the progressive-load frame callback. While set, the engine
+ * invokes `cb(ctx, framebuffer)` SYNCHRONOUSLY from inside `browser_engine_load_url`, on the load
+ * thread, each time it paints a partial frame as the page's HTML streams in (and once more for the
+ * final frame). The `Framebuffer` pixels point at the engine's own buffer and are valid ONLY for
+ * the duration of the callback call — copy them synchronously; do not retain the pointer. `ctx` is
+ * passed through unchanged. Pass a null `cb` to disable progressive frames (the default).
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`]; `cb` (if non-null) must remain a
+ * valid function pointer and `ctx` valid for the lifetime of every `browser_engine_load_url` call
+ * made while the callback is installed.
+ */
+void browser_engine_set_progress_callback(struct Engine *engine,
+                                          void (*cb)(void*, struct FrameView),
+                                          void *ctx);
+
+/**
  * Navigate to `url` (NUL-terminated UTF-8). Returns 0 on success, negative on error:
  * -1 fetch/network failure, -2 bad arguments.
+ *
+ * When a progress callback is installed via [`browser_engine_set_progress_callback`], this paints
+ * and delivers partial frames synchronously as the page streams in, then the final frame.
  *
  * # Safety
  * `engine` must be a valid handle; `url` must be a valid NUL-terminated C string.

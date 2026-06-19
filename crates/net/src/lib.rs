@@ -43,6 +43,13 @@ pub struct Response {
     pub final_url: String,
 }
 
+/// Response metadata (everything except the body), for streaming callers.
+pub struct ResponseMeta {
+    pub status: u16,
+    pub content_type: String,
+    pub final_url: String,
+}
+
 /// One entry in the network activity log (for the devtools Network tab).
 #[derive(Clone)]
 pub struct NetEntry {
@@ -104,35 +111,88 @@ pub fn request(
     body: Option<&[u8]>,
     headers: &[(String, String)],
 ) -> Result<Response, String> {
-    let start = std::time::Instant::now();
-    let result = request_inner(method, url, body, headers);
-    let (status, ok, size, ct) = match &result {
-        Ok(r) => (r.status, (200..300).contains(&r.status), r.body.len(), r.content_type.clone()),
-        Err(_) => (0u16, false, 0usize, String::new()),
-    };
-    record_net(NetEntry {
-        method: method.to_ascii_uppercase(),
-        url: url.to_string(),
-        status,
-        ok,
-        duration_ms: start.elapsed().as_millis() as u64,
-        size,
-        content_type: ct,
-    });
-    result
+    // Accumulate the streamed body into a Vec so the historical buffered `Response` surface is
+    // identical. The shared core records the network log exactly once (here), so we pass
+    // `log = true` and don't record again.
+    let mut buf = Vec::new();
+    let meta = request_streaming_core(method, url, body, headers, true, &mut |chunk| {
+        buf.extend_from_slice(chunk);
+    })?;
+    Ok(Response {
+        status: meta.status,
+        content_type: meta.content_type,
+        body: buf,
+        final_url: meta.final_url,
+    })
 }
 
-fn request_inner(
+/// Perform `url` like `request("GET", ...)` but deliver the body INCREMENTALLY: `on_chunk` is
+/// called with each block of bytes as it is read from the socket (do not buffer the whole body
+/// first). Returns the response metadata once the body is fully read, or Err on failure.
+pub fn fetch_streaming(url: &str, on_chunk: &mut dyn FnMut(&[u8])) -> Result<ResponseMeta, String> {
+    // GET-only streaming: no request body or custom headers. Records the network log exactly once.
+    request_streaming_core("GET", url, None, &[], true, on_chunk)
+}
+
+/// The single shared request path. Builds + sends the request (with the retry loop), then streams
+/// the response body chunk-by-chunk through `on_chunk` (without buffering the whole body here).
+/// When `log` is true, records exactly one network-log entry for this logical request. Returns the
+/// response metadata, with `final_url` always set to the requested `url`.
+fn request_streaming_core(
     method: &str,
     url: &str,
     body: Option<&[u8]>,
     headers: &[(String, String)],
-) -> Result<Response, String> {
+    log: bool,
+    on_chunk: &mut dyn FnMut(&[u8]),
+) -> Result<ResponseMeta, String> {
+    let start = std::time::Instant::now();
+    // Count the total bytes streamed (sum of chunk lengths) for the network log.
+    let mut total: usize = 0;
+    let result = request_streaming_inner(method, url, body, headers, &mut |chunk| {
+        total += chunk.len();
+        on_chunk(chunk);
+    });
+    if log {
+        let (status, ok, ct) = match &result {
+            Ok(m) => (m.status, (200..300).contains(&m.status), m.content_type.clone()),
+            Err(_) => (0u16, false, String::new()),
+        };
+        record_net(NetEntry {
+            method: method.to_ascii_uppercase(),
+            url: url.to_string(),
+            status,
+            ok,
+            duration_ms: start.elapsed().as_millis() as u64,
+            size: total,
+            content_type: ct,
+        });
+    }
+    result
+}
+
+/// Inner request implementation: handles `file://`, the disk cache, and the network send/retry
+/// loop, then streams the response body through `on_chunk`. Does NOT touch the network log
+/// (that's the caller's job, exactly once per logical request).
+fn request_streaming_inner(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(String, String)],
+    on_chunk: &mut dyn FnMut(&[u8]),
+) -> Result<ResponseMeta, String> {
     let method_uc = method.to_ascii_uppercase();
 
     if let Some(path) = url.strip_prefix("file://") {
-        // file:// is a local read; method/body/headers don't apply.
-        return fetch_file(path, url);
+        // file:// is a local read; method/body/headers don't apply. A local read isn't
+        // meaningfully chunked, so deliver the whole content in a single `on_chunk` call.
+        let resp = fetch_file(path, url)?;
+        on_chunk(&resp.body);
+        return Ok(ResponseMeta {
+            status: resp.status,
+            content_type: resp.content_type,
+            final_url: resp.final_url,
+        });
     }
 
     let is_get = method_uc == "GET";
@@ -142,10 +202,11 @@ fn request_inner(
     let cache = if is_get { cache_path(url) } else { None };
     if let Some(p) = &cache {
         if let Ok(body) = std::fs::read(p) {
-            return Ok(Response {
+            // Cache hit: deliver the cached bytes in one chunk.
+            on_chunk(&body);
+            return Ok(ResponseMeta {
                 status: 200,
                 content_type: content_type_from_url(url),
-                body,
                 final_url: url.to_string(),
             });
         }
@@ -216,23 +277,37 @@ fn request_inner(
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    let mut resp_body = Vec::new();
-    resp.into_reader()
-        .take(MAX_BODY_BYTES)
-        .read_to_end(&mut resp_body)
-        .map_err(|e| format!("failed to read body: {e}"))?;
+    // Stream the body: read into a fixed buffer and hand each block to `on_chunk` as it arrives,
+    // never buffering the whole body here. On a cache MISS we accumulate a copy locally so the
+    // disk cache can still be populated after a successful read.
+    let want_cache = status == 200 && cache.is_some();
+    let mut cache_buf: Vec<u8> = Vec::new();
+    let mut reader = resp.into_reader().take(MAX_BODY_BYTES);
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("failed to read body: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if want_cache {
+            cache_buf.extend_from_slice(&buf[..n]);
+        }
+        on_chunk(&buf[..n]);
+    }
 
     // Populate the opt-in disk cache on success (GET only).
-    if status == 200 {
+    if want_cache {
         if let Some(p) = &cache {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(p, &resp_body);
+            let _ = std::fs::write(p, &cache_buf);
         }
     }
 
-    Ok(Response { status, content_type, body: resp_body, final_url: url.to_string() })
+    Ok(ResponseMeta { status, content_type, final_url: url.to_string() })
 }
 
 /// Disk-cache file path for `url` under `NET_CACHE_DIR` (a stable hash of the URL), or `None`
@@ -320,6 +395,63 @@ mod tests {
         let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
         let r = request("POST", &url, Some(b"ignored"), &headers).expect("file read");
         assert_eq!(r.body, b"payload");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_streaming_file_concatenates_to_contents() {
+        // Streaming a file:// URL: concatenated chunks equal the file, status is 200.
+        let mut path = std::env::temp_dir();
+        path.push(format!("net_stream_small_{}.txt", std::process::id()));
+        std::fs::write(&path, b"streamed contents").unwrap();
+        let url = format!("file://{}", path.display());
+
+        let mut acc = Vec::new();
+        let meta = fetch_streaming(&url, &mut |chunk| acc.extend_from_slice(chunk)).expect("stream");
+        assert_eq!(acc, b"streamed contents");
+        assert_eq!(meta.status, 200);
+        assert_eq!(meta.final_url, url);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_streaming_large_file_round_trips() {
+        // A body larger than the 32 KiB read buffer. Per the spec, file:// delivers in a single
+        // chunk, so we assert the single-chunk accumulation equals the full file contents
+        // (kept offline/deterministic — no live network).
+        let mut path = std::env::temp_dir();
+        path.push(format!("net_stream_large_{}.bin", std::process::id()));
+        let data: Vec<u8> = (0..100 * 1024).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let url = format!("file://{}", path.display());
+
+        let mut acc = Vec::new();
+        let mut chunks = 0usize;
+        let meta = fetch_streaming(&url, &mut |chunk| {
+            chunks += 1;
+            acc.extend_from_slice(chunk);
+        })
+        .expect("stream large");
+        assert_eq!(acc, data);
+        assert_eq!(meta.status, 200);
+        // file:// is delivered in exactly one chunk per the spec.
+        assert_eq!(chunks, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn request_get_file_body_unchanged_regression() {
+        // Regression: after refactoring `request` to share the streaming core, `request("GET", …)`
+        // still returns the full body identical to the file contents.
+        let mut path = std::env::temp_dir();
+        path.push(format!("net_stream_regression_{}.txt", std::process::id()));
+        let data: Vec<u8> = (0..70 * 1024).map(|i| (i % 97) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let url = format!("file://{}", path.display());
+
+        let r = request("GET", &url, None, &[]).expect("file read");
+        assert_eq!(r.body, data);
+        assert_eq!(r.status, 200);
         let _ = std::fs::remove_file(&path);
     }
 }
