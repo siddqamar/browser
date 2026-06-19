@@ -3038,6 +3038,10 @@ fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
         Some(em * parent_px)
     } else if let Some(rem) = num("rem") {
         Some(rem * 16.0)
+    } else if let Some(pct) = num("%") {
+        // Percentage font-size is relative to the PARENT's computed font size (e.g. `500%` on the
+        // big browserscore.dev score number → 5× its parent).
+        Some(pct / 100.0 * parent_px).filter(|n| *n > 0.0)
     } else {
         v.parse::<f32>().ok().filter(|n| *n > 0.0)
     }
