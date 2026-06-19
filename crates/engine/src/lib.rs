@@ -41,6 +41,7 @@ pub type FrameCallback = extern "C" fn(*mut std::ffi::c_void, FrameView);
 const PARTIAL_PAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// A decoded raster image ready to blit: straight-alpha RGBA8 pixels plus dimensions.
+#[derive(Clone)]
 struct DecodedImage {
     rgba: Vec<u8>,
     w: u32,
@@ -167,6 +168,25 @@ pub struct Engine {
     /// Rasterized inline `<svg>` bitmaps keyed by the `<svg>` node id. Rebuilt each `render` by
     /// walking the SVG DOM subtree directly (no JS); composited like decoded images / canvas.
     svg_bitmaps: HashMap<dom::NodeId, DecodedImage>,
+    /// `mask-image` sources keyed by their resolved url string, fetched/decoded at navigation
+    /// (`collect_masks`): either an SVG source string (rasterized to alpha at paint size) or a
+    /// decoded raster whose alpha channel is the coverage. Drives [`Engine::mask_bitmaps`].
+    mask_sources: HashMap<String, MaskSource>,
+    /// Per-box mask coverage bitmaps keyed by the masked element's node id. Rebuilt each `render`
+    /// (after layout) by rasterizing the box's [`MaskSource`] to its border-box device size; the
+    /// alpha channel is the coverage the painter multiplies the background by.
+    mask_bitmaps: HashMap<dom::NodeId, DecodedImage>,
+}
+
+/// A fetched/decoded `mask-image` source, ready to rasterize to a per-box coverage bitmap.
+#[derive(Clone)]
+enum MaskSource {
+    /// An SVG mask: the raw SVG markup, parsed + rasterized to the box size at paint time. Its
+    /// rasterized alpha is the mask coverage.
+    Svg(String),
+    /// A raster mask (PNG/etc): the decoded RGBA. Its alpha channel is the mask coverage, scaled
+    /// (nearest-neighbour) to the box.
+    Raster(DecodedImage),
 }
 
 impl Default for Engine {
@@ -198,6 +218,8 @@ impl Engine {
             inspect_node: None,
             canvas_bitmaps: HashMap::new(),
             svg_bitmaps: HashMap::new(),
+            mask_sources: HashMap::new(),
+            mask_bitmaps: HashMap::new(),
         }
     }
 
@@ -604,6 +626,63 @@ impl Engine {
         self.svg_bitmaps = next;
     }
 
+    /// Build a per-box `mask-image` coverage bitmap for every masked element (the icon technique:
+    /// `background: currentColor; mask: url(icon.svg) ... / contain`). Walks the laid-out tree for
+    /// boxes whose `extras.mask_image` is set, fetches/decodes each distinct mask source once
+    /// (cached in `self.mask_sources` keyed by url), then rasterizes the source to the box's
+    /// border-box device size honoring `contain`/`cover`/stretch. The result's ALPHA channel is the
+    /// mask coverage the painter multiplies the background by. Guarded: mask-free pages clear the
+    /// caches and pay nothing. Call AFTER `ensure_layout`.
+    fn update_mask_bitmaps(&mut self) {
+        // Gather (node, border-box device rect, MaskImage) for every masked box in the layout tree.
+        let mut targets: Vec<(dom::NodeId, layout::Rect, style::MaskImage)> = Vec::new();
+        if let Some(cache) = &self.layout_cache {
+            collect_mask_targets(&cache.root, &mut targets);
+        }
+        if targets.is_empty() {
+            if !self.mask_bitmaps.is_empty() {
+                self.mask_bitmaps.clear();
+            }
+            if !self.mask_sources.is_empty() {
+                self.mask_sources.clear();
+            }
+            return;
+        }
+
+        // Resolve the page base url (for fetching same-origin mask SVGs / rasters).
+        let base = match &self.state {
+            LoadState::Loaded { url, .. } => url.clone(),
+            _ => String::new(),
+        };
+
+        // Fetch + decode any mask sources we haven't seen yet, keyed by their resolved url.
+        for (_, _, mask) in &targets {
+            if self.mask_sources.contains_key(&mask.url) {
+                continue;
+            }
+            if let Some(src) = load_mask_source(&mask.url, &base) {
+                self.mask_sources.insert(mask.url.clone(), src);
+            }
+        }
+        // Drop cached sources no longer referenced by the page.
+        let live: std::collections::HashSet<&String> = targets.iter().map(|(_, _, m)| &m.url).collect();
+        self.mask_sources.retain(|k, _| live.contains(k));
+
+        let font = self.font.as_ref();
+        let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        for (id, rect, mask) in targets {
+            let src = match self.mask_sources.get(&mask.url) {
+                Some(s) => s,
+                None => continue, // fetch/decode failed
+            };
+            let w = rect.width.round().clamp(1.0, 4096.0) as u32;
+            let h = rect.height.round().clamp(1.0, 4096.0) as u32;
+            let cov = rasterize_mask_coverage(src, w, h, mask.size, font);
+            next.insert(id, cov);
+        }
+        self.mask_bitmaps = next;
+    }
+
     /// Push the freshly-built layout to the JS Session so `getBoundingClientRect()` /
     /// `offsetWidth` / `scrollHeight` etc. return real values. Converts the engine's
     /// document-absolute, top-origin **device-px** border-box rects to **CSS px** (÷ scale) and
@@ -659,6 +738,9 @@ impl Engine {
         // Rasterize each inline <svg> subtree to a bitmap (also composited like a decoded <img>).
         // After ensure_layout so each SVG's content-box device size is known for crisp output.
         self.update_svg_bitmaps();
+        // Build per-box mask coverage bitmaps (the `mask-image` icon technique). After ensure_layout
+        // so each masked box's border-box device size is known for the contain/cover fit.
+        self.update_mask_bitmaps();
 
         let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;
@@ -705,7 +787,7 @@ impl Engine {
                         paint_box(
                             &mut fb, font, &cache.root, left, header_h - scroll_y, header_h,
                             page_max_y, images, &self.canvas_bitmaps, &self.svg_bitmaps,
-                            &sel_ranges, &mut run_idx,
+                            &self.mask_bitmaps, &sel_ranges, &mut run_idx,
                         );
                     } else if doc.is_none() {
                         draw_text(
@@ -2173,6 +2255,174 @@ fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Re
     }
 }
 
+/// Collect every masked box: its node id, border-box rect (device px), and the resolved
+/// [`style::MaskImage`]. Used to build per-box mask coverage bitmaps. Only boxes carrying a DOM node
+/// and a `mask-image` in their paint extras qualify.
+fn collect_mask_targets(
+    b: &layout::LayoutBox,
+    out: &mut Vec<(dom::NodeId, layout::Rect, style::MaskImage)>,
+) {
+    if let Some(node) = b.node {
+        if let Some(mask) = b.style.extras.as_deref().and_then(|e| e.mask_image.clone()) {
+            out.push((node, b.dimensions.border_box(), mask));
+        }
+    }
+    for c in &b.children {
+        collect_mask_targets(c, out);
+    }
+}
+
+/// Fetch + decode a `mask-image` source `url` (resolved against `base`) into a [`MaskSource`].
+/// Handles `data:` URLs (percent-encoded or base64; SVG kept as text, raster decoded) and
+/// same-origin/absolute http(s) urls (fetched like an `<img>`). SVG payloads are recognized by a
+/// `image/svg` media type or by sniffing `<svg` markup. Returns `None` on fetch/decode failure.
+fn load_mask_source(url: &str, base: &str) -> Option<MaskSource> {
+    let url = url.trim();
+    if let Some(rest) = url.strip_prefix("data:") {
+        // Split the `data:` URL into media type + payload to decide SVG-vs-raster up front.
+        let comma = rest.find(',')?;
+        let meta = &rest[..comma].to_ascii_lowercase();
+        let bytes = decode_data_url(url)?;
+        if meta.contains("image/svg") {
+            return Some(MaskSource::Svg(String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        // No explicit svg type: sniff the decoded bytes for `<svg`.
+        if sniff_svg(&bytes) {
+            return Some(MaskSource::Svg(String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        return decode_image(&bytes).map(MaskSource::Raster);
+    }
+    // Network / same-origin: resolve and fetch.
+    let abs = resolve_url(base, url)?;
+    let resp = net::fetch(&abs).ok()?;
+    if abs.to_ascii_lowercase().ends_with(".svg") || sniff_svg(&resp.body) {
+        return Some(MaskSource::Svg(String::from_utf8_lossy(&resp.body).into_owned()));
+    }
+    decode_image(&resp.body).map(MaskSource::Raster)
+}
+
+/// Cheap heuristic: does this byte slice look like SVG markup? (Looks for `<svg` near the start,
+/// skipping a leading XML declaration / whitespace.)
+fn sniff_svg(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(512)];
+    let s = String::from_utf8_lossy(head).to_ascii_lowercase();
+    s.contains("<svg")
+}
+
+/// Rasterize a [`MaskSource`] to an `out_w × out_h` coverage bitmap (RGBA, but only the ALPHA
+/// channel is meaningful — it's the mask coverage). `size` picks the fit: `Stretch` fills the box
+/// exactly; `Contain`/`Cover` preserve aspect ratio (the engine's SVG rasterizer already does a
+/// contain-style `xMidYMid meet` fit, so for SVG we rasterize straight at the box size; for raster
+/// masks we fit the source rect and centre it).
+fn rasterize_mask_coverage(
+    src: &MaskSource,
+    out_w: u32,
+    out_h: u32,
+    size: style::MaskSize,
+    font: Option<&SystemFont>,
+) -> DecodedImage {
+    let out_w = out_w.clamp(1, 4096);
+    let out_h = out_h.clamp(1, 4096);
+    match src {
+        MaskSource::Svg(text) => {
+            // Parse the SVG markup into a DOM (the same parser inline <svg> uses) and rasterize its
+            // <svg> subtree at the box size. The rasterizer's viewBox fit is xMidYMid-meet (contain),
+            // matching the common `mask: ... / contain`. (`stretch`/`cover` differences in aspect are
+            // simplified to this contain fit — documented.)
+            let doc = html::parse(text);
+            let svg_id = (0..doc.len()).map(dom::NodeId).find(|&id| {
+                matches!(&doc.get(id).data,
+                    dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("svg"))
+            });
+            match svg_id {
+                Some(id) => svg::rasterize_svg(&doc, id, out_w, out_h, font),
+                None => DecodedImage { rgba: vec![0; (out_w * out_h * 4) as usize], w: out_w, h: out_h },
+            }
+        }
+        MaskSource::Raster(img) => {
+            // Fit the decoded raster into the box and sample its alpha into the coverage buffer.
+            let mut rgba = vec![0u8; (out_w * out_h * 4) as usize];
+            if img.w == 0 || img.h == 0 {
+                return DecodedImage { rgba, w: out_w, h: out_h };
+            }
+            // Destination sub-rect (device px) the mask occupies, per the size keyword.
+            let (dx, dy, dw, dh) = match size {
+                style::MaskSize::Stretch => (0.0, 0.0, out_w as f32, out_h as f32),
+                style::MaskSize::Contain | style::MaskSize::Cover => {
+                    let sx = out_w as f32 / img.w as f32;
+                    let sy = out_h as f32 / img.h as f32;
+                    let s = if matches!(size, style::MaskSize::Cover) { sx.max(sy) } else { sx.min(sy) };
+                    let dw = img.w as f32 * s;
+                    let dh = img.h as f32 * s;
+                    ((out_w as f32 - dw) / 2.0, (out_h as f32 - dh) / 2.0, dw, dh)
+                }
+            };
+            for y in 0..out_h {
+                for x in 0..out_w {
+                    let fx = x as f32 - dx;
+                    let fy = y as f32 - dy;
+                    if fx < 0.0 || fy < 0.0 || fx >= dw || fy >= dh {
+                        continue; // outside the fitted mask → coverage 0 (already zeroed)
+                    }
+                    let sx = ((fx / dw) * img.w as f32) as u32;
+                    let sy = ((fy / dh) * img.h as f32) as u32;
+                    let sx = sx.min(img.w - 1);
+                    let sy = sy.min(img.h - 1);
+                    let si = ((sy * img.w + sx) * 4) as usize;
+                    let a = img.rgba.get(si + 3).copied().unwrap_or(0);
+                    let di = ((y * out_w + x) * 4) as usize;
+                    rgba[di + 3] = a;
+                }
+            }
+            DecodedImage { rgba, w: out_w, h: out_h }
+        }
+    }
+}
+
+/// Paint a solid color `c` into the box's border box, modulated by a mask coverage bitmap `cov`
+/// (whose ALPHA channel is the coverage). Each destination pixel's alpha = `c.a * cov_alpha`, so
+/// the result is the background color in the shape of the mask. Axis-aligned only (the common case);
+/// under a non-axis-aligned transform we fall back to the device bounding box (an approximation).
+fn paint_masked_bg(fb: &mut Framebuffer, xf: &Affine, border: layout::Rect, cov: &DecodedImage, c: Color, axis: bool) {
+    if cov.w == 0 || cov.h == 0 {
+        return;
+    }
+    // Device-space destination rect of the border box.
+    let dst = if axis {
+        xf_rect(xf, border.x, border.y, border.width, border.height)
+    } else {
+        // Bounding box of the four mapped corners.
+        let p = [
+            xf.apply(border.x, border.y),
+            xf.apply(border.x + border.width, border.y),
+            xf.apply(border.x, border.y + border.height),
+            xf.apply(border.x + border.width, border.y + border.height),
+        ];
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (px, py) in p {
+            x0 = x0.min(px); y0 = y0.min(py); x1 = x1.max(px); y1 = y1.max(py);
+        }
+        Rect { x: x0.round() as i32, y: y0.round() as i32, w: (x1 - x0).round() as i32, h: (y1 - y0).round() as i32 }
+    };
+    if dst.w <= 0 || dst.h <= 0 {
+        return;
+    }
+    // Sample the coverage bitmap (nearest-neighbour) across the destination rect and blend the
+    // color with the modulated alpha at each pixel.
+    for oy in 0..dst.h {
+        let sy = ((oy as i64 * cov.h as i64) / dst.h as i64).clamp(0, cov.h as i64 - 1) as u32;
+        for ox in 0..dst.w {
+            let sx = ((ox as i64 * cov.w as i64) / dst.w as i64).clamp(0, cov.w as i64 - 1) as u32;
+            let si = ((sy * cov.w + sx) * 4) as usize;
+            let cova = cov.rgba.get(si + 3).copied().unwrap_or(0);
+            if cova == 0 {
+                continue;
+            }
+            fb.blend_coverage(dst.x + ox, dst.y + oy, cova, c);
+        }
+    }
+}
+
 /// Like [`collect_node_rects`] but records each replaced-image box's **content** rect (device px) —
 /// used to rasterize each inline `<svg>` at its exact on-screen size for crisp output.
 fn collect_content_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
@@ -2455,13 +2705,14 @@ fn paint_box(
     images: &HashMap<dom::NodeId, DecodedImage>,
     canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     svg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
+    mask_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
 ) {
     // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
     // declarations compose additional affines on top per-box.
     let xf = Affine::translate(ox, oy);
-    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, 1.0, sel_ranges, run_idx);
+    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, mask_bitmaps, 1.0, sel_ranges, run_idx);
 }
 
 /// A 2D affine mapping a CSS-space point `(x, y)` to a device-space point: `x' = a*x + c*y + e`,
@@ -2535,6 +2786,7 @@ fn paint_box_opacity(
     images: &HashMap<dom::NodeId, DecodedImage>,
     canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     svg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
+    mask_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     parent_opacity: f32,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
@@ -2599,8 +2851,21 @@ fn paint_box_opacity(
             }
         }
 
-        // (a) Background fills the border box: a gradient if set, else the solid color.
-        if let Some(grad) = extras.and_then(|e| e.background_gradient.as_ref()) {
+        // (a) Background fills the border box: a gradient if set, else the solid color. When the box
+        // carries a `mask-image`, the background is composited only through the mask's opaque pixels
+        // (the icon technique: `background: currentColor; mask: url(icon.svg)`) — see `paint_masked_bg`.
+        let mask_cov = b.node.and_then(|n| mask_bitmaps.get(&n));
+        if let Some(cov) = mask_cov {
+            if let Some((r, g, bl)) = b.style.background_color {
+                // Masked solid background: stamp the color through the coverage alpha.
+                let c = Color { r, g, b: bl, a: scale_alpha(255, opacity) };
+                paint_masked_bg(fb, xf, border, cov, c, axis);
+            } else if let Some(grad) = extras.and_then(|e| e.background_gradient.as_ref()) {
+                // Gradient-as-background under a mask is out of scope (the icon technique uses a solid
+                // color). Paint the gradient unmasked so something shows. Rare.
+                paint_gradient_fill(fb, xf, border, radius, grad, opacity, axis);
+            }
+        } else if let Some(grad) = extras.and_then(|e| e.background_gradient.as_ref()) {
             paint_gradient_fill(fb, xf, border, radius, grad, opacity, axis);
         } else if let Some((r, g, bl)) = b.style.background_color {
             let c = Color { r, g, b: bl, a: scale_alpha(255, opacity) };
@@ -2795,7 +3060,7 @@ fn paint_box_opacity(
     }
 
     for child in &b.children {
-        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, opacity, sel_ranges, run_idx);
+        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, mask_bitmaps, opacity, sel_ranges, run_idx);
     }
 }
 
@@ -4853,6 +5118,61 @@ mod tests {
     }
 
     #[test]
+    fn mask_image_clips_background_to_shape() {
+        // A 40x40 red box with a circle mask: the centre must be red, the corners must show the page
+        // background (white) — proving the background is composited only through the mask's opaque
+        // pixels (the icon technique) instead of filling the whole box. The mask is a data: SVG with a
+        // viewBox so it scales to the box; the circle leaves the corners transparent.
+        let svg = "<svg viewBox='0 0 20 20'><circle cx='10' cy='10' r='9' fill='black'/></svg>";
+        let url = format!("data:image/svg+xml,{svg}");
+        let html = format!(
+            "<html><body style='margin:0'><div style=\"width:40px;height:40px;background:#ff0000;\
+             mask:url(&quot;{url}&quot;) no-repeat center / contain\"></div></body></html>"
+        );
+        let path = std::env::temp_dir().join("browser_mask_test.html");
+        std::fs::write(&path, &html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(100, 100, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let fb = e.render();
+
+        let px = |x: u32, y: u32| -> (u8, u8, u8) {
+            let i = (y * fb.stride) as usize + (x as usize) * 4;
+            (fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2])
+        };
+        // Centre of the box (20,20) is inside the circle → red.
+        let (cr, cg, cb) = px(20, 20);
+        assert!(cr > 200 && cg < 60 && cb < 60, "centre should be red, got {:?}", (cr, cg, cb));
+        // Corner (1,1) is outside the circle → page background (white), NOT red.
+        let (kr, kg, kb) = px(1, 1);
+        assert!(
+            kr > 200 && kg > 200 && kb > 200,
+            "corner should be page background (white), got {:?}",
+            (kr, kg, kb)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn box_without_mask_fills_fully() {
+        // Regression: an unmasked red box fills its whole border box, corners included.
+        let html = "<html><body style='margin:0'>\
+            <div style='width:40px;height:40px;background:#ff0000'></div></body></html>";
+        let path = std::env::temp_dir().join("browser_nomask_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(100, 100, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let fb = e.render();
+        let i = (1 * fb.stride) as usize + 1 * 4;
+        let (r, g, b) = (fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]);
+        assert!(r > 200 && g < 60 && b < 60, "unmasked box corner should be red, got {:?}", (r, g, b));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn drag_selects_text_and_clear_empties_it() {
         // Two words on (likely) one line: a drag from the left of "Hello" to the middle of "world"
         // should select "Hello wor" (or similar). Using a wide viewport keeps it on one line.
@@ -5843,7 +6163,7 @@ mod tests {
         let mut fb = Framebuffer::new(400, 300);
         let images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &no_canvas, &no_canvas, &[], &mut 0);
+        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &no_canvas, &no_canvas, &no_canvas, &[], &mut 0);
 
         // The root box should exist; with the parallel layout stub it may have no children yet,
         // so only assert the path completed and the root carries the viewport width.
@@ -5887,7 +6207,7 @@ mod tests {
             paint_gradient(&mut fb);
             let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
             let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &no_canvas, &no_canvas, &[], &mut 0);
+            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &no_canvas, &no_canvas, &no_canvas, &[], &mut 0);
             // Sample a pixel inside the div.
             let i = (50 * fb.stride + 50 * 4) as usize;
             [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
@@ -5933,7 +6253,7 @@ mod tests {
         fb.clear(Color::BLACK);
         let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &no_canvas, &no_canvas, &[], &mut 0);
+        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &no_canvas, &no_canvas, &no_canvas, &[], &mut 0);
         fb
     }
 

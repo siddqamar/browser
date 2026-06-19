@@ -277,6 +277,11 @@ pub struct ComputedStyle {
     /// pivot the `transform`. Not inherited.
     pub transform_origin: (f32, f32),
 
+    /// A `mask-image` / `mask` / `-webkit-mask` source (the icon technique), if any. `None` = no
+    /// mask. When set, the painter composites the box's background/content only through the mask's
+    /// opaque pixels. Not inherited.
+    pub mask_image: Option<MaskImage>,
+
     /// The resolved `content` string for a generated pseudo-element box. `None` for ordinary
     /// elements and for pseudo-elements whose `content` is `none`/`normal`/unsupported (no box).
     pub content: Option<String>,
@@ -408,6 +413,36 @@ pub enum Gradient {
     Linear { angle_deg: f32, stops: Vec<GradientStop> },
     /// A radial gradient (centered circle, half-diagonal radius). Stops sorted by `pos`.
     Radial { stops: Vec<GradientStop> },
+}
+
+/// How a `mask-image` is scaled to the box. Parsed from the `/ <size>` part of the `mask`
+/// shorthand. `Contain`/`Cover` honor the mask's aspect ratio; `Stretch` (the default when no
+/// size keyword is given) fits the mask to the border box. (Pixel sizes and `auto` collapse to
+/// `Contain`, the common icon case.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaskSize {
+    /// Scale the mask to fit inside the border box, preserving aspect ratio (letterboxed).
+    #[default]
+    Contain,
+    /// Scale the mask to cover the border box, preserving aspect ratio (cropped).
+    Cover,
+    /// Stretch the mask to exactly fill the border box (ignore aspect ratio).
+    Stretch,
+}
+
+/// A resolved `mask-image` / `mask` / `-webkit-mask` source. Only the image `url(...)` source is
+/// modeled (after `var()` resolution): a `data:` URL (percent-encoded or base64 SVG / raster) or a
+/// same-origin relative/absolute URL the engine fetches like an `<img>`. `size` records the
+/// `contain`/`cover` keyword; position is assumed `center` (the icon convention). Out of scope:
+/// gradients-as-mask, multiple comma-separated images (first only), `mask-mode: luminance`,
+/// `mask-composite`, and `<mask>`-element references — all treated as alpha masks / no-ops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskImage {
+    /// The image source `url(...)` contents, with surrounding quotes stripped and `var()` already
+    /// resolved. Either a `data:` URL or a relative/absolute URL to fetch.
+    pub url: String,
+    /// How the mask is scaled to the box.
+    pub size: MaskSize,
 }
 
 /// A single `box-shadow` layer.
@@ -562,6 +597,7 @@ impl Default for ComputedStyle {
             box_shadows: Vec::new(),
             transform: None,
             transform_origin: (0.5, 0.5),
+            mask_image: None,
             content: None,
             before: None,
             after: None,
@@ -1445,6 +1481,8 @@ fn compute_element_style<'a>(
         box_shadows: Vec::new(),
         transform: None,
         transform_origin: (0.5, 0.5),
+        // `mask-image` is not inherited; each box starts unmasked.
+        mask_image: None,
         // `content` only applies to generated pseudo-elements; ordinary elements never carry one.
         content: None,
         before: None,
@@ -1641,6 +1679,7 @@ fn cascade_pseudo(
     let mut ps = element_style.clone();
     ps.background_color = None;
     ps.background_gradient = None;
+    ps.mask_image = None;
     ps.box_shadows = Vec::new();
     ps.transform = None;
     ps.transform_origin = (0.5, 0.5);
@@ -2413,6 +2452,18 @@ fn apply_declaration(
                 style.color_scheme = cs;
             }
         }
+        // `mask` / `mask-image` and the WebKit-prefixed aliases. The icon technique:
+        // `background: currentColor; mask: url(icon.svg) no-repeat center / contain`. We parse past
+        // `no-repeat` / position / `/ size`, extracting the `url(...)` source (already `var()`-
+        // resolved by the caller) plus the contain/cover size keyword. `none` clears the mask.
+        "mask" | "mask-image" | "-webkit-mask" | "-webkit-mask-image" => {
+            let v = val.trim();
+            if v.eq_ignore_ascii_case("none") {
+                style.mask_image = None;
+            } else if let Some(m) = parse_mask(v) {
+                style.mask_image = Some(m);
+            }
+        }
         "box-shadow" => {
             let shadows = parse_box_shadows(val, current_color, inherited_color);
             if val.trim().eq_ignore_ascii_case("none") {
@@ -3072,6 +3123,41 @@ fn parse_angle_deg(tok: &str) -> Option<f32> {
     } else {
         t.parse::<f32>().ok()
     }
+}
+
+/// Parse a `mask` / `mask-image` value into a [`MaskImage`]. Extracts the first `url(...)` source
+/// (with surrounding quotes stripped) and scans for a `contain` / `cover` size keyword (the part
+/// after `/` in the shorthand). Other tokens (`no-repeat`, `center`, position, etc.) are ignored.
+/// Returns `None` when there's no `url(...)` (e.g. a gradient-as-mask, which is out of scope).
+fn parse_mask(val: &str) -> Option<MaskImage> {
+    let lower = val.to_ascii_lowercase();
+    // Find the first `url(` and its matching `)`.
+    let start = lower.find("url(")?;
+    let inner_start = start + 4;
+    let rest = &val[inner_start..];
+    let close = rest.find(')')?;
+    let mut raw = rest[..close].trim().to_string();
+    // Strip optional surrounding quotes.
+    if (raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2)
+        || (raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2)
+    {
+        raw = raw[1..raw.len() - 1].to_string();
+    }
+    let url = raw.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    // Size keyword: look at the tokens AFTER the `/` (CSS `position / size`), else scan the whole
+    // value for `contain`/`cover`. Default is `Stretch` (no keyword → fit-to-box).
+    let after_url = &lower[inner_start + close + 1..];
+    let size = if after_url.contains("cover") {
+        MaskSize::Cover
+    } else if after_url.contains("contain") {
+        MaskSize::Contain
+    } else {
+        MaskSize::Stretch
+    };
+    Some(MaskImage { url, size })
 }
 
 /// Parse a `linear-gradient(...)` / `radial-gradient(...)` (incl. `repeating-*`) value into a
@@ -7401,6 +7487,65 @@ mod tests {
             |e| e.tag == "table",
         );
         assert_eq!(hex.background_color, Some((0, 255, 0)));
+    }
+
+    #[test]
+    fn mask_shorthand_extracts_url_and_size() {
+        // `mask: url(...) no-repeat center / contain` → url + Contain size, parsing past the rest.
+        let cs = cs_of(
+            r#"<html><body><div class="x"></div></body></html>"#,
+            r#".x { mask: url("icon.svg") no-repeat center / contain }"#,
+            |e| e.tag == "div",
+        );
+        let m = cs.mask_image.expect("mask should parse");
+        assert_eq!(m.url, "icon.svg");
+        assert_eq!(m.size, MaskSize::Contain);
+    }
+
+    #[test]
+    fn webkit_mask_is_an_alias() {
+        let cs = cs_of(
+            r#"<html><body><div class="x"></div></body></html>"#,
+            r#".x { -webkit-mask: url(a.svg) center / cover }"#,
+            |e| e.tag == "div",
+        );
+        let m = cs.mask_image.expect("-webkit-mask should parse");
+        assert_eq!(m.url, "a.svg");
+        assert_eq!(m.size, MaskSize::Cover);
+    }
+
+    #[test]
+    fn mask_url_resolves_var() {
+        // The icon url is behind a custom property (the browserscore pattern).
+        let cs = cs_of(
+            r#"<html><body><div class="x"></div></body></html>"#,
+            r#".x { --icon: url(glyph.svg); mask: var(--icon) no-repeat center / contain }"#,
+            |e| e.tag == "div",
+        );
+        let m = cs.mask_image.expect("var()-indirected mask should resolve");
+        assert_eq!(m.url, "glyph.svg");
+    }
+
+    #[test]
+    fn mask_data_url_preserved() {
+        let cs = cs_of(
+            r#"<html><body><div class="x"></div></body></html>"#,
+            r#".x { mask: url("data:image/svg+xml,<svg></svg>") }"#,
+            |e| e.tag == "div",
+        );
+        let m = cs.mask_image.expect("data: mask should parse");
+        assert!(m.url.starts_with("data:image/svg+xml,"));
+        assert_eq!(m.size, MaskSize::Stretch, "no size keyword → Stretch (fit-to-box)");
+    }
+
+    #[test]
+    fn mask_none_clears() {
+        let cs = cs_of(
+            r#"<html><body><div class="x"></div></body></html>"#,
+            r#".x { mask: url(a.svg); mask: none }"#,
+            |e| e.tag == "div",
+        );
+        assert!(cs.mask_image.is_none(), "mask: none clears the mask");
     }
 
     #[test]

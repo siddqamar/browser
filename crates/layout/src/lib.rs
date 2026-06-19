@@ -114,6 +114,9 @@ pub struct PaintExtras {
     /// Uniform corner radius (px) for the background/border (0 = square). Lives here (rather than on
     /// the hot `PaintStyle`) to keep the per-box paint style small for deeply nested layouts.
     pub border_radius: f32,
+    /// A `mask-image` source (the icon technique), if any. When set, the painter composites the
+    /// box's background through the mask's opaque (alpha) pixels. `None` = unmasked.
+    pub mask_image: Option<style::MaskImage>,
 }
 
 impl Default for PaintStyle {
@@ -724,6 +727,7 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
             || !cs.box_shadows.is_empty()
             || cs.transform.is_some()
             || cs.border_radius != 0.0
+            || cs.mask_image.is_some()
         {
             Some(Box::new(PaintExtras {
                 background_gradient: cs.background_gradient.clone(),
@@ -731,6 +735,7 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
                 transform: cs.transform,
                 transform_origin: cs.transform_origin,
                 border_radius: cs.border_radius,
+                mask_image: cs.mask_image.clone(),
             }))
         } else {
             None
