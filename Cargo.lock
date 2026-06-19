@@ -1039,8 +1039,10 @@ dependencies = [
 name = "js"
 version = "0.1.0"
 dependencies = [
+ "css",
  "dom",
  "html",
+ "style",
  "url",
  "v8",
 ]

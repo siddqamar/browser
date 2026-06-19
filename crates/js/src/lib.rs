@@ -124,6 +124,17 @@ struct HostState {
     /// Cheap gate: true only while at least one `MutationObserver` is registered. When false the
     /// mutation primitives record nothing (the common case for pages with no observers).
     observers_active: Cell<bool>,
+    /// Monotonic version of the live DOM, bumped by every mutation primitive (append/insert/remove
+    /// child, set/remove attr, set text content). Used to invalidate `computed_cache`: if the cache
+    /// was computed at an older version it is stale and must be recomputed. browserscore.dev sets an
+    /// inline style on a probe element and immediately reads it back via `getComputedStyle`, so
+    /// invalidate-on-mutation is essential for the read to reflect the write.
+    dom_version: Cell<u64>,
+    /// Cached cascade for `getComputedStyle`, tagged with the `dom_version` it was computed at.
+    /// `None` until the first `getComputedStyle` call. Recomputed lazily when the tag != the current
+    /// `dom_version`. Computed entirely in-Session (the JS thread holds the DOM while the engine is
+    /// blocked, so we cannot reach the engine's cascade — we run `style::cascade` here ourselves).
+    computed_cache: RefCell<Option<(u64, HashMap<dom::NodeId, style::ComputedStyle>)>>,
 }
 
 impl HostState {
@@ -150,7 +161,15 @@ impl HostState {
             in_flight: Cell::new(0),
             mutations: RefCell::new(Vec::new()),
             observers_active: Cell::new(false),
+            dom_version: Cell::new(0),
+            computed_cache: RefCell::new(None),
         })
+    }
+
+    /// Bump the DOM version so the cached cascade (`computed_cache`) is treated as stale. Called by
+    /// every mutation primitive.
+    fn bump_dom_version(&self) {
+        self.dom_version.set(self.dom_version.get().wrapping_add(1));
     }
 
     /// Record a mutation if any `MutationObserver` is registered. Cheap no-op otherwise.
@@ -724,6 +743,112 @@ fn prim_get_attr(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// getComputedStyle support (computed in-Session).
+//
+// The Session's JS runs on its own worker thread while the engine is blocked, and most
+// feature-detection (browserscore.dev etc.) reads `getComputedStyle(probe).someProp` during init,
+// before any layout exists — so we cannot call back into the engine for the cascade. Instead we run
+// the *same* `style::cascade` here over the live DOM, caching it and invalidating on every DOM
+// mutation (via `dom_version`).
+//
+// Limitation: only inline `<style>` blocks (and the UA sheet that `cascade` auto-prepends) are
+// honoured. External `<link rel=stylesheet>` CSS is not available in-Session (the engine fetches it
+// out of band and it isn't surfaced to the worker), so author rules from external sheets do not
+// affect these computed values. That's fine for feature-detection, which probes inline styles on
+// throwaway elements — it never relies on external CSS.
+// ---------------------------------------------------------------------------------------------
+
+/// Walk the document for `<style>` elements, concatenate their text content, and parse it into a
+/// single author stylesheet. Returns an empty `Vec` when there are no `<style>` blocks (the cascade
+/// then runs with just the UA sheet + inline `style=""` attributes).
+fn collect_author_sheets(doc: &dom::Document) -> Vec<css::Stylesheet> {
+    fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("style") {
+                out.push_str(&text_content(doc, id));
+                out.push('\n');
+                return; // don't descend into a <style>'s text as if it were markup
+            }
+        }
+        for &child in &doc.get(id).children {
+            walk(doc, child, out);
+        }
+    }
+    let mut css_src = String::new();
+    walk(doc, doc.root(), &mut css_src);
+    if css_src.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![css::parse(&css_src)]
+    }
+}
+
+/// Recompute the cascade if the cache is missing or stale (DOM changed since it was built), then run
+/// `f` over the cached `ComputedStyle` for `id` (`None` if `id` has no computed style — e.g. a text
+/// node or out-of-range id). Keeps the borrow of `computed_cache` scoped to this call.
+fn with_computed_style<R>(
+    state: &HostState,
+    id: dom::NodeId,
+    f: impl FnOnce(Option<&style::ComputedStyle>) -> R,
+) -> R {
+    let version = state.dom_version.get();
+    {
+        let mut cache = state.computed_cache.borrow_mut();
+        let fresh = matches!(&*cache, Some((v, _)) if *v == version);
+        if !fresh {
+            let doc = state.doc.borrow();
+            let sheets = collect_author_sheets(&doc);
+            let map = style::cascade(&doc, &sheets);
+            *cache = Some((version, map));
+        }
+    }
+    let cache = state.computed_cache.borrow();
+    let map = cache.as_ref().map(|(_, m)| m);
+    f(map.and_then(|m| m.get(&id)))
+}
+
+/// `__computedStyleProp(id, name) -> string` — the computed value of CSS property `name` (kebab,
+/// lowercased by JS) for node `id`, or "" if there's no computed style (non-element / unknown id) or
+/// the property isn't tracked.
+fn prim_computed_style_prop(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let name = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    let value = match node {
+        Some(n) => with_computed_style(&state, n, |cs| {
+            cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
+        }),
+        None => String::new(),
+    };
+    let s = js_str(scope, &value);
+    rv.set(s);
+}
+
+/// `__computedStyleNames(id) -> [name...]` — the property names with non-empty computed values for
+/// node `id` (backs `length`/`item(i)`/index access/iteration). Empty array for non-elements.
+fn prim_computed_style_names(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let names: Vec<String> = match node {
+        Some(n) => with_computed_style(&state, n, |cs| {
+            cs.map(|cs| cs.property_names().iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default()
+        }),
+        None => Vec::new(),
+    };
+    let arr = js_str_array(scope, &names);
+    rv.set(arr);
+}
+
 /// `__setAttr(id, name, val)`
 fn prim_set_attr(
     scope: &mut v8::PinScope,
@@ -735,6 +860,7 @@ fn prim_set_attr(
     let value = arg_str(scope, &args, 2);
     let state = host_state(scope);
     if let Some(n) = node {
+        state.bump_dom_version(); // invalidate getComputedStyle cache
         let old = if state.observers_active.get() {
             // Capture the old value BEFORE overwriting (for `attributeOldValue`).
             match &state.doc.borrow().get(n).data {
@@ -768,6 +894,7 @@ fn prim_remove_attr(
     let name = arg_str(scope, &args, 1);
     let state = host_state(scope);
     if let Some(n) = node {
+        state.bump_dom_version(); // invalidate getComputedStyle cache
         let old = if state.observers_active.get() {
             match &state.doc.borrow().get(n).data {
                 dom::NodeData::Element(e) => e.attrs.get(&name).cloned(),
@@ -818,6 +945,7 @@ fn prim_append_child(
     let child = arg_node(scope, &args, 1);
     let state = host_state(scope);
     if let (Some(parent), Some(child)) = (parent, child) {
+        state.bump_dom_version(); // invalidate getComputedStyle cache
         let old_parent = {
             let mut d = state.doc.borrow_mut();
             let old_parent = d.get(child).parent;
@@ -866,6 +994,7 @@ fn prim_insert_before(
     let ref_node = arg_node(scope, &args, 2);
     let state = host_state(scope);
     if let (Some(parent), Some(child)) = (parent, child) {
+        state.bump_dom_version(); // invalidate getComputedStyle cache
         let old_parent = {
             let mut d = state.doc.borrow_mut();
             let old_parent = d.get(child).parent;
@@ -915,6 +1044,7 @@ fn prim_remove_child(
     let child = arg_node(scope, &args, 1);
     let state = host_state(scope);
     if let (Some(parent), Some(child)) = (parent, child) {
+        state.bump_dom_version(); // invalidate getComputedStyle cache
         let removed = {
             let mut d = state.doc.borrow_mut();
             let was_child = d.get(parent).children.contains(&child);
@@ -1024,6 +1154,7 @@ fn prim_set_text_content(
     let text = arg_str(scope, &args, 1);
     let state = host_state(scope);
     if let Some(n) = node {
+        state.bump_dom_version(); // invalidate getComputedStyle cache
         // For Text/Comment nodes, setting textContent/data is a `characterData` mutation; capture
         // the old string value first (for `characterDataOldValue`). For elements it replaces the
         // subtree (we don't emit a childList record for that simplification).
@@ -1073,6 +1204,7 @@ fn prim_set_inner_html(
     let html = arg_str(scope, &args, 1);
     let state = host_state(scope);
     if let Some(n) = node {
+        state.bump_dom_version(); // invalidate getComputedStyle cache (subtree replaced)
         set_inner_html(&mut state.doc.borrow_mut(), n, &html);
     }
 }
@@ -1529,6 +1661,8 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__startFetch", prim_start_fetch);
     set_fn(scope, global, "__observersActive", prim_observers_active);
     set_fn(scope, global, "__drainMutations", prim_drain_mutations);
+    set_fn(scope, global, "__computedStyleProp", prim_computed_style_prop);
+    set_fn(scope, global, "__computedStyleNames", prim_computed_style_names);
 }
 
 /// Compile+run a script in the current context, ignoring the result. Used for bootstraps where a
@@ -2183,23 +2317,92 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   };
 
   // --- getComputedStyle --------------------------------------------------------------------
-  // Proxy so any property access returns "" and getPropertyValue() returns "". Falls back to a
-  // plain object with common props if Proxy is unavailable.
-  globalThis.getComputedStyle = function () {
-    var base = { getPropertyValue: function () { return ""; }, getPropertyPriority: function () { return ""; }, setProperty: fn, removeProperty: function () { return ""; }, item: function () { return ""; }, length: 0 };
-    try {
-      return new Proxy(base, {
-        get: function (target, prop) {
-          if (prop in target) { return target[prop]; }
-          return "";
-        }
-      });
-    } catch (e) {
-      var common = ["display", "color", "width", "height", "visibility", "opacity", "position", "margin", "padding", "font-size", "background-color"];
-      for (var i = 0; i < common.length; i++) { base[common[i]] = ""; }
-      return base;
+  // Returns a read-only CSSStyleDeclaration-like object backed by the in-Session cascade
+  // (`__computedStyleProp` / `__computedStyleNames`, computed in Rust by the `style` crate). For a
+  // detached object with no node id we fall back to the old empty-stub so callers don't throw.
+  (function () {
+    // camelCase (or vendor-prefixed) property name -> kebab-case. `fontSize` -> `font-size`;
+    // `WebkitTransform` -> `-webkit-transform`; already-kebab names pass through unchanged.
+    function camelToKebab(prop) {
+      prop = String(prop);
+      if (prop.indexOf("-") >= 0) { return prop.toLowerCase(); } // already kebab
+      // Insert "-" before each uppercase letter, lowercase everything. A leading uppercase (vendor
+      // prefixes like `Webkit`/`Moz`/`Ms`) becomes a leading "-" (e.g. `-webkit-transform`).
+      var out = prop.replace(/[A-Z]/g, function (c) { return "-" + c.toLowerCase(); });
+      return out;
     }
-  };
+
+    function emptyDeclaration() {
+      // Detached / no node id: behave like the old stub (every read is "").
+      var base = {
+        getPropertyValue: function () { return ""; },
+        getPropertyPriority: function () { return ""; },
+        setProperty: fn, removeProperty: function () { return ""; },
+        item: function () { return ""; }, length: 0
+      };
+      try {
+        return new Proxy(base, { get: function (t, p) { return (p in t) ? t[p] : ""; } });
+      } catch (e) {
+        var common = ["display", "color", "width", "height", "visibility", "opacity", "position", "margin", "padding", "font-size", "background-color"];
+        for (var i = 0; i < common.length; i++) { base[common[i]] = ""; }
+        return base;
+      }
+    }
+
+    function makeDeclaration(id) {
+      var names = null; // lazily fetched list of populated property names
+      function getNames() { if (names === null) { try { names = __computedStyleNames(id) || []; } catch (e) { names = []; } } return names; }
+      function get(prop) { try { return __computedStyleProp(id, String(prop).toLowerCase()); } catch (e) { return ""; } }
+
+      var decl = {
+        getPropertyValue: function (name) { return get(name); },
+        getPropertyPriority: function () { return ""; },
+        // Computed styles are read-only: mutators are no-ops.
+        setProperty: fn,
+        removeProperty: function () { return ""; },
+        item: function (i) { var n = getNames(); i = i >>> 0; return i < n.length ? n[i] : ""; }
+      };
+      Object.defineProperty(decl, "length", {
+        get: function () { return getNames().length; }, enumerable: true, configurable: true
+      });
+
+      try {
+        return new Proxy(decl, {
+          get: function (target, prop) {
+            if (typeof prop === "symbol") { return target[prop]; }
+            if (prop in target) { return target[prop]; }
+            // Numeric index -> the i-th property name (like a real CSSStyleDeclaration).
+            if (/^[0-9]+$/.test(prop)) { var n = getNames(); var i = Number(prop); return i < n.length ? n[i] : undefined; }
+            // Any other property: kebab or camelCase CSS property access.
+            return get(camelToKebab(prop));
+          },
+          has: function (target, prop) {
+            if (prop in target) { return true; }
+            return get(camelToKebab(prop)) !== "";
+          }
+        });
+      } catch (e) {
+        // No Proxy: define the common longhands + index slots eagerly (matches the old fallback).
+        var nm = getNames();
+        for (var i = 0; i < nm.length; i++) {
+          (function (k, idx) {
+            var kebab = k;
+            // expose both kebab and the camelCase alias
+            decl[kebab] = get(kebab);
+            decl[kebab.replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); })] = get(kebab);
+            decl[idx] = kebab;
+          })(nm[i], i);
+        }
+        return decl;
+      }
+    }
+
+    globalThis.getComputedStyle = function (el) {
+      var id = (el && typeof el.__node === "number") ? el.__node : null;
+      if (id === null) { return emptyDeclaration(); }
+      return makeDeclaration(id);
+    };
+  })();
 
   // --- event model (no-op but present) + a simple listener registry ------------------------
   function installEvents(target) {
@@ -5691,6 +5894,140 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_display_block_for_div_inline_for_span() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        doc.append_element(body, "span");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "getComputedStyle(document.querySelectorAll('div')[0]).display".to_string(),
+                "getComputedStyle(document.querySelectorAll('span')[0]).display".to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("block"));
+        assert_eq!(out[1].value.as_deref(), Some("inline"));
+    }
+
+    #[test]
+    fn computed_style_inline_color_serializes_rgb() {
+        let (mut doc, body) = doc_with_body("");
+        let p = doc.append_element(body, "p");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(p).data {
+            e.attrs.insert("style".to_string(), "color:red".to_string());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec!["getComputedStyle(document.querySelectorAll('p')[0]).color".to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("rgb(255, 0, 0)"));
+    }
+
+    #[test]
+    fn computed_style_get_property_value_font_size_in_px() {
+        let (mut doc, body) = doc_with_body("");
+        let p = doc.append_element(body, "p");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(p).data {
+            e.attrs.insert("style".to_string(), "font-size:18px".to_string());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "getComputedStyle(document.querySelectorAll('p')[0]).getPropertyValue('font-size')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("18px"));
+    }
+
+    #[test]
+    fn computed_style_applies_style_element_rule() {
+        // A `<style>` rule `.x{display:flex}` is collected in-Session and applied via the cascade.
+        let (mut doc, body) = doc_with_body("");
+        // <style> in <head>
+        let head = doc.get(doc.get(body).parent.unwrap()).children[0]; // html -> head
+        let style_el = doc.append_element(head, "style");
+        doc.append_child(style_el, dom::NodeData::Text(".x{display:flex}".to_string()));
+        let d = doc.append_element(body, "div");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(d).data {
+            e.attrs.insert("class".to_string(), "x".to_string());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec!["getComputedStyle(document.querySelectorAll('div')[0]).display".to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("flex"));
+    }
+
+    #[test]
+    fn computed_style_mutating_inline_style_invalidates_cache() {
+        // Read once, mutate the inline style, read again -> must reflect the NEW value (the
+        // dom_version bump on setAttribute invalidates the cached cascade).
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var el = document.querySelectorAll('div')[0];
+                   var before = getComputedStyle(el).color;
+                   el.style.color = 'rgb(1, 2, 3)';
+                   var after = getComputedStyle(el).color;
+                   before + '|' + after"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // `before` is the inherited default; `after` is the freshly-set inline color.
+        let v = out[0].value.as_deref().unwrap();
+        assert!(v.ends_with("|rgb(1, 2, 3)"), "expected new color after mutation, got {v}");
+        assert_ne!(v, "rgb(1, 2, 3)|rgb(1, 2, 3)", "before should differ from after");
+    }
+
+    #[test]
+    fn computed_style_untracked_property_is_empty() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = getComputedStyle(document.querySelectorAll('div')[0]); \
+                 [s.cursor, s.getPropertyValue('transition'), s.visibility].join(',')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some(",,"));
+    }
+
+    #[test]
+    fn computed_style_length_and_item_backed_by_names() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = getComputedStyle(document.querySelectorAll('div')[0]); \
+                 (s.length > 0) && (typeof s.item(0) === 'string') && (s.item(0).length > 0) \
+                 && (s.setProperty('color','blue'), s.removeProperty('color'), true)"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true"));
+    }
+
+    #[test]
     fn document_title_returns_title_text() {
         let (doc, _) = doc_with_body("My Page");
         let (_doc, out) = run_with_dom(doc, vec!["document.title".to_string()], "https://example.com/");
@@ -5965,14 +6302,16 @@ mod tests {
     }
 
     #[test]
-    fn get_computed_style_returns_empty_strings() {
+    fn get_computed_style_returns_real_values() {
+        // The body is a real element (UA sheet -> display:block); getComputedStyle now surfaces the
+        // in-Session cascade instead of the old "" stub.
         let out = env_eval(
             "https://example.com/",
-            "getComputedStyle(document.body).getPropertyValue('color') === '' \
-             && getComputedStyle(document.body).color === ''",
+            "var s = getComputedStyle(document.body); \
+             [s.getPropertyValue('display'), s.display, s.getPropertyValue('color').slice(0,4)].join('|')",
         );
         assert_eq!(out.error, None, "{out:?}");
-        assert_eq!(out.value.as_deref(), Some("true"));
+        assert_eq!(out.value.as_deref(), Some("block|block|rgb("));
     }
 
     #[test]

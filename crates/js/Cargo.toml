@@ -12,6 +12,11 @@ license.workspace = true
 v8 = "150"
 # The real DOM, so page scripts can read and mutate the live document tree.
 dom = { path = "../dom" }
+# The cascade + CSS parser, so `getComputedStyle` can compute real values in-Session (the JS runs
+# on its own thread while the engine is blocked, so we cannot call back into the engine; we run the
+# cascade here instead). `style` depends only on `css` + `dom` — no cycle back through `js`.
+style = { path = "../style" }
+css = { path = "../css" }
 # HTML parsing, so the `innerHTML` setter can build real child nodes from markup.
 html = { path = "../html" }
 # URL parsing/joining, so dynamic `import()` can resolve relative specifiers against the

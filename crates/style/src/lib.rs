@@ -386,6 +386,350 @@ impl Default for ComputedStyle {
     }
 }
 
+/// Format a number the way `getComputedStyle` does: an integer with no decimal point when whole
+/// (`16` not `16.0`), otherwise the shortest decimal (`12.5`). Negative zero normalizes to `0`.
+fn num(v: f32) -> String {
+    let v = if v == 0.0 { 0.0 } else { v }; // normalize -0
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        // Trim trailing zeros from a fixed rendering.
+        let mut s = format!("{v:.4}");
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+        s
+    }
+}
+
+/// Format a length in CSS px (`<n>px`).
+fn px(v: f32) -> String {
+    format!("{}px", num(v))
+}
+
+/// Format an opaque color as `rgb(r, g, b)`.
+fn rgb_str((r, g, b): (u8, u8, u8)) -> String {
+    format!("rgb({r}, {g}, {b})")
+}
+
+impl ComputedStyle {
+    /// Return the *computed* value of CSS property `name` (kebab-case) as the string
+    /// [`getComputedStyle`](https://developer.mozilla.org/en-US/docs/Web/API/Window/getComputedStyle)
+    /// would return for it, for every field this `ComputedStyle` tracks. Properties this struct does
+    /// not model return `""` (empty) — which correctly reports "we don't support/track that" to the
+    /// feature-detection that drives most callers (e.g. browserscore.dev reads
+    /// `getComputedStyle(probe).someProp` and checks whether it's empty).
+    ///
+    /// Both common longhands and the few cheaply-assembled shorthands (`margin`, `padding`,
+    /// `border-width`, `inset`, `gap`) are mapped.
+    pub fn get_property(&self, name: &str) -> String {
+        // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
+        let name = name.trim().to_ascii_lowercase();
+        match name.as_str() {
+            // --- display / box model mode ---
+            "display" => match self.display {
+                Display::None => "none",
+                Display::Block => "block",
+                Display::Inline => "inline",
+                Display::InlineBlock => "inline-block",
+                Display::Flex => "flex",
+                Display::InlineFlex => "inline-flex",
+                Display::Grid => "grid",
+                Display::InlineGrid => "inline-grid",
+            }
+            .to_string(),
+            "position" => match self.position {
+                Position::Static => "static",
+                Position::Relative => "relative",
+                Position::Absolute => "absolute",
+                Position::Fixed => "fixed",
+                Position::Sticky => "sticky",
+            }
+            .to_string(),
+
+            // --- color / paint ---
+            "color" => rgb_str(self.color),
+            "background-color" => match self.background_color {
+                Some(c) => rgb_str(c),
+                None => "rgba(0, 0, 0, 0)".to_string(), // CSS transparent
+            },
+            "border-top-color" | "border-right-color" | "border-bottom-color"
+            | "border-left-color" | "border-color" => rgb_str(self.border_color),
+            "opacity" => num(self.opacity),
+            "border-radius" => px(self.border_radius),
+
+            // --- typography ---
+            "font-size" => px(self.font_size),
+            "font-weight" => if self.bold { "700" } else { "400" }.to_string(),
+            "font-style" => if self.italic { "italic" } else { "normal" }.to_string(),
+            "text-align" => match self.text_align {
+                TextAlign::Left => "left",
+                TextAlign::Center => "center",
+                TextAlign::Right => "right",
+            }
+            .to_string(),
+            "text-transform" => match self.text_transform {
+                TextTransform::None => "none",
+                TextTransform::Uppercase => "uppercase",
+                TextTransform::Lowercase => "lowercase",
+                TextTransform::Capitalize => "capitalize",
+            }
+            .to_string(),
+            "letter-spacing" => {
+                if self.letter_spacing == 0.0 {
+                    "normal".to_string()
+                } else {
+                    px(self.letter_spacing)
+                }
+            }
+            "line-height" => match self.line_height {
+                Some(v) => px(v),
+                None => "normal".to_string(),
+            },
+            "text-decoration-line" | "text-decoration" => {
+                let mut parts = Vec::new();
+                if self.underline {
+                    parts.push("underline");
+                }
+                if self.line_through {
+                    parts.push("line-through");
+                }
+                if parts.is_empty() {
+                    "none".to_string()
+                } else {
+                    parts.join(" ")
+                }
+            }
+
+            // --- sizing ---
+            "width" => self.width.map(px).unwrap_or_else(|| "auto".to_string()),
+            "height" => self.height.map(px).unwrap_or_else(|| "auto".to_string()),
+            "min-width" => self.min_width.map(|c| size_constraint_str(c)).unwrap_or_else(|| "auto".to_string()),
+            "min-height" => self.min_height.map(|c| size_constraint_str(c)).unwrap_or_else(|| "auto".to_string()),
+            "max-width" => self.max_width.map(|c| size_constraint_str(c)).unwrap_or_else(|| "none".to_string()),
+            "max-height" => self.max_height.map(|c| size_constraint_str(c)).unwrap_or_else(|| "none".to_string()),
+
+            // --- insets (position offsets) ---
+            "top" => self.top.map(px).unwrap_or_else(|| "auto".to_string()),
+            "right" => self.right.map(px).unwrap_or_else(|| "auto".to_string()),
+            "bottom" => self.bottom.map(px).unwrap_or_else(|| "auto".to_string()),
+            "left" => self.left.map(px).unwrap_or_else(|| "auto".to_string()),
+            "inset" => format!(
+                "{} {} {} {}",
+                self.top.map(px).unwrap_or_else(|| "auto".to_string()),
+                self.right.map(px).unwrap_or_else(|| "auto".to_string()),
+                self.bottom.map(px).unwrap_or_else(|| "auto".to_string()),
+                self.left.map(px).unwrap_or_else(|| "auto".to_string()),
+            ),
+            "z-index" => self.z_index.map(|z| z.to_string()).unwrap_or_else(|| "auto".to_string()),
+
+            // --- margin ---
+            "margin-top" => px(self.margin.top),
+            "margin-right" => px(self.margin.right),
+            "margin-bottom" => px(self.margin.bottom),
+            "margin-left" => px(self.margin.left),
+            "margin" => edges_str(self.margin),
+
+            // --- padding ---
+            "padding-top" => px(self.padding.top),
+            "padding-right" => px(self.padding.right),
+            "padding-bottom" => px(self.padding.bottom),
+            "padding-left" => px(self.padding.left),
+            "padding" => edges_str(self.padding),
+
+            // --- border widths ---
+            "border-top-width" => px(self.border.top),
+            "border-right-width" => px(self.border.right),
+            "border-bottom-width" => px(self.border.bottom),
+            "border-left-width" => px(self.border.left),
+            "border-width" => edges_str(self.border),
+
+            // --- flex container ---
+            "flex-direction" => match self.flex_direction {
+                FlexDirection::Row => "row",
+                FlexDirection::RowReverse => "row-reverse",
+                FlexDirection::Column => "column",
+                FlexDirection::ColumnReverse => "column-reverse",
+            }
+            .to_string(),
+            "flex-wrap" => match self.flex_wrap {
+                FlexWrap::NoWrap => "nowrap",
+                FlexWrap::Wrap => "wrap",
+                FlexWrap::WrapReverse => "wrap-reverse",
+            }
+            .to_string(),
+            "justify-content" => justify_content_str(self.justify_content).to_string(),
+            "align-items" => match self.align_items {
+                AlignItems::Stretch => "stretch",
+                AlignItems::FlexStart => "flex-start",
+                AlignItems::FlexEnd => "flex-end",
+                AlignItems::Center => "center",
+                AlignItems::Baseline => "baseline",
+            }
+            .to_string(),
+            "align-content" => match self.align_content {
+                Some(jc) => justify_content_str(jc).to_string(),
+                None => "normal".to_string(),
+            },
+
+            // --- flex item ---
+            "flex-grow" => num(self.flex_grow),
+            "flex-shrink" => num(self.flex_shrink),
+            "flex-basis" => self.flex_basis.map(px).unwrap_or_else(|| "auto".to_string()),
+            "align-self" => match self.align_self {
+                AlignSelf::Auto => "auto",
+                AlignSelf::Stretch => "stretch",
+                AlignSelf::FlexStart => "flex-start",
+                AlignSelf::FlexEnd => "flex-end",
+                AlignSelf::Center => "center",
+                AlignSelf::Baseline => "baseline",
+            }
+            .to_string(),
+            "order" => self.order.to_string(),
+
+            // --- gaps ---
+            "row-gap" => px(self.row_gap),
+            "column-gap" => px(self.column_gap),
+            "gap" => {
+                if self.row_gap == self.column_gap {
+                    px(self.row_gap)
+                } else {
+                    format!("{} {}", px(self.row_gap), px(self.column_gap))
+                }
+            }
+
+            // --- grid ---
+            "grid-template-columns" => tracks_str(&self.grid_template_columns),
+            "grid-template-rows" => tracks_str(&self.grid_template_rows),
+
+            // Anything else this struct does not model: report empty so feature detection sees
+            // "unsupported/untracked" (which is the correct, honest answer for those callers).
+            _ => String::new(),
+        }
+    }
+
+    /// The CSS property names this `ComputedStyle` can return a (non-empty) value for, in a stable
+    /// order. Backs `getComputedStyle(el).length`/`item(i)`/index access/iteration. Shorthands are
+    /// included (browsers enumerate them too).
+    pub fn property_names(&self) -> Vec<&'static str> {
+        const NAMES: &[&str] = &[
+            "display",
+            "position",
+            "color",
+            "background-color",
+            "border-color",
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+            "opacity",
+            "border-radius",
+            "font-size",
+            "font-weight",
+            "font-style",
+            "text-align",
+            "text-transform",
+            "letter-spacing",
+            "line-height",
+            "text-decoration",
+            "text-decoration-line",
+            "width",
+            "height",
+            "min-width",
+            "min-height",
+            "max-width",
+            "max-height",
+            "top",
+            "right",
+            "bottom",
+            "left",
+            "inset",
+            "z-index",
+            "margin",
+            "margin-top",
+            "margin-right",
+            "margin-bottom",
+            "margin-left",
+            "padding",
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+            "border-width",
+            "border-top-width",
+            "border-right-width",
+            "border-bottom-width",
+            "border-left-width",
+            "flex-direction",
+            "flex-wrap",
+            "justify-content",
+            "align-items",
+            "align-content",
+            "flex-grow",
+            "flex-shrink",
+            "flex-basis",
+            "align-self",
+            "order",
+            "row-gap",
+            "column-gap",
+            "gap",
+            "grid-template-columns",
+            "grid-template-rows",
+        ];
+        // Every name here maps to a tracked field, so all are non-empty.
+        NAMES.to_vec()
+    }
+}
+
+fn size_constraint_str(c: SizeConstraint) -> String {
+    match c {
+        SizeConstraint::Px(v) => px(v),
+        SizeConstraint::Pct(p) => format!("{}%", num(p * 100.0)),
+    }
+}
+
+fn justify_content_str(jc: JustifyContent) -> &'static str {
+    match jc {
+        JustifyContent::FlexStart => "flex-start",
+        JustifyContent::FlexEnd => "flex-end",
+        JustifyContent::Center => "center",
+        JustifyContent::SpaceBetween => "space-between",
+        JustifyContent::SpaceAround => "space-around",
+        JustifyContent::SpaceEvenly => "space-evenly",
+    }
+}
+
+/// Serialize four edges the way `getComputedStyle` returns the shorthand: collapsed when sides are
+/// equal, otherwise the full `top right bottom left` form.
+fn edges_str(e: Edges) -> String {
+    if e.top == e.right && e.right == e.bottom && e.bottom == e.left {
+        px(e.top)
+    } else if e.top == e.bottom && e.left == e.right {
+        format!("{} {}", px(e.top), px(e.right))
+    } else {
+        format!("{} {} {} {}", px(e.top), px(e.right), px(e.bottom), px(e.left))
+    }
+}
+
+fn track_str(t: TrackSize) -> String {
+    match t {
+        TrackSize::Px(v) => px(v),
+        TrackSize::Fr(v) => format!("{}fr", num(v)),
+        TrackSize::Pct(p) => format!("{}%", num(p)),
+        TrackSize::Auto => "auto".to_string(),
+    }
+}
+
+fn tracks_str(tracks: &[TrackSize]) -> String {
+    if tracks.is_empty() {
+        return "none".to_string();
+    }
+    tracks.iter().map(|t| track_str(*t)).collect::<Vec<_>>().join(" ")
+}
+
 /// Compute a [`ComputedStyle`] for every element node in `doc`, using the built-in UA
 /// stylesheet first, then the supplied author `sheets` (in document order), then each
 /// element's inline `style="…"` attribute (highest precedence within an element).
@@ -5512,6 +5856,128 @@ mod tests {
                 let indexed = indexed_matches(&doc, id, el, &index);
                 assert_eq!(indexed, brute, "match set diverged for <{}>", el.tag);
             }
+        }
+    }
+
+    // --- get_property (getComputedStyle string serialization) ----------------------------------
+
+    /// Cascade a doc + sheet and return the computed style for the first element matching `pred`.
+    fn cs_of(html_src: &str, sheet_src: &str, pred: impl Fn(&dom::ElementData) -> bool) -> ComputedStyle {
+        let sheet = css::parse(sheet_src);
+        let doc = html::parse(html_src);
+        let map = cascade(&doc, &[sheet]);
+        let id = elem(&doc, pred);
+        map[&id].clone()
+    }
+
+    #[test]
+    fn get_property_display_block_inline_flex_none() {
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("display"), "block");
+        let cs = cs_of("<html><body><span></span></body></html>", "", |e| e.tag == "span");
+        assert_eq!(cs.get_property("display"), "inline");
+        let cs = cs_of("<html><body><div class='x'></div></body></html>", ".x{display:flex}", |e| e.tag == "div");
+        assert_eq!(cs.get_property("display"), "flex");
+        let cs = cs_of("<html><body><div class='x'></div></body></html>", ".x{display:none}", |e| e.tag == "div");
+        assert_eq!(cs.get_property("display"), "none");
+    }
+
+    #[test]
+    fn get_property_color_serializes_rgb() {
+        let cs = cs_of("<html><body><p style='color:red'>t</p></body></html>", "", |e| e.tag == "p");
+        assert_eq!(cs.get_property("color"), "rgb(255, 0, 0)");
+    }
+
+    #[test]
+    fn get_property_background_color_transparent_default() {
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("background-color"), "rgba(0, 0, 0, 0)");
+        let cs = cs_of("<html><body><div style='background-color:#00ff00'></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("background-color"), "rgb(0, 255, 0)");
+    }
+
+    #[test]
+    fn get_property_font_size_and_weight() {
+        let cs = cs_of("<html><body><p style='font-size:20px;font-weight:bold'>t</p></body></html>", "", |e| e.tag == "p");
+        assert_eq!(cs.get_property("font-size"), "20px");
+        assert_eq!(cs.get_property("font-weight"), "700");
+        let cs = cs_of("<html><body><p>t</p></body></html>", "", |e| e.tag == "p");
+        assert_eq!(cs.get_property("font-weight"), "400");
+    }
+
+    #[test]
+    fn get_property_position() {
+        let cs = cs_of("<html><body><div style='position:absolute'></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("position"), "absolute");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("position"), "static");
+    }
+
+    #[test]
+    fn get_property_width_height_auto_or_px() {
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("width"), "auto");
+        let cs = cs_of("<html><body><div style='width:100px;height:50px'></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("width"), "100px");
+        assert_eq!(cs.get_property("height"), "50px");
+    }
+
+    #[test]
+    fn get_property_margin_longhand_and_shorthand() {
+        let cs = cs_of("<html><body><div style='margin:10px 20px 30px 40px'></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("margin-top"), "10px");
+        assert_eq!(cs.get_property("margin-right"), "20px");
+        assert_eq!(cs.get_property("margin-bottom"), "30px");
+        assert_eq!(cs.get_property("margin-left"), "40px");
+        assert_eq!(cs.get_property("margin"), "10px 20px 30px 40px");
+        let cs = cs_of("<html><body><div style='margin:5px'></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("margin"), "5px");
+    }
+
+    #[test]
+    fn get_property_opacity_and_padding() {
+        let cs = cs_of("<html><body><div style='opacity:0.5;padding:8px'></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("opacity"), "0.5");
+        assert_eq!(cs.get_property("padding"), "8px");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("opacity"), "1");
+    }
+
+    #[test]
+    fn get_property_flex_container() {
+        let cs = cs_of(
+            "<html><body><div style='display:flex;justify-content:center;flex-direction:column'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.get_property("justify-content"), "center");
+        assert_eq!(cs.get_property("flex-direction"), "column");
+    }
+
+    #[test]
+    fn get_property_untracked_returns_empty() {
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("visibility"), "");
+        assert_eq!(cs.get_property("cursor"), "");
+        assert_eq!(cs.get_property("--custom-var"), "");
+        assert_eq!(cs.get_property("transition"), "");
+    }
+
+    #[test]
+    fn get_property_is_case_insensitive() {
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        assert_eq!(cs.get_property("DISPLAY"), "block");
+        assert_eq!(cs.get_property("Font-Size"), "16px");
+    }
+
+    #[test]
+    fn property_names_all_resolve_nonempty() {
+        let cs = ComputedStyle::default();
+        for name in cs.property_names() {
+            assert!(
+                !cs.get_property(name).is_empty(),
+                "property `{name}` listed in property_names() resolved to empty"
+            );
         }
     }
 }
