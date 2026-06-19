@@ -714,8 +714,13 @@ fn find_top_level(s: &str, sep: char) -> Option<usize> {
 }
 
 /// Split a comma-separated selector list into trimmed, non-empty raw selector strings.
+///
+/// Splits on *top-level* commas only (respecting `()`, `[]`, and quotes), so functional
+/// pseudo-classes with comma-separated arguments — `:is(.a, .b)`, `:not(h1, h2)`,
+/// `:nth-child(2n, …)` — and attribute values containing commas survive intact.
 fn parse_selector_list(s: &str) -> Vec<String> {
-    s.split(',')
+    split_top_level(s, ',')
+        .into_iter()
         .map(|sel| sel.trim().to_string())
         .filter(|sel| !sel.is_empty())
         .collect()

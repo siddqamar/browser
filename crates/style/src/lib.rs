@@ -405,21 +405,16 @@ impl<'a> SelectorIndex<'a> {
         }
         for sel in &rule.selectors {
             let Some(compiled) = compile_selector(sel) else {
-                continue; // unsupported selector — never matches, drop it
+                continue; // unsupported selector (e.g. pseudo-element) — drop it
             };
-            let entry = Entry { origin, order, compiled: compiled.clone(), decls: &rule.declarations };
-            // Bucket under the single most-selective key available.
-            if let Some(id) = compiled.ids.first() {
-                self.by_id.entry(id.clone()).or_default().push(entry);
-            } else if let Some(class) = compiled.classes.first() {
-                self.by_class.entry(class.clone()).or_default().push(entry);
-            } else if let Some(t) = &compiled.type_part {
-                // `type_part` is already lowercased — the query side lowercases the tag too.
-                self.by_type.entry(t.clone()).or_default().push(entry);
-            } else {
-                // `*` or `:root` — no id/class/type key.
-                self.universal.push(entry);
+            // Bucket under the rightmost (subject) compound's most-selective simple part.
+            match compiled.bucket_key().clone() {
+                BucketKey::Id(id) => self.by_id.entry(id).or_default(),
+                BucketKey::Class(class) => self.by_class.entry(class).or_default(),
+                BucketKey::Type(t) => self.by_type.entry(t).or_default(),
+                BucketKey::Universal => &mut self.universal,
             }
+            .push(Entry { origin, order, compiled, decls: &rule.declarations });
         }
     }
 }
@@ -440,6 +435,31 @@ pub fn set_viewport_metrics(width: f32, height: f32, device_pixel_ratio: f32) {
     VIEWPORT_W_BITS.store(width.max(1.0).to_bits(), Ordering::Relaxed);
     VIEWPORT_H_BITS.store(height.max(1.0).to_bits(), Ordering::Relaxed);
     VIEWPORT_DPR_BITS.store(device_pixel_ratio.max(0.1).to_bits(), Ordering::Relaxed);
+}
+
+// Live pointer/keyboard interaction state used to evaluate `:hover`/`:focus`/`:active`/
+// `:focus-within`/`:focus-visible` during the cascade. The engine sets these via
+// `set_interaction_state` before each cascade. We store the hovered/focused node ids (the
+// `usize` inside a `dom::NodeId`); `usize::MAX` means "none".
+static HOVERED_NODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static FOCUSED_NODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Set the currently hovered and focused node ids (as the raw `usize` of their [`dom::NodeId`]),
+/// or `None` for neither. Call before [`cascade`] whenever interaction state changes so
+/// `:hover`/`:focus`/… re-evaluate. Mirrors [`set_viewport_metrics`].
+pub fn set_interaction_state(hovered: Option<usize>, focused: Option<usize>) {
+    use std::sync::atomic::Ordering;
+    HOVERED_NODE.store(hovered.unwrap_or(usize::MAX), Ordering::Relaxed);
+    FOCUSED_NODE.store(focused.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
+
+fn interaction_hovered() -> Option<usize> {
+    let v = HOVERED_NODE.load(std::sync::atomic::Ordering::Relaxed);
+    if v == usize::MAX { None } else { Some(v) }
+}
+fn interaction_focused() -> Option<usize> {
+    let v = FOCUSED_NODE.load(std::sync::atomic::Ordering::Relaxed);
+    if v == usize::MAX { None } else { Some(v) }
 }
 
 fn viewport_width() -> f32 {
@@ -479,7 +499,7 @@ fn cascade_node(
     let node = doc.get(id);
     let (computed, vars) = if let dom::NodeData::Element(el) = &node.data {
         let (style, vars) =
-            compute_element_style(el, parent, parent_vars, parent_hidden, index);
+            compute_element_style(doc, id, el, parent, parent_vars, parent_hidden, index);
         out.insert(id, style.clone());
         (style, vars)
     } else {
@@ -500,7 +520,10 @@ fn cascade_node(
 
 /// Resolve one element's computed style: gather matching declarations from all origins in
 /// precedence order, apply them, then layer inheritance.
+#[allow(clippy::too_many_arguments)]
 fn compute_element_style<'a>(
+    doc: &dom::Document,
+    node_id: dom::NodeId,
     el: &dom::ElementData,
     parent: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
@@ -587,7 +610,7 @@ fn compute_element_style<'a>(
     // specificity.
     let mut best_by_order: HashMap<usize, (u8, u32, &[(String, String)])> = HashMap::new();
     let mut consider = |entry: &Entry<'a>| {
-        if matches_compiled(&entry.compiled, el) {
+        if complex_matches(doc, node_id, &entry.compiled.selector) {
             best_by_order
                 .entry(entry.order)
                 .and_modify(|(_, spec, _)| *spec = (*spec).max(entry.compiled.specificity))
@@ -2360,131 +2383,807 @@ fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
 /// The cascade now matches via [`SelectorIndex`] rather than calling this per rule, but it is
 /// retained as the reference single-rule matcher (used by tests / external callers).
 #[allow(dead_code)]
-fn rule_specificity(selectors: &[String], el: &dom::ElementData) -> Option<u32> {
+fn rule_specificity(selectors: &[String], doc: &dom::Document, id: dom::NodeId) -> Option<u32> {
     let mut best: Option<u32> = None;
     for sel in selectors {
-        if let Some(spec) = match_simple_selector(sel, el) {
-            best = Some(best.map_or(spec, |b| b.max(spec)));
+        if let Some(c) = compile_selector(sel) {
+            if complex_matches(doc, id, &c.selector) {
+                best = Some(best.map_or(c.specificity, |b| b.max(c.specificity)));
+            }
         }
     }
     best
 }
 
-/// A pre-parsed simple/compound selector. Produced once by [`compile_selector`] and reused
-/// both by [`match_simple_selector`] and the cascade's selector index. Holding the parsed
-/// components avoids re-parsing the selector string on every element.
+// ===========================================================================================
+// Complex selector engine
+// ===========================================================================================
+//
+// A *complex* selector is a sequence of compound selectors joined by combinators, evaluated
+// right-to-left. We parse each selector string into a [`ComplexSelector`] (a `Vec` of
+// `(Combinator, Compound)` stored RIGHTMOST-FIRST) and match it against a `(doc, node_id)`
+// pair by walking the appropriate tree axis for each combinator, with backtracking for the
+// descendant / general-sibling axes.
+//
+// Pseudo-ELEMENTS (`::before`, `::after`, `::placeholder`, `::marker`) are OUT OF SCOPE: a
+// selector containing one is treated as non-matching (its parse returns `None`, so the rule is
+// dropped from the index) — we never crash on it.
+
+/// How a compound relates to the compound on its right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Combinator {
+    /// Rightmost compound (no left neighbor) — the "subject" of the selector.
+    Subject,
+    /// Descendant (whitespace): some ancestor matches.
+    Descendant,
+    /// Child (`>`): the parent matches.
+    Child,
+    /// Adjacent sibling (`+`): the immediately-preceding element sibling matches.
+    NextSibling,
+    /// General sibling (`~`): some preceding element sibling matches.
+    SubsequentSibling,
+}
+
+/// One attribute selector `[name OP value FLAG]`.
+#[derive(Debug, Clone)]
+struct AttrSel {
+    name: String,
+    op: AttrOp,
+    value: String,
+    case_insensitive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttrOp {
+    /// `[attr]` — present.
+    Exists,
+    /// `[attr=val]`.
+    Equals,
+    /// `[attr~=val]` — whitespace-separated word.
+    Includes,
+    /// `[attr|=val]` — val or val-`-`….
+    DashMatch,
+    /// `[attr^=val]` — prefix.
+    Prefix,
+    /// `[attr$=val]` — suffix.
+    Suffix,
+    /// `[attr*=val]` — substring.
+    Substring,
+}
+
+/// A pseudo-class. Structural ones need tree/sibling position; state ones consult interaction
+/// state or element attributes; functional ones recurse into nested selector lists.
+#[derive(Debug, Clone)]
+enum Pseudo {
+    // Structural
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    FirstOfType,
+    LastOfType,
+    OnlyOfType,
+    NthChild(NthArg),
+    NthLastChild(NthArg),
+    NthOfType(NthArg),
+    NthLastOfType(NthArg),
+    Root,
+    Empty,
+    // State (attribute-derived)
+    Checked,
+    Disabled,
+    Enabled,
+    Required,
+    Optional,
+    Link,    // <a href> (also :any-link / :visited→never matches, see parse)
+    // State (interaction)
+    Hover,
+    Focus,
+    Active,
+    FocusWithin,
+    FocusVisible,
+    // Functional
+    Not(Vec<ComplexSelector>),
+    Is(Vec<ComplexSelector>),
+    Where(Vec<ComplexSelector>),
+    /// Recognized-but-never-matches (`:visited`, `:target`, `:default`, `:placeholder-shown`,
+    /// etc.) — best-effort: parses cleanly so the rest of the selector still works, but the
+    /// element never matches it.
+    NeverMatch,
+}
+
+/// An `An+B` argument for `:nth-*`.
+#[derive(Debug, Clone, Copy)]
+struct NthArg {
+    a: i32,
+    b: i32,
+}
+
+impl NthArg {
+    /// Does a 1-based index `n` satisfy `An+B`? i.e. exists k>=0 with n == a*k + b.
+    fn matches(&self, n: i32) -> bool {
+        if self.a == 0 {
+            return n == self.b;
+        }
+        let diff = n - self.b;
+        diff % self.a == 0 && diff / self.a >= 0
+    }
+}
+
+/// A compound selector: an optional type plus any number of class/id/attr/pseudo simples.
+#[derive(Debug, Clone, Default)]
+struct Compound {
+    /// Leading type, lowercased. `None` = universal (`*`) or no explicit type.
+    type_part: Option<String>,
+    classes: Vec<String>,
+    ids: Vec<String>,
+    attrs: Vec<AttrSel>,
+    pseudos: Vec<Pseudo>,
+}
+
+/// A full complex selector, stored rightmost-compound-first. `parts[0]` is the subject.
+#[derive(Debug, Clone)]
+struct ComplexSelector {
+    parts: Vec<(Combinator, Compound)>,
+    specificity: u32,
+}
+
+/// What we bucket a compiled selector under in the [`SelectorIndex`]: the most-selective simple
+/// part of the RIGHTMOST (subject) compound.
+#[derive(Debug, Clone)]
+enum BucketKey {
+    Id(String),
+    Class(String),
+    Type(String),
+    Universal,
+}
+
+/// A compiled selector ready for the index: the parsed [`ComplexSelector`] plus its bucket key.
 #[derive(Debug, Clone)]
 struct Compiled {
-    /// The leading type, lowercased (matched case-insensitively against the element tag). A
-    /// universal `*` prefix is represented as `None` (matches any type, no type specificity).
-    type_part: Option<String>,
-    /// Required classes (matched case-sensitively, like the original matcher).
-    classes: Vec<String>,
-    /// Required ids (matched case-sensitively).
-    ids: Vec<String>,
-    /// Precomputed specificity = ids*100 + classes*10 + (has_type?1:0).
+    selector: ComplexSelector,
+    key: BucketKey,
     specificity: u32,
-    /// True for the `:root` pseudo (matches an `html` element with specificity 10).
-    matches_root: bool,
 }
 
-/// Parse a single COMPOUND selector into a [`Compiled`], or `None` if the selector uses
-/// syntax this engine never matches (combinators, spaces, attributes, pseudos other than
-/// `:root`). This is the SINGLE source of truth for selector parsing — [`match_simple_selector`]
-/// and the cascade index both go through it, so matching behavior stays byte-identical.
+impl Compiled {
+    fn bucket_key(&self) -> &BucketKey {
+        &self.key
+    }
+}
+
+/// Specificity weights packed into a sortable u32 (a*10000 + b*100 + c), matching the existing
+/// scheme's magnitude (id=100, class=10, type=1 historically; the new packing keeps the same
+/// relative ordering with more headroom for many components).
+#[derive(Debug, Clone, Copy, Default)]
+struct Spec {
+    a: u32, // ids
+    b: u32, // classes / attrs / pseudo-classes
+    c: u32, // types / pseudo-elements
+}
+
+impl Spec {
+    fn pack(&self) -> u32 {
+        self.a.min(9999) * 10000 + self.b.min(99) * 100 + self.c.min(99)
+    }
+    fn add(&mut self, o: Spec) {
+        self.a += o.a;
+        self.b += o.b;
+        self.c += o.c;
+    }
+    fn max_with(self, o: Spec) -> Spec {
+        if (self.a, self.b, self.c) >= (o.a, o.b, o.c) { self } else { o }
+    }
+}
+
+/// Parse one (possibly complex) selector string into a [`Compiled`], or `None` if it uses
+/// syntax we never match — chiefly pseudo-ELEMENTS (`::before`) or malformed input. This is the
+/// single source of truth for selector parsing used by the cascade index.
 fn compile_selector(sel: &str) -> Option<Compiled> {
-    let sel = sel.trim();
-    if sel.is_empty() {
+    let selector = parse_complex(sel)?;
+    let specificity = selector.specificity;
+    // Bucket key = most-selective simple part of the rightmost (subject) compound.
+    let subject = &selector.parts[0].1;
+    let key = if let Some(id) = subject.ids.first() {
+        BucketKey::Id(id.clone())
+    } else if let Some(class) = subject.classes.first() {
+        BucketKey::Class(class.clone())
+    } else if let Some(t) = &subject.type_part {
+        BucketKey::Type(t.clone())
+    } else {
+        // Purely `[attr]`/`:pseudo`/`*` subject → universal bucket.
+        BucketKey::Universal
+    };
+    Some(Compiled { selector, key, specificity })
+}
+
+/// Parse a complex selector into rightmost-first `(Combinator, Compound)` parts, computing its
+/// specificity. Returns `None` if any compound fails to parse (e.g. a pseudo-element).
+fn parse_complex(sel: &str) -> Option<ComplexSelector> {
+    let chars: Vec<char> = sel.trim().chars().collect();
+    if chars.is_empty() {
         return None;
     }
-    if sel == "*" {
-        return Some(Compiled {
-            type_part: None,
-            classes: Vec::new(),
-            ids: Vec::new(),
-            specificity: 0,
-            matches_root: false,
-        });
-    }
-    // `:root` matches the document root element (the `<html>` element). We approximate by
-    // matching any `html` element. Specificity of a pseudo-class is class-level (10).
-    if sel.eq_ignore_ascii_case(":root") {
-        return Some(Compiled {
-            type_part: None,
-            classes: Vec::new(),
-            ids: Vec::new(),
-            specificity: 10,
-            matches_root: true,
-        });
-    }
-
-    // Split a compound selector into its components: a leading optional type, then a run of
-    // `.class` / `#id` parts. We parse character-by-character.
-    let mut type_part: Option<String> = None;
-    let mut classes: Vec<String> = Vec::new();
-    let mut ids: Vec<String> = Vec::new();
-
-    let chars: Vec<char> = sel.chars().collect();
+    // Tokenize into (combinator-to-the-left, compound-text) pairs, left-to-right, then reverse.
+    // We split on top-level whitespace / `>` / `+` / `~` (not inside [], (), or quotes).
+    let mut parts: Vec<(Combinator, String)> = Vec::new();
+    let mut cur = String::new();
+    // Combinator that precedes the NEXT compound to be flushed (relates it to the PREVIOUS
+    // compound). The first compound has no preceding combinator (`Subject`).
+    let mut pending_comb = Combinator::Subject;
     let mut i = 0;
-    // Optional leading type/universal (anything before the first '.' or '#').
-    let start = i;
-    while i < chars.len() && chars[i] != '.' && chars[i] != '#' {
-        i += 1;
-    }
-    if i > start {
-        let t: String = chars[start..i].iter().collect();
-        if t == "*" {
-            // universal prefix; contributes no specificity, matches any type
-        } else if is_ident(&t) {
-            type_part = Some(t.to_lowercase());
-        } else {
-            // Unsupported selector syntax (combinators, attributes, pseudo, etc.).
-            return None;
+    let mut depth_brk = 0i32; // []
+    let mut depth_par = 0i32; // ()
+    let mut quote: Option<char> = None;
+    let n = chars.len();
+    // Flush the current compound text, tagged with the pending combinator; reset pending to the
+    // "no combinator seen yet" sentinel for the next compound.
+    let flush = |cur: &mut String, pending: &mut Combinator, parts: &mut Vec<(Combinator, String)>| {
+        if !cur.is_empty() {
+            parts.push((*pending, std::mem::take(cur)));
+            *pending = Combinator::Subject; // sentinel; overwritten before next flush
         }
-    }
-    // Remaining `.class` / `#id` parts.
-    while i < chars.len() {
-        let marker = chars[i];
-        if marker != '.' && marker != '#' {
-            return None; // unexpected token (e.g. combinator/space) → unsupported
-        }
-        i += 1;
-        let name_start = i;
-        while i < chars.len() && chars[i] != '.' && chars[i] != '#' {
+    };
+    while i < n {
+        let c = chars[i];
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
             i += 1;
+            continue;
         }
-        let name: String = chars[name_start..i].iter().collect();
-        if name.is_empty() || !is_ident(&name) {
-            return None;
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '[' => {
+                depth_brk += 1;
+                cur.push(c);
+            }
+            ']' => {
+                depth_brk -= 1;
+                cur.push(c);
+            }
+            '(' => {
+                depth_par += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth_par -= 1;
+                cur.push(c);
+            }
+            _ if depth_brk > 0 || depth_par > 0 => cur.push(c),
+            c if c.is_whitespace() => {
+                // Whitespace: flush the current compound, then tentatively mark the next
+                // combinator as descendant. An explicit combinator immediately after overrides
+                // it (so `.a > .b` parses Child, not Descendant).
+                flush(&mut cur, &mut pending_comb, &mut parts);
+                pending_comb = Combinator::Descendant;
+                while i + 1 < n && chars[i + 1].is_whitespace() {
+                    i += 1;
+                }
+            }
+            '>' | '+' | '~' => {
+                // Explicit combinator relates the NEXT compound to the previous one. Flush the
+                // current compound first (handles the no-whitespace case `a>b`).
+                flush(&mut cur, &mut pending_comb, &mut parts);
+                pending_comb = match c {
+                    '>' => Combinator::Child,
+                    '+' => Combinator::NextSibling,
+                    _ => Combinator::SubsequentSibling,
+                };
+                while i + 1 < n && chars[i + 1].is_whitespace() {
+                    i += 1;
+                }
+            }
+            _ => cur.push(c),
         }
-        if marker == '.' {
-            classes.push(name);
+        i += 1;
+    }
+    flush(&mut cur, &mut pending_comb, &mut parts);
+    if parts.is_empty() {
+        return None;
+    }
+    // `parts[i].0` is the combinator BEFORE compound i (linking it to compound i-1) in source
+    // order. We want each compound to carry the combinator linking it to its RIGHT neighbor:
+    //   right_link[i] = before[i+1]   (and the last compound's right_link = Subject).
+    // Then reversing puts the subject at index 0, and every `match_from` step at index `idx`
+    // reads the combinator relating `parts[idx]` to `parts[idx-1]` (its source-right neighbor).
+    let k = parts.len();
+    let mut right_link: Vec<Combinator> = Vec::with_capacity(k);
+    for i in 0..k {
+        if i + 1 < k {
+            right_link.push(parts[i + 1].0);
         } else {
-            ids.push(name);
+            right_link.push(Combinator::Subject);
         }
     }
 
-    let specificity = (ids.len() as u32) * 100
-        + (classes.len() as u32) * 10
-        + (type_part.is_some() as u32);
-    Some(Compiled { type_part, classes, ids, specificity, matches_root: false })
+    let mut out: Vec<(Combinator, Compound)> = Vec::with_capacity(k);
+    let mut spec = Spec::default();
+    // Build rightmost-first.
+    for i in (0..k).rev() {
+        let (compound, cspec) = parse_compound(&parts[i].1)?;
+        spec.add(cspec);
+        out.push((right_link[i], compound));
+    }
+    Some(ComplexSelector { parts: out, specificity: spec.pack() })
 }
 
-/// Test an already-compiled selector against an element. Returns its specificity if every
-/// component matches. Mirrors the original [`match_simple_selector`] tests exactly.
-fn matches_compiled(c: &Compiled, el: &dom::ElementData) -> bool {
-    if c.matches_root {
-        return el.tag.eq_ignore_ascii_case("html");
+/// Parse a single compound selector (`type.class#id[attr]:pseudo`...). Returns the compound and
+/// its specificity, or `None` on a pseudo-element / malformed token.
+fn parse_compound(text: &str) -> Option<(Compound, Spec)> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut compound = Compound::default();
+    let mut spec = Spec::default();
+
+    // Optional leading type / universal.
+    if i < n && chars[i] != '.' && chars[i] != '#' && chars[i] != '[' && chars[i] != ':' && chars[i] != '*' {
+        let start = i;
+        while i < n && !matches!(chars[i], '.' | '#' | '[' | ':' | '*') {
+            i += 1;
+        }
+        let t: String = chars[start..i].iter().collect();
+        if !is_ident(&t) {
+            return None;
+        }
+        compound.type_part = Some(t.to_lowercase());
+        spec.c += 1;
+    } else if i < n && chars[i] == '*' {
+        i += 1; // universal, no specificity, no type constraint
     }
+
+    while i < n {
+        match chars[i] {
+            '.' => {
+                i += 1;
+                let start = i;
+                while i < n && is_name_char(chars[i]) {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                if name.is_empty() {
+                    return None;
+                }
+                compound.classes.push(name);
+                spec.b += 1;
+            }
+            '#' => {
+                i += 1;
+                let start = i;
+                while i < n && is_name_char(chars[i]) {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                if name.is_empty() {
+                    return None;
+                }
+                compound.ids.push(name);
+                spec.a += 1;
+            }
+            '[' => {
+                // Read up to the matching ']' (no nested brackets in attribute selectors).
+                let start = i + 1;
+                let mut j = start;
+                let mut quote: Option<char> = None;
+                while j < n {
+                    let c = chars[j];
+                    if let Some(q) = quote {
+                        if c == q {
+                            quote = None;
+                        }
+                    } else if c == '"' || c == '\'' {
+                        quote = Some(c);
+                    } else if c == ']' {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j >= n {
+                    return None; // unterminated
+                }
+                let inner: String = chars[start..j].iter().collect();
+                let attr = parse_attr(&inner)?;
+                compound.attrs.push(attr);
+                spec.b += 1;
+                i = j + 1;
+            }
+            ':' => {
+                // Pseudo-element `::x` is out of scope → reject the whole selector.
+                if i + 1 < n && chars[i + 1] == ':' {
+                    return None;
+                }
+                i += 1;
+                let start = i;
+                while i < n && is_name_char(chars[i]) {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                let name_l = name.to_ascii_lowercase();
+                // Single-colon pseudo-elements (legacy) are also out of scope.
+                if matches!(name_l.as_str(), "before" | "after" | "first-line" | "first-letter" | "placeholder" | "marker" | "selection" | "backdrop") {
+                    return None;
+                }
+                // Functional pseudo with `(...)`.
+                let arg = if i < n && chars[i] == '(' {
+                    let astart = i + 1;
+                    let mut depth = 1i32;
+                    let mut j = astart;
+                    let mut quote: Option<char> = None;
+                    while j < n && depth > 0 {
+                        let c = chars[j];
+                        if let Some(q) = quote {
+                            if c == q {
+                                quote = None;
+                            }
+                        } else if c == '"' || c == '\'' {
+                            quote = Some(c);
+                        } else if c == '(' {
+                            depth += 1;
+                        } else if c == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    if j >= n {
+                        return None;
+                    }
+                    let a: String = chars[astart..j].iter().collect();
+                    i = j + 1;
+                    Some(a)
+                } else {
+                    None
+                };
+                let (pseudo, pspec) = parse_pseudo(&name_l, arg.as_deref())?;
+                spec.add(pspec);
+                compound.pseudos.push(pseudo);
+            }
+            '*' => return None, // universal not allowed mid-compound
+            _ => return None,
+        }
+    }
+    Some((compound, spec))
+}
+
+/// Parse the inside of `[...]` into an [`AttrSel`].
+fn parse_attr(inner: &str) -> Option<AttrSel> {
+    let s = inner.trim();
+    // Detect a trailing ` i` / ` s` case flag (only meaningful with a value, but tolerate it).
+    let mut case_insensitive = false;
+    let mut body = s.to_string();
+    {
+        let lower = body.to_ascii_lowercase();
+        if lower.ends_with(" i") {
+            case_insensitive = true;
+            let len = body.len() - 2;
+            body.truncate(len);
+            body = body.trim_end().to_string();
+        } else if lower.ends_with(" s") {
+            let len = body.len() - 2;
+            body.truncate(len);
+            body = body.trim_end().to_string();
+        }
+    }
+    // Find the operator.
+    let ops: [(&str, AttrOp); 6] = [
+        ("~=", AttrOp::Includes),
+        ("|=", AttrOp::DashMatch),
+        ("^=", AttrOp::Prefix),
+        ("$=", AttrOp::Suffix),
+        ("*=", AttrOp::Substring),
+        ("=", AttrOp::Equals),
+    ];
+    for (tok, op) in ops {
+        if let Some(pos) = body.find(tok) {
+            let name = body[..pos].trim().to_string();
+            let raw_val = body[pos + tok.len()..].trim();
+            let value = unquote(raw_val);
+            if name.is_empty() {
+                return None;
+            }
+            return Some(AttrSel { name: name.to_ascii_lowercase(), op, value, case_insensitive });
+        }
+    }
+    // No operator → presence test.
+    let name = body.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(AttrSel { name: name.to_ascii_lowercase(), op: AttrOp::Exists, value: String::new(), case_insensitive })
+}
+
+/// Strip optional surrounding quotes.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 {
+        let b = s.as_bytes();
+        if (b[0] == b'"' && b[s.len() - 1] == b'"') || (b[0] == b'\'' && b[s.len() - 1] == b'\'') {
+            return s[1..s.len() - 1].to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Parse a pseudo-class by name (+ optional functional argument). Returns the pseudo and its
+/// specificity contribution. `None` only for genuinely unparseable functional args.
+fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spec)> {
+    let class_spec = Spec { a: 0, b: 1, c: 0 };
+    let p = match name {
+        "first-child" => Pseudo::FirstChild,
+        "last-child" => Pseudo::LastChild,
+        "only-child" => Pseudo::OnlyChild,
+        "first-of-type" => Pseudo::FirstOfType,
+        "last-of-type" => Pseudo::LastOfType,
+        "only-of-type" => Pseudo::OnlyOfType,
+        "root" => Pseudo::Root,
+        "empty" => Pseudo::Empty,
+        "checked" => Pseudo::Checked,
+        "disabled" => Pseudo::Disabled,
+        "enabled" => Pseudo::Enabled,
+        "required" => Pseudo::Required,
+        "optional" => Pseudo::Optional,
+        "link" | "any-link" => Pseudo::Link,
+        "hover" => Pseudo::Hover,
+        "focus" => Pseudo::Focus,
+        "active" => Pseudo::Active,
+        "focus-within" => Pseudo::FocusWithin,
+        "focus-visible" => Pseudo::FocusVisible,
+        // Best-effort never-match (parse cleanly, never match).
+        "visited" | "target" | "default" | "placeholder-shown" | "read-only" | "read-write"
+        | "in-range" | "out-of-range" | "valid" | "invalid" | "indeterminate" | "autofill" => {
+            Pseudo::NeverMatch
+        }
+        "nth-child" => Pseudo::NthChild(parse_nth(arg?)?),
+        "nth-last-child" => Pseudo::NthLastChild(parse_nth(arg?)?),
+        "nth-of-type" => Pseudo::NthOfType(parse_nth(arg?)?),
+        "nth-last-of-type" => Pseudo::NthLastOfType(parse_nth(arg?)?),
+        "not" => {
+            let list = parse_selector_list(arg?)?;
+            let s = list.iter().fold(Spec::default(), |acc, c| acc.max_with(unpack_spec(c.specificity)));
+            return Some((Pseudo::Not(list), s));
+        }
+        "is" | "matches" => {
+            let list = parse_selector_list(arg?)?;
+            let s = list.iter().fold(Spec::default(), |acc, c| acc.max_with(unpack_spec(c.specificity)));
+            return Some((Pseudo::Is(list), s));
+        }
+        "where" => {
+            let list = parse_selector_list(arg?)?;
+            // :where() contributes ZERO specificity.
+            return Some((Pseudo::Where(list), Spec::default()));
+        }
+        // Unknown pseudo-class: best-effort never-match (don't drop the rule — the rest of the
+        // compound may still be useful, but this element won't match it).
+        _ => Pseudo::NeverMatch,
+    };
+    Some((p, class_spec))
+}
+
+/// Unpack a packed specificity back to components (for `:is`/`:not` "most specific arg").
+fn unpack_spec(packed: u32) -> Spec {
+    Spec { a: packed / 10000, b: (packed / 100) % 100, c: packed % 100 }
+}
+
+/// Parse a comma-separated selector list (the argument of `:is/:where/:not`).
+fn parse_selector_list(arg: &str) -> Option<Vec<ComplexSelector>> {
+    let mut out = Vec::new();
+    for piece in split_selector_list(arg) {
+        let p = piece.trim();
+        if p.is_empty() {
+            continue;
+        }
+        out.push(parse_complex(p)?);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Split a selector list on top-level commas (not inside [], (), or quotes).
+fn split_selector_list(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut brk = 0i32;
+    let mut par = 0i32;
+    let mut quote: Option<char> = None;
+    for c in s.chars() {
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '[' => {
+                brk += 1;
+                cur.push(c);
+            }
+            ']' => {
+                brk -= 1;
+                cur.push(c);
+            }
+            '(' => {
+                par += 1;
+                cur.push(c);
+            }
+            ')' => {
+                par -= 1;
+                cur.push(c);
+            }
+            ',' if brk == 0 && par == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Parse an `An+B` micro-syntax (`odd`, `even`, `3`, `2n`, `2n+1`, `-n+3`, `n`).
+fn parse_nth(arg: &str) -> Option<NthArg> {
+    let s: String = arg.trim().to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    if s == "odd" {
+        return Some(NthArg { a: 2, b: 1 });
+    }
+    if s == "even" {
+        return Some(NthArg { a: 2, b: 0 });
+    }
+    if let Some(npos) = s.find('n') {
+        let a_str = &s[..npos];
+        let a = match a_str {
+            "" | "+" => 1,
+            "-" => -1,
+            _ => a_str.parse::<i32>().ok()?,
+        };
+        let rest = &s[npos + 1..];
+        let b = if rest.is_empty() {
+            0
+        } else {
+            // rest is like "+1" / "-3".
+            rest.parse::<i32>().ok()?
+        };
+        Some(NthArg { a, b })
+    } else {
+        // Plain integer B.
+        Some(NthArg { a: 0, b: s.parse::<i32>().ok()? })
+    }
+}
+
+/// A valid CSS identifier for our purposes: letters, digits, `-`, `_`, not starting empty.
+fn is_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(is_name_char)
+}
+
+/// A character allowed inside a class/id/type/pseudo name.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '\\' || !c.is_ascii()
+}
+
+// ===========================================================================================
+// Matching against the tree (right-to-left, with backtracking)
+// ===========================================================================================
+
+/// Helper: borrow an element's [`ElementData`] for a node id, if it is an element.
+fn el_of(doc: &dom::Document, id: dom::NodeId) -> Option<&dom::ElementData> {
+    if id.0 >= doc.len() {
+        return None;
+    }
+    match &doc.get(id).data {
+        dom::NodeData::Element(e) => Some(e),
+        _ => None,
+    }
+}
+
+/// Element parent of `id` (skips non-element ancestors — though in practice the parent of an
+/// element is the document or another element).
+fn parent_of(doc: &dom::Document, id: dom::NodeId) -> Option<dom::NodeId> {
+    doc.get(id).parent
+}
+
+/// Preceding *element* sibling of `id` (immediately before, skipping text/comment nodes).
+fn prev_element_sibling(doc: &dom::Document, id: dom::NodeId) -> Option<dom::NodeId> {
+    let parent = parent_of(doc, id)?;
+    let kids = &doc.get(parent).children;
+    let pos = kids.iter().position(|&c| c == id)?;
+    kids[..pos].iter().rev().copied().find(|&c| el_of(doc, c).is_some())
+}
+
+/// All preceding element siblings of `id`, nearest-first.
+fn prev_element_siblings(doc: &dom::Document, id: dom::NodeId) -> Vec<dom::NodeId> {
+    let Some(parent) = parent_of(doc, id) else { return Vec::new() };
+    let kids = &doc.get(parent).children;
+    let Some(pos) = kids.iter().position(|&c| c == id) else { return Vec::new() };
+    kids[..pos].iter().rev().copied().filter(|&c| el_of(doc, c).is_some()).collect()
+}
+
+/// Match a full complex selector against node `id` (right-to-left with backtracking).
+fn complex_matches(doc: &dom::Document, id: dom::NodeId, sel: &ComplexSelector) -> bool {
+    // Subject (parts[0]) must match `id`; then recurse leftward.
+    if el_of(doc, id).is_none() {
+        return false;
+    }
+    if !compound_matches(doc, id, &sel.parts[0].1) {
+        return false;
+    }
+    match_from(doc, id, &sel.parts, 1)
+}
+
+/// Match the remaining parts `sel[idx..]` against the tree, given that `sel[idx-1]` matched at
+/// `node`. Each part carries the combinator relating it to the part on its right.
+fn match_from(doc: &dom::Document, node: dom::NodeId, parts: &[(Combinator, Compound)], idx: usize) -> bool {
+    if idx >= parts.len() {
+        return true;
+    }
+    let (comb, compound) = &parts[idx];
+    match comb {
+        Combinator::Subject => true, // shouldn't happen past index 0
+        Combinator::Child => {
+            if let Some(p) = parent_of(doc, node) {
+                if el_of(doc, p).is_some() && compound_matches(doc, p, compound) {
+                    return match_from(doc, p, parts, idx + 1);
+                }
+            }
+            false
+        }
+        Combinator::Descendant => {
+            // Try each ancestor; backtrack.
+            let mut cur = parent_of(doc, node);
+            while let Some(a) = cur {
+                if el_of(doc, a).is_some()
+                    && compound_matches(doc, a, compound)
+                    && match_from(doc, a, parts, idx + 1)
+                {
+                    return true;
+                }
+                cur = parent_of(doc, a);
+            }
+            false
+        }
+        Combinator::NextSibling => {
+            if let Some(s) = prev_element_sibling(doc, node) {
+                if compound_matches(doc, s, compound) {
+                    return match_from(doc, s, parts, idx + 1);
+                }
+            }
+            false
+        }
+        Combinator::SubsequentSibling => {
+            for s in prev_element_siblings(doc, node) {
+                if compound_matches(doc, s, compound) && match_from(doc, s, parts, idx + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Does node `id` (which must be an element) match a single compound selector?
+fn compound_matches(doc: &dom::Document, id: dom::NodeId, c: &Compound) -> bool {
+    let Some(el) = el_of(doc, id) else { return false };
     if let Some(t) = &c.type_part {
-        // `type_part` is already lowercased; compare case-insensitively against the tag.
         if !el.tag.eq_ignore_ascii_case(t) {
             return false;
         }
     }
-    for id in &c.ids {
+    for want in &c.ids {
         match el.id() {
-            Some(eid) if eid == id => {}
+            Some(eid) if eid == want => {}
             _ => return false,
         }
     }
@@ -2493,28 +3192,155 @@ fn matches_compiled(c: &Compiled, el: &dom::ElementData) -> bool {
             return false;
         }
     }
+    for attr in &c.attrs {
+        if !attr_matches(el, attr) {
+            return false;
+        }
+    }
+    for p in &c.pseudos {
+        if !pseudo_matches(doc, id, el, p) {
+            return false;
+        }
+    }
     true
 }
 
-/// Match a *simple* selector against an element. Supports a single tag, a single class
-/// (`.x`), a single id (`#id`), the universal `*`, and one compound of a tag plus one
-/// class/id (e.g. `p.note`, `a#home`). Returns the selector's specificity if it matches.
-///
-/// Thin wrapper over [`compile_selector`] + [`matches_compiled`] so its behavior stays
-/// byte-identical to the indexed path.
-#[allow(dead_code)]
-fn match_simple_selector(sel: &str, el: &dom::ElementData) -> Option<u32> {
-    let c = compile_selector(sel)?;
-    if matches_compiled(&c, el) {
-        Some(c.specificity)
+/// Match one attribute selector against an element. Attribute *names* are matched
+/// case-insensitively (HTML); values per the operator and the `i` flag.
+fn attr_matches(el: &dom::ElementData, a: &AttrSel) -> bool {
+    // Find the attribute case-insensitively by name.
+    let actual = el
+        .attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(&a.name))
+        .map(|(_, v)| v.as_str());
+    let Some(val) = actual else {
+        return false;
+    };
+    if a.op == AttrOp::Exists {
+        return true;
+    }
+    let (hay, needle) = if a.case_insensitive {
+        (val.to_ascii_lowercase(), a.value.to_ascii_lowercase())
     } else {
-        None
+        (val.to_string(), a.value.clone())
+    };
+    match a.op {
+        AttrOp::Exists => true,
+        AttrOp::Equals => hay == needle,
+        AttrOp::Includes => !needle.is_empty() && hay.split_whitespace().any(|w| w == needle),
+        AttrOp::DashMatch => hay == needle || hay.starts_with(&format!("{needle}-")),
+        AttrOp::Prefix => !needle.is_empty() && hay.starts_with(&needle),
+        AttrOp::Suffix => !needle.is_empty() && hay.ends_with(&needle),
+        AttrOp::Substring => !needle.is_empty() && hay.contains(&needle),
     }
 }
 
-/// A valid CSS identifier for our purposes: letters, digits, `-`, `_`, not starting empty.
-fn is_ident(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+/// Match a pseudo-class against an element node.
+fn pseudo_matches(doc: &dom::Document, id: dom::NodeId, el: &dom::ElementData, p: &Pseudo) -> bool {
+    match p {
+        Pseudo::Root => el.tag.eq_ignore_ascii_case("html"),
+        Pseudo::FirstChild => element_index(doc, id).map(|(i, _)| i == 0).unwrap_or(false),
+        Pseudo::LastChild => element_index(doc, id).map(|(i, t)| i + 1 == t).unwrap_or(false),
+        Pseudo::OnlyChild => element_index(doc, id).map(|(_, t)| t == 1).unwrap_or(false),
+        Pseudo::NthChild(n) => element_index(doc, id).map(|(i, _)| n.matches(i as i32 + 1)).unwrap_or(false),
+        Pseudo::NthLastChild(n) => element_index(doc, id).map(|(i, t)| n.matches((t - i) as i32)).unwrap_or(false),
+        Pseudo::FirstOfType => type_index(doc, id, &el.tag).map(|(i, _)| i == 0).unwrap_or(false),
+        Pseudo::LastOfType => type_index(doc, id, &el.tag).map(|(i, t)| i + 1 == t).unwrap_or(false),
+        Pseudo::OnlyOfType => type_index(doc, id, &el.tag).map(|(_, t)| t == 1).unwrap_or(false),
+        Pseudo::NthOfType(n) => type_index(doc, id, &el.tag).map(|(i, _)| n.matches(i as i32 + 1)).unwrap_or(false),
+        Pseudo::NthLastOfType(n) => type_index(doc, id, &el.tag).map(|(i, t)| n.matches((t - i) as i32)).unwrap_or(false),
+        Pseudo::Empty => is_empty_element(doc, id),
+        Pseudo::Checked => {
+            (el.tag.eq_ignore_ascii_case("input") || el.tag.eq_ignore_ascii_case("option"))
+                && el.attrs.keys().any(|k| k.eq_ignore_ascii_case("checked") || k.eq_ignore_ascii_case("selected"))
+        }
+        Pseudo::Disabled => is_form_control(&el.tag) && has_attr(el, "disabled"),
+        Pseudo::Enabled => is_form_control(&el.tag) && !has_attr(el, "disabled"),
+        Pseudo::Required => is_form_control(&el.tag) && has_attr(el, "required"),
+        Pseudo::Optional => is_form_control(&el.tag) && !has_attr(el, "required"),
+        Pseudo::Link => el.tag.eq_ignore_ascii_case("a") && has_attr(el, "href"),
+        Pseudo::Hover => {
+            let h = interaction_hovered();
+            h == Some(id.0) || h.map(|hn| is_ancestor(doc, id, dom::NodeId(hn))).unwrap_or(false)
+        }
+        // `:active` ≈ `:hover` (no separate pressed-state tracking in the engine).
+        Pseudo::Active => {
+            let h = interaction_hovered();
+            h == Some(id.0) || h.map(|hn| is_ancestor(doc, id, dom::NodeId(hn))).unwrap_or(false)
+        }
+        Pseudo::Focus | Pseudo::FocusVisible => interaction_focused() == Some(id.0),
+        Pseudo::FocusWithin => {
+            let f = interaction_focused();
+            f == Some(id.0) || f.map(|fn_| is_ancestor(doc, id, dom::NodeId(fn_))).unwrap_or(false)
+        }
+        Pseudo::Not(list) => !list.iter().any(|s| complex_matches(doc, id, s)),
+        Pseudo::Is(list) | Pseudo::Where(list) => list.iter().any(|s| complex_matches(doc, id, s)),
+        Pseudo::NeverMatch => false,
+    }
+}
+
+fn has_attr(el: &dom::ElementData, name: &str) -> bool {
+    el.attrs.keys().any(|k| k.eq_ignore_ascii_case(name))
+}
+
+fn is_form_control(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "input" | "button" | "select" | "textarea" | "option" | "optgroup" | "fieldset"
+    )
+}
+
+/// Is `ancestor` an ancestor of `descendant` (strictly above it)?
+fn is_ancestor(doc: &dom::Document, ancestor: dom::NodeId, descendant: dom::NodeId) -> bool {
+    if descendant.0 >= doc.len() {
+        return false;
+    }
+    let mut cur = doc.get(descendant).parent;
+    while let Some(p) = cur {
+        if p == ancestor {
+            return true;
+        }
+        cur = doc.get(p).parent;
+    }
+    false
+}
+
+/// (index-among-element-siblings, total-element-siblings) for `id`.
+fn element_index(doc: &dom::Document, id: dom::NodeId) -> Option<(usize, usize)> {
+    let parent = parent_of(doc, id)?;
+    let kids = &doc.get(parent).children;
+    let elems: Vec<dom::NodeId> = kids.iter().copied().filter(|&c| el_of(doc, c).is_some()).collect();
+    let pos = elems.iter().position(|&c| c == id)?;
+    Some((pos, elems.len()))
+}
+
+/// (index-among-same-type-siblings, total-same-type-siblings) for `id`.
+fn type_index(doc: &dom::Document, id: dom::NodeId, tag: &str) -> Option<(usize, usize)> {
+    let parent = parent_of(doc, id)?;
+    let kids = &doc.get(parent).children;
+    let same: Vec<dom::NodeId> = kids
+        .iter()
+        .copied()
+        .filter(|&c| el_of(doc, c).map(|e| e.tag.eq_ignore_ascii_case(tag)).unwrap_or(false))
+        .collect();
+    let pos = same.iter().position(|&c| c == id)?;
+    Some((pos, same.len()))
+}
+
+/// `:empty` — no element children and no non-whitespace text.
+fn is_empty_element(doc: &dom::Document, id: dom::NodeId) -> bool {
+    for &c in &doc.get(id).children {
+        if c.0 >= doc.len() {
+            continue;
+        }
+        match &doc.get(c).data {
+            dom::NodeData::Element(_) => return false,
+            dom::NodeData::Text(t) if !t.trim().is_empty() => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// The built-in user-agent stylesheet: sane defaults for a dark-background renderer.
@@ -3302,7 +4128,8 @@ mod tests {
     /// specificity over its comma selectors, media/container gated, exactly as the pre-index
     /// code did. Used to cross-check the index produces the identical match set.
     fn naive_matches(
-        el: &dom::ElementData,
+        doc: &dom::Document,
+        nid: dom::NodeId,
         ua: &css::Stylesheet,
         author: &[css::Stylesheet],
     ) -> Vec<(u8, usize, u32)> {
@@ -3312,7 +4139,7 @@ mod tests {
             if media_applies(rule.media.as_deref())
                 && container_applies(rule.container.as_deref())
             {
-                if let Some(spec) = rule_specificity(&rule.selectors, el) {
+                if let Some(spec) = rule_specificity(&rule.selectors, doc, nid) {
                     out.push((0u8, order, spec));
                 }
             }
@@ -3323,7 +4150,7 @@ mod tests {
                 if media_applies(rule.media.as_deref())
                     && container_applies(rule.container.as_deref())
                 {
-                    if let Some(spec) = rule_specificity(&rule.selectors, el) {
+                    if let Some(spec) = rule_specificity(&rule.selectors, doc, nid) {
                         out.push((1u8, order, spec));
                     }
                 }
@@ -3336,10 +4163,15 @@ mod tests {
 
     /// The same query the indexed cascade runs, surfaced as `(origin, order, max_spec)` so it
     /// can be compared against `naive_matches`.
-    fn indexed_matches(el: &dom::ElementData, index: &SelectorIndex) -> Vec<(u8, usize, u32)> {
+    fn indexed_matches(
+        doc: &dom::Document,
+        nid: dom::NodeId,
+        el: &dom::ElementData,
+        index: &SelectorIndex,
+    ) -> Vec<(u8, usize, u32)> {
         let mut best: HashMap<usize, (u8, u32)> = HashMap::new();
         let mut consider = |e: &Entry| {
-            if matches_compiled(&e.compiled, el) {
+            if complex_matches(doc, nid, &e.compiled.selector) {
                 best.entry(e.order)
                     .and_modify(|(_, s)| *s = (*s).max(e.compiled.specificity))
                     .or_insert((e.origin, e.compiled.specificity));
@@ -3417,8 +4249,8 @@ mod tests {
         for id in ids {
             if let NodeData::Element(el) = &doc.get(id).data {
                 assert_eq!(
-                    indexed_matches(el, &index),
-                    naive_matches(el, &ua, &author),
+                    indexed_matches(&doc, id, el, &index),
+                    naive_matches(&doc, id, &ua, &author),
                     "match set diverged for <{}>",
                     el.tag
                 );
@@ -3466,6 +4298,393 @@ mod tests {
     ) -> bool {
         let span = elem(doc, |e| e.tag == "span");
         map[&span].bold
+    }
+
+    // ====================================================================================
+    // Complex selector engine tests
+    // ====================================================================================
+
+    /// Find the nth (0-based) element matching a predicate, depth-first.
+    fn elem_nth(
+        doc: &dom::Document,
+        n: usize,
+        pred: impl Fn(&dom::ElementData) -> bool,
+    ) -> dom::NodeId {
+        fn walk(
+            doc: &dom::Document,
+            id: dom::NodeId,
+            pred: &dyn Fn(&dom::ElementData) -> bool,
+            out: &mut Vec<dom::NodeId>,
+        ) {
+            if let NodeData::Element(e) = &doc.get(id).data {
+                if pred(e) {
+                    out.push(id);
+                }
+            }
+            for &c in &doc.get(id).children {
+                walk(doc, c, pred, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(doc, doc.root(), &pred, &mut out);
+        out[n]
+    }
+
+    fn red() -> (u8, u8, u8) {
+        (255, 0, 0)
+    }
+
+    #[test]
+    fn descendant_combinator() {
+        let sheet = css::parse(".a .b { color: red }");
+        let doc = html::parse(
+            r#"<html><body>
+                 <div class="a"><div><span class="b">x</span></div></div>
+                 <span class="b">y</span>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let inside = elem_nth(&doc, 0, |e| e.classes().any(|c| c == "b"));
+        let outside = elem_nth(&doc, 1, |e| e.classes().any(|c| c == "b"));
+        assert_eq!(map[&inside].color, red());
+        assert_ne!(map[&outside].color, red());
+    }
+
+    #[test]
+    fn child_combinator() {
+        let sheet = css::parse(".a > .b { color: red }");
+        let doc = html::parse(
+            r#"<html><body>
+                 <div class="a"><span class="b">direct</span></div>
+                 <div class="a"><div><span class="b">grand</span></div></div>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let direct = elem_nth(&doc, 0, |e| e.classes().any(|c| c == "b"));
+        let grand = elem_nth(&doc, 1, |e| e.classes().any(|c| c == "b"));
+        assert_eq!(map[&direct].color, red());
+        assert_ne!(map[&grand].color, red());
+    }
+
+    #[test]
+    fn adjacent_sibling_combinator() {
+        let sheet = css::parse(".a + .b { color: red }");
+        let doc = html::parse(
+            r#"<html><body>
+                 <span class="a">a</span><span class="b">adjacent</span>
+                 <span class="x">gap</span><span class="b">notadjacent</span>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let adj = elem_nth(&doc, 0, |e| e.classes().any(|c| c == "b"));
+        let notadj = elem_nth(&doc, 1, |e| e.classes().any(|c| c == "b"));
+        assert_eq!(map[&adj].color, red());
+        assert_ne!(map[&notadj].color, red());
+    }
+
+    #[test]
+    fn general_sibling_combinator() {
+        let sheet = css::parse(".a ~ .b { color: red }");
+        let doc = html::parse(
+            r#"<html><body>
+                 <span class="a">a</span><span class="x">x</span><span class="b">after</span>
+                 <div><span class="b">nested-before-no-a</span></div>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let after = elem_nth(&doc, 0, |e| e.classes().any(|c| c == "b"));
+        let nested = elem_nth(&doc, 1, |e| e.classes().any(|c| c == "b"));
+        assert_eq!(map[&after].color, red());
+        assert_ne!(map[&nested].color, red());
+    }
+
+    #[test]
+    fn nth_child_and_structural() {
+        let sheet = css::parse(
+            "li:nth-child(2) { color: red }
+             li:first-child { font-weight: bold }
+             li:last-child { font-style: italic }
+             li:nth-child(odd) { letter-spacing: 3px }",
+        );
+        let doc = html::parse(
+            r#"<html><body><ul><li>1</li><li>2</li><li>3</li></ul></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let li1 = elem_nth(&doc, 0, |e| e.tag == "li");
+        let li2 = elem_nth(&doc, 1, |e| e.tag == "li");
+        let li3 = elem_nth(&doc, 2, |e| e.tag == "li");
+        assert_eq!(map[&li2].color, red()); // nth-child(2)
+        assert!(map[&li1].bold); // first-child
+        assert!(map[&li3].italic); // last-child
+        assert_eq!(map[&li1].letter_spacing, 3.0); // odd → 1
+        assert_eq!(map[&li3].letter_spacing, 3.0); // odd → 3
+        assert_eq!(map[&li2].letter_spacing, 0.0); // even → not odd
+    }
+
+    #[test]
+    fn only_child_and_of_type() {
+        let sheet = css::parse(
+            "p:only-child { color: red }
+             span:first-of-type { font-weight: bold }",
+        );
+        let doc = html::parse(
+            r#"<html><body>
+                 <div><p>solo</p></div>
+                 <div><p>a</p><p>b</p></div>
+                 <div><span>s1</span><em>e</em><span>s2</span></div>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let solo = elem_nth(&doc, 0, |e| e.tag == "p");
+        let paired = elem_nth(&doc, 1, |e| e.tag == "p");
+        assert_eq!(map[&solo].color, red());
+        assert_ne!(map[&paired].color, red());
+        let s1 = elem_nth(&doc, 0, |e| e.tag == "span");
+        let s2 = elem_nth(&doc, 1, |e| e.tag == "span");
+        assert!(map[&s1].bold);
+        assert!(!map[&s2].bold);
+    }
+
+    #[test]
+    fn attribute_selectors() {
+        let sheet = css::parse(
+            "[data-x] { color: red }
+             input[type=text] { font-weight: bold }
+             a[href^=\"https\"] { font-style: italic }
+             [class~=foo] { letter-spacing: 2px }
+             [type=TEXT i] { text-decoration: underline }",
+        );
+        let doc = html::parse(
+            r#"<html><body>
+                 <div data-x="1">x</div>
+                 <input type="text">
+                 <a href="https://example.com">link</a>
+                 <a href="http://nope.com">nope</a>
+                 <span class="foo bar">word</span>
+                 <input type="TEXT">
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let dx = elem_nth(&doc, 0, |e| e.attrs.contains_key("data-x"));
+        assert_eq!(map[&dx].color, red());
+        let inp = elem_nth(&doc, 0, |e| e.tag == "input");
+        assert!(map[&inp].bold);
+        let a_https = elem_nth(&doc, 0, |e| e.tag == "a");
+        let a_http = elem_nth(&doc, 1, |e| e.tag == "a");
+        assert!(map[&a_https].italic);
+        assert!(!map[&a_http].italic);
+        let foo = elem_nth(&doc, 0, |e| e.classes().any(|c| c == "foo"));
+        assert_eq!(map[&foo].letter_spacing, 2.0);
+        // case-insensitive [type=TEXT i] matches both lowercase and uppercase type.
+        let inp_upper = elem_nth(&doc, 1, |e| e.tag == "input");
+        assert!(map[&inp].underline);
+        assert!(map[&inp_upper].underline);
+    }
+
+    #[test]
+    fn state_checked_and_disabled() {
+        let sheet = css::parse(
+            "input:checked { color: red }
+             button:disabled { font-weight: bold }
+             input:enabled { font-style: italic }",
+        );
+        let doc = html::parse(
+            r#"<html><body>
+                 <input type="checkbox" checked>
+                 <input type="checkbox">
+                 <button disabled>b</button>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let checked = elem_nth(&doc, 0, |e| e.tag == "input");
+        let unchecked = elem_nth(&doc, 1, |e| e.tag == "input");
+        assert_eq!(map[&checked].color, red());
+        assert_ne!(map[&unchecked].color, red());
+        assert!(map[&unchecked].italic); // :enabled (no disabled attr)
+        let btn = elem_nth(&doc, 0, |e| e.tag == "button");
+        assert!(map[&btn].bold);
+    }
+
+    #[test]
+    fn hover_and_focus_via_interaction_state() {
+        let sheet = css::parse(
+            ".btn:hover { color: red }
+             .field:focus { font-weight: bold }",
+        );
+        let doc = html::parse(
+            r#"<html><body>
+                 <a class="btn"><span>label</span></a>
+                 <input class="field">
+               </body></html>"#,
+        );
+        let btn = elem(&doc, |e| e.classes().any(|c| c == "btn"));
+        let label = elem(&doc, |e| e.tag == "span");
+        let field = elem(&doc, |e| e.classes().any(|c| c == "field"));
+
+        // Hover the inner span: `.btn:hover` should match the ancestor `.btn` too.
+        set_interaction_state(Some(label.0), None);
+        let map = cascade(&doc, &[sheet.clone()]);
+        assert_eq!(map[&btn].color, red());
+
+        // Focus the field.
+        set_interaction_state(None, Some(field.0));
+        let map = cascade(&doc, &[sheet.clone()]);
+        assert!(map[&field].bold);
+
+        // Clear state: neither matches.
+        set_interaction_state(None, None);
+        let map = cascade(&doc, &[sheet]);
+        assert_ne!(map[&btn].color, red());
+        assert!(!map[&field].bold);
+    }
+
+    #[test]
+    fn functional_not_is_where() {
+        let sheet = css::parse(
+            "div:not(.x) { color: red }
+             :is(.a, .b) { font-weight: bold }
+             :where(.c) { font-style: italic }",
+        );
+        let doc = html::parse(
+            r#"<html><body>
+                 <div>plain</div>
+                 <div class="x">excluded</div>
+                 <div class="a">isa</div>
+                 <div class="c">wherec</div>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let plain = elem_nth(&doc, 0, |e| e.tag == "div");
+        let excluded = elem_nth(&doc, 0, |e| e.tag == "div" && e.classes().any(|c| c == "x"));
+        let isa = elem(&doc, |e| e.classes().any(|c| c == "a"));
+        let wherec = elem(&doc, |e| e.classes().any(|c| c == "c"));
+        assert_eq!(map[&plain].color, red()); // :not(.x) matches a plain div
+        assert_ne!(map[&excluded].color, red()); // .x excluded
+        assert!(map[&isa].bold); // :is(.a, .b)
+        assert!(map[&wherec].italic); // :where(.c)
+    }
+
+    #[test]
+    fn specificity_id_class_type_and_not() {
+        // #id beats .cls beats tag.
+        assert!(
+            compile_selector("#x").unwrap().specificity
+                > compile_selector(".c").unwrap().specificity
+        );
+        assert!(
+            compile_selector(".c").unwrap().specificity
+                > compile_selector("p").unwrap().specificity
+        );
+        // :not(#x) carries id-level specificity.
+        assert_eq!(
+            compile_selector("div:not(#x)").unwrap().specificity,
+            compile_selector("#x").unwrap().specificity
+                + compile_selector("div").unwrap().specificity
+        );
+        // :where() contributes ZERO specificity (only the type counts here).
+        assert_eq!(
+            compile_selector("div:where(.a.b.c)").unwrap().specificity,
+            compile_selector("div").unwrap().specificity
+        );
+    }
+
+    #[test]
+    fn where_zero_specificity_loses_to_class() {
+        // `:where(.hi)` adds 0 specificity, so a plain `.lo` (class) should win on source order
+        // when both target the same element and `.lo` comes later.
+        let sheet = css::parse(
+            ":where(.hi) { color: blue }
+             .lo { color: red }",
+        );
+        let doc = html::parse(r#"<html><body><p class="hi lo">t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        // Equal specificity (0 vs 10) → .lo (10) wins → red.
+        assert_eq!(map[&p].color, red());
+    }
+
+    #[test]
+    fn pseudo_element_does_not_crash_and_never_matches() {
+        // `::before` is out of scope: the rule is dropped, the element keeps inherited color.
+        let sheet = css::parse(
+            "p::before { color: red }
+             p { color: blue }",
+        );
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (0, 0, 255)); // only `p { blue }` applied
+        // The compile step itself rejects pseudo-elements.
+        assert!(compile_selector("p::before").is_none());
+        assert!(compile_selector("div::after").is_none());
+    }
+
+    #[test]
+    fn empty_and_root_pseudo() {
+        let sheet = css::parse(
+            ":root { letter-spacing: 5px }
+             p:empty { color: red }",
+        );
+        let doc = html::parse(
+            r#"<html><body><p></p><p>full</p></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let html_el = elem(&doc, |e| e.tag == "html");
+        assert_eq!(map[&html_el].letter_spacing, 5.0);
+        let empty_p = elem_nth(&doc, 0, |e| e.tag == "p");
+        let full_p = elem_nth(&doc, 1, |e| e.tag == "p");
+        assert_eq!(map[&empty_p].color, red());
+        assert_ne!(map[&full_p].color, red());
+    }
+
+    /// Cross-check: for a doc + sheet exercising combinators/attrs/pseudos, the indexed match set
+    /// equals a brute-force `complex_matches` scan over every rule for every element.
+    #[test]
+    fn indexed_complex_match_set_equals_bruteforce() {
+        let sheet = css::parse(
+            ".nav a { color: #010101 }
+             .card > .title { color: #020202 }
+             li:nth-child(2) { color: #030303 }
+             a[target=_blank] { color: #040404 }
+             input:checked { color: #050505 }
+             div:not(.x) { color: #060606 }
+             :is(.a, .b) { color: #070707 }
+             .a + .b { color: #080808 }
+             .a ~ .c { color: #090909 }
+             [data-y] { color: #0a0a0a }",
+        );
+        let ua = user_agent_stylesheet();
+        let author = [sheet];
+        let index = SelectorIndex::build(&ua, &author);
+        let doc = html::parse(
+            r#"<html><body>
+                 <nav class="nav"><a target="_blank">l</a></nav>
+                 <div class="card"><span class="title">t</span></div>
+                 <ul><li>1</li><li>2</li></ul>
+                 <input type="checkbox" checked>
+                 <div class="x">x</div><div>plain</div>
+                 <span class="a">a</span><span class="b">b</span><span class="c">c</span>
+                 <p data-y="1">y</p>
+               </body></html>"#,
+        );
+        fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut Vec<dom::NodeId>) {
+            if let NodeData::Element(_) = &doc.get(id).data {
+                out.push(id);
+            }
+            for &c in &doc.get(id).children {
+                walk(doc, c, out);
+            }
+        }
+        let mut ids = Vec::new();
+        walk(&doc, doc.root(), &mut ids);
+        for id in ids {
+            if let NodeData::Element(el) = &doc.get(id).data {
+                // Brute-force: scan every rule directly via complex_matches.
+                let brute = naive_matches(&doc, id, &ua, &author);
+                let indexed = indexed_matches(&doc, id, el, &index);
+                assert_eq!(indexed, brute, "match set diverged for <{}>", el.tag);
+            }
+        }
     }
 }
 

@@ -204,6 +204,8 @@ impl Engine {
         // @container, and vw/vh units evaluate against the true window — and, since this runs on
         // every viewport change, they re-evaluate on resize.
         style::set_viewport_metrics(self.vp_w as f32, self.vp_h as f32, self.scale);
+        // Feed pointer/keyboard interaction state to the cascade so `:hover`/`:focus`/… match.
+        style::set_interaction_state(self.hovered_node.map(|n| n.0), self.focused_node.map(|n| n.0));
         if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
             return;
         }
@@ -544,11 +546,13 @@ impl Engine {
         }
 
         self.hovered_node = node;
+        // The hovered node changed: invalidate layout so `:hover` rules re-cascade/repaint even
+        // when no JS snapshot was produced.
+        self.layout_cache = None;
         if let Some(snap) = snapshot {
             if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
                 *doc = Some(snap);
                 c.extend(console);
-                self.layout_cache = None;
                 return true;
             }
         }

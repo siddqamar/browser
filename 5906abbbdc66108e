@@ -1,0 +1,209 @@
+export default {
+	id: 'css-fonts-3',
+	title: 'CSS Fonts Module Level 3',
+	link: 'css-fonts-3',
+	status: 'stable',
+	firstSnapshot: 2015,
+	values: {
+		'font-variant': {
+			link: '#font-variant-prop',
+			properties: ['font-variant'],
+			tests: [
+				'none',
+				'common-ligatures',
+				'no-common-ligatures',
+				'discretionary-ligatures',
+				'no-discretionary-ligatures',
+				'historical-ligatures',
+				'no-historical-ligatures',
+				'contextual',
+				'no-contextual',
+				'all-small-caps',
+				'petite-caps',
+				'all-petite-caps',
+				'unicase',
+				'titling-caps',
+				'lining-nums',
+				'oldstyle-nums',
+				'proportional-nums',
+				'tabular-nums',
+				'diagonal-fractions',
+				'stacked-fractions',
+				'ordinal',
+				'slashed-zero',
+				'jis78',
+				'jis83',
+				'jis90',
+				'jis04',
+				'simplified',
+				'traditional',
+				'full-width',
+				'proportional-width',
+				'ruby',
+				'sub',
+				'super',
+				'common-ligatures discretionary-ligatures',
+				'small-caps lining-nums ordinal ruby sub'
+			],
+		},
+	},
+	properties: {
+		'font-stretch': {
+			link: '#font-stretch-prop',
+			tests: [
+				'normal',
+				'ultra-condensed',
+				'extra-condensed',
+				'condensed',
+				'semi-condensed',
+				'semi-expanded',
+				'expanded',
+				'extra-expanded',
+				'ultra-expanded',
+			],
+		},
+		'font-size-adjust': {
+			link: '#font-size-adjust-prop',
+			tests: ['none', '0', '.5', '1.234'],
+		},
+		'font-synthesis': {
+			link: '#font-synthesis-prop',
+			tests: ['none', 'weight', 'style', 'weight style', 'style weight'],
+		},
+		'font-kerning': {
+			link: '#font-kerning-prop',
+			tests: ['auto', 'normal', 'none'],
+		},
+		'font-variant-position': {
+			link: '#font-variant-position-prop',
+			tests: ['normal', 'sub', 'super'],
+		},
+		'font-variant-ligatures': {
+			link: '#font-variant-ligatures-prop',
+			tests: [
+				'normal',
+				'none',
+				'common-ligatures',
+				'no-common-ligatures',
+				'discretionary-ligatures',
+				'no-discretionary-ligatures',
+				'historical-ligatures',
+				'no-historical-ligatures',
+				'contextual',
+				'no-contextual',
+				'common-ligatures discretionary-ligatures historical-ligatures contextual',
+			],
+		},
+		'font-variant-caps': {
+			link: '#font-variant-caps-prop',
+			tests: [
+				'normal',
+				'small-caps',
+				'all-small-caps',
+				'petite-caps',
+				'all-petite-caps',
+				'titling-caps',
+				'unicase',
+			],
+		},
+		'font-variant-numeric': {
+			link: '#font-variant-numeric-prop',
+			tests: [
+				'normal',
+				'lining-nums',
+				'oldstyle-nums',
+				'proportional-nums',
+				'tabular-nums',
+				'diagonal-fractions',
+				'stacked-fractions',
+				'ordinal',
+				'slashed-zero',
+				'lining-nums proportional-nums diagonal-fractions',
+				'oldstyle-nums tabular-nums stacked-fractions ordinal slashed-zero',
+				'slashed-zero ordinal tabular-nums stacked-fractions oldstyle-nums',
+			],
+		},
+		'font-variant-east-asian': {
+			link: '#font-variant-east-asian-prop',
+			tests: [
+				'normal',
+				'jis78',
+				'jis83',
+				'jis90',
+				'jis04',
+				'simplified',
+				'traditional',
+				'full-width',
+				'proportional-width',
+				'ruby',
+				'simplified full-width ruby',
+			],
+		},
+
+		'font-feature-settings': {
+			link: '#font-feature-settings-prop',
+			tests: ['normal', "'c2sc'", "'smcp' on", "'liga' off", "'swsh' 2", "'smcp', 'liga' off, 'swsh' 2"],
+		},
+	},
+
+	atrules: {
+		'@font-face': {
+			isGroup: true,
+			link: '#font-face-rule',
+			descriptors: {
+				src: {
+					link: '#descdef-src',
+					values: [
+						'url(http://example.com/fonts/Gentium.woff)',
+						'url(ideal-sans-serif.woff2) format("woff2"), url(good-sans-serif.woff) format("woff"), url(basic-sans-serif.ttf) format("opentype")',
+						'local(Gentium), url(Gentium.woff)'
+					],
+				},
+				'font-family': {
+					link: '#descdef-font-family',
+					value: 'Gentium'
+				},
+				'font-style': {
+					link: '#font-prop-desc',
+					values: ['normal', 'italic', 'oblique'],
+				},
+				'font-weight': {
+					link: '#font-prop-desc',
+					values: ['normal', 'bold', '100', '200', '300', '400', '500', '600', '700', '800', '900'],
+				},
+				'font-stretch': {
+					link: '#font-prop-desc',
+					values: [
+						'normal',
+						'ultra-condensed',
+						'extra-condensed',
+						'condensed',
+						'semi-condensed',
+						'semi-expanded',
+						'expanded',
+						'extra-expanded',
+						'ultra-expanded ',
+					],
+				},
+				'font-feature-settings': {
+					link: '#font-rend-desc',
+					values: ['normal', "'c2sc'", "'smcp' on", "'liga' off", "'smcp', 'swsh' 2"],
+				},
+				'font-variation-settings': {
+					link: '#font-rend-desc',
+					values: ['normal', "'swsh' 2"],
+				},
+				'unicode-range': {
+					link: '#unicode-range-desc',
+					values: ['U+416', 'U+0-7F', 'U+A5, U+4E00-9FFF', 'U+30??'],
+				},
+			}
+		},
+	},
+	globals: {
+		CSSFontFaceRule: {
+			link: '#om-fontface',
+			mdnGroup: 'DOM',
+		},
+	},
+};

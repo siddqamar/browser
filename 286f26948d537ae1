@@ -1,0 +1,104 @@
+:root {
+	/* Literal tokens */
+
+	--font-sans: system-ui, sans-serif;
+	--font-serif: ui-serif,serif;
+	--font-mono: Monaco, Consolas, monospace;
+	--font-body: var(--font-sans);
+	--font-heading: var(--font-body);
+
+	--color-gray: hsl(200 10% 50%);
+	--color-magenta: hsl(336 100% 50%);
+	--color-green: hsl(93 100% 30%);
+	--color-lime: hsl(80 100% 40%);
+	--color-yellow: oklch(85% 0.2 91);
+	--color-orange: hsl(34 100% 47%);
+	--color-red:  hsl(9 100% 47%);
+	--color-red-dark: hsl(0 100% 37%);
+	--color-blue: light-dark(oklch(65% 0.15 220), oklch(60% 0.15 220));
+
+	--font-size-xs: .72rem;
+	--font-size-s: .85rem;
+	--font-size-m: 1rem;
+	--font-size-l: 1.25rem;
+	--font-size-xl: 1.5rem;
+	--font-size-2xl: 2rem;
+	--font-size-3xl: 3rem;
+
+	/* Semantic or higher level tokens */
+
+	--color-pass: var(--color-green);
+	--color-almost-pass: var(--color-lime);
+	--color-slightly-buggy: var(--color-yellow);
+	--color-buggy: var(--color-orange);
+	--color-very-buggy: color-mix(in hsl, var(--color-orange), var(--color-red) 60%);
+	--color-fail: var(--color-red);
+	--color-epic-fail: var(--color-red-dark);
+
+	--color-neutral: var(--color-gray);
+	--color-accent: var(--color-magenta);
+	--color-accent-text: white;
+
+	--color-neutral-0: black;
+	--color-neutral-10: hsl(from var(--color-neutral) h s 10%);
+	--color-neutral-20: hsl(from var(--color-neutral) h s 20%);
+	--color-neutral-30: hsl(from var(--color-neutral) h s 30%);
+	--color-neutral-40: hsl(from var(--color-neutral) h s 40%);
+	--color-neutral-50: hsl(from var(--color-neutral) h s 50%);
+	--color-neutral-60: hsl(from var(--color-neutral) h s 60%);
+	--color-neutral-70: hsl(from var(--color-neutral) h s 70%);
+	--color-neutral-80: hsl(from var(--color-neutral) h s 80%);
+	--color-neutral-90: hsl(from var(--color-neutral) h s 90%);
+	--color-neutral-100: white;
+
+	--color-neutral-0-100: light-dark(var(--color-neutral-0), var(--color-neutral-100));
+	--color-neutral-10-100: light-dark(var(--color-neutral-10), var(--color-neutral-100));
+	--color-neutral-20-100: light-dark(var(--color-neutral-20), var(--color-neutral-100));
+	--color-neutral-20-90: light-dark(var(--color-neutral-20), var(--color-neutral-90));
+	--color-neutral-30-80: light-dark(var(--color-neutral-30), var(--color-neutral-80));
+	--color-neutral-30-90: light-dark(var(--color-neutral-30), var(--color-neutral-90));
+	--color-neutral-30-100: light-dark(var(--color-neutral-30), var(--color-neutral-100));
+	--color-neutral-80-30: light-dark(var(--color-neutral-80), var(--color-neutral-30));
+	--color-neutral-90-20: light-dark(var(--color-neutral-90), var(--color-neutral-20));
+	--color-neutral-100-20: light-dark(var(--color-neutral-100), var(--color-neutral-20));
+	--color-neutral-100-10: light-dark(var(--color-neutral-100), var(--color-neutral-10));
+	--color-neutral-100-0: light-dark(var(--color-neutral-100), var(--color-neutral-0));
+	--color-transparent: oklab(none none none / 0);
+
+	--color-bg: canvas;
+	--color-text: var(--color-neutral-10-100);
+	--color-border: var(--color-neutral-80-30);
+	--color-shade: light-dark(oklab(none none none / .4), black);
+	--color-bg-soft: var(--color-neutral-90-20);
+	--color-text-soft: var(--color-neutral-20-90);
+	--color-bg-loud: var(--color-neutral-20-90);
+	--color-text-loud: var(--color-neutral-100-10);
+
+	--footer-border-color: var(--color-border);
+	--focus-border-color: color-mix(in oklab, var(--color-blue), var(--color-transparent) 60%);
+	--focus-ring: clamp(.1rem, .15em, .2rem) solid var(--focus-border-color, red);
+	--focus-ring-offset: .1em;
+
+	--title-background-color: var(--color-bg-loud);
+	--title-foreground-color: var(--color-text-loud);
+	--badge-background-color: var(--color-neutral-90-20);
+	--badge-foreground-color: var(--color-neutral-30-100);
+
+	--prefix-background-color: light-dark(oklab(none none none / 0.4), oklab(100% 0 0 / 0.4));
+	--prefix-foreground-color: var(--color-text-loud);
+
+	--aside-border-color: light-dark(hsl(0 0% 80% / .8), hsl(0 0% 20% / .8));
+	--aside-background-color: light-dark(hsl(0 0% 98% / .6), hsl(0 0% 2% / .6));
+	--aside-foreground-color: light-dark(hsl(0 0% 0%), hsl(0 0% 100%));
+
+	--l-threshold: 0.73;
+	--is-light: clamp(0, (l - var(--l-threshold)) * infinity, 1);
+	--is-dark: (1 - var(--is-light));
+	--text: calc(1 * var(--is-dark) + .1 * var(--is-light)) calc(c * var(--is-light)) h;
+
+	--shadow-l: 0 .4em .7em -.3em var(--color-shade);
+	--shadow-l-90deg: -.4em 0 .7em -.3em var(--color-shade);
+
+	--radius-s: .2rem;
+	--radius-m: .3rem;
+}
