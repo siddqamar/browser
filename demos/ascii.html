@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ASCII rendering check</title>
+<style>
+  :root { --bg:#0b0d16; --fg:#e6e8ef; --muted:#7b8194; --line:#262a3a; --accent:#5aa6ff; }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; margin: 0; padding: 28px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 22px; }
+
+  /* Grid of every printable ASCII code point (0x20–0x7E). */
+  .grid { display: grid; grid-template-columns: repeat(16, 1fr); gap: 6px; }
+  .cell { border: 1px solid var(--line); border-radius: 6px; padding: 6px 2px 4px; text-align: center; background: #11141f; }
+  .cell .ch { font-size: 22px; line-height: 1.1; min-height: 26px; }
+  .cell .code { font-size: 10px; color: var(--muted); margin-top: 4px; font-family: ui-monospace, monospace; }
+  .cell.sp .ch::after { content: "␠"; color: var(--muted); } /* mark the space cell so it isn't blank */
+
+  section { margin-top: 30px; }
+  h2 { font-size: 15px; color: var(--accent); border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+
+  /* A continuous run, to check spacing/kerning, in several faces + sizes. */
+  .run { white-space: pre-wrap; word-break: break-all; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .serif { font-family: Georgia, "Times New Roman", serif; }
+  .big { font-size: 30px; }
+  .bold { font-weight: 700; }
+  .ital { font-style: italic; }
+  .row { margin: 10px 0; padding: 8px 10px; background: #11141f; border: 1px solid var(--line); border-radius: 8px; }
+  .label { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; display: block; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+  <h1>ASCII rendering check</h1>
+  <p class="sub">Every printable ASCII character (0x20–0x7E, 95 glyphs). Each cell shows the glyph and its decimal code. Any blank/▯/wrong cell = a glyph the engine failed to render.</p>
+
+  <div class="grid" id="grid"></div>
+
+  <section>
+    <h2>Continuous runs (spacing, kerning, faces)</h2>
+    <div class="row"><span class="label">sans &middot; default</span><span class="run" id="run-sans"></span></div>
+    <div class="row"><span class="label">monospace</span><span class="run mono" id="run-mono"></span></div>
+    <div class="row"><span class="label">serif</span><span class="run serif" id="run-serif"></span></div>
+    <div class="row"><span class="label">bold</span><span class="run bold" id="run-bold"></span></div>
+    <div class="row"><span class="label">italic</span><span class="run ital" id="run-ital"></span></div>
+    <div class="row"><span class="label">large 30px</span><span class="run big" id="run-big"></span></div>
+  </section>
+
+  <section>
+    <h2>Letters, digits, punctuation, symbols (grouped)</h2>
+    <div class="row"><span class="label">uppercase</span><span class="run">ABCDEFGHIJKLMNOPQRSTUVWXYZ</span></div>
+    <div class="row"><span class="label">lowercase</span><span class="run">abcdefghijklmnopqrstuvwxyz</span></div>
+    <div class="row"><span class="label">digits</span><span class="run">0123456789</span></div>
+    <div class="row"><span class="label">punctuation / symbols</span><span class="run">!&quot;#$%&amp;'()*+,-./:;&lt;=&gt;?@[\]^_`{|}~</span></div>
+  </section>
+
+  <script>
+    // Build the grid + the runs from char codes 32..126 so the data is generated, not hand-typed
+    // (also exercises createElement/textContent/String.fromCharCode in the engine).
+    var grid = document.getElementById('grid');
+    var run = '';
+    for (var c = 32; c <= 126; c++) {
+      var ch = String.fromCharCode(c);
+      run += ch;
+      var cell = document.createElement('div');
+      cell.className = 'cell' + (c === 32 ? ' sp' : '');
+      var g = document.createElement('div');
+      g.className = 'ch';
+      g.textContent = ch;
+      var code = document.createElement('div');
+      code.className = 'code';
+      code.textContent = c;
+      cell.appendChild(g);
+      cell.appendChild(code);
+      grid.appendChild(cell);
+    }
+    ['sans', 'mono', 'serif', 'bold', 'ital', 'big'].forEach(function (id) {
+      document.getElementById('run-' + id).textContent = run;
+    });
+  </script>
+</body>
+</html>
