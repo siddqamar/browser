@@ -29,7 +29,7 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::sync::Once;
@@ -1050,6 +1050,52 @@ fn prim_scroll_y(
     rv.set(v8::Number::new(scope, y as f64).into());
 }
 
+/// A JS-requested scroll target (document CSS px), read+cleared by the engine after each Session
+/// interaction. `i64::MIN` = no request. Process-global: the active tab is the one being driven.
+static PENDING_SCROLL: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Read + clear a pending JS scroll request (`window.scrollTo` / `scrollIntoView`). The engine calls
+/// this after `tick`/`dispatch_*`/`console_eval` and applies it to its scroll offset.
+pub fn take_pending_scroll() -> Option<f32> {
+    let v = PENDING_SCROLL.swap(i64::MIN, Ordering::AcqRel);
+    if v == i64::MIN {
+        None
+    } else {
+        Some(v as f32)
+    }
+}
+
+/// `__scrollSet(y)` — request a scroll to document `y` (CSS px); clamped to >= 0.
+fn prim_scroll_set(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let y = args.get(0).number_value(scope).unwrap_or(0.0);
+    let y = if y.is_finite() { y.max(0.0) } else { 0.0 };
+    PENDING_SCROLL.store(y.round() as i64, Ordering::Release);
+}
+
+/// `__scrollIntoView(id)` — request a scroll so node `id`'s top is near the viewport top.
+fn prim_scroll_into_view(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if !id.is_finite() || id < 0.0 {
+        return;
+    }
+    let target = host_state(scope)
+        .layout_rects
+        .borrow()
+        .get(&(id as usize))
+        .map(|&(_, y, _, _)| (y - 8.0).max(0.0)); // small margin above the element
+    if let Some(t) = target {
+        PENDING_SCROLL.store(t.round() as i64, Ordering::Release);
+    }
+}
+
 /// Fill `buf` with cryptographically-random bytes from the OS (`/dev/urandom`), falling back to a
 /// time/address-seeded PRNG only if that's unreadable.
 fn fill_random(buf: &mut [u8]) {
@@ -1971,6 +2017,8 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__storageSave", prim_storage_save);
     set_fn(scope, global, "__cryptoRandom", prim_crypto_random);
     set_fn(scope, global, "__scrollY", prim_scroll_y);
+    set_fn(scope, global, "__scrollSet", prim_scroll_set);
+    set_fn(scope, global, "__scrollIntoView", prim_scroll_into_view);
     set_fn(scope, global, "__appendChild", prim_append_child);
     set_fn(scope, global, "__insertBefore", prim_insert_before);
     set_fn(scope, global, "__removeChild", prim_remove_child);
@@ -2689,7 +2737,16 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(globalThis, "pageYOffset", { get: function () { try { return __scrollY(); } catch (e) { return 0; } }, configurable: true });
   } catch (e) { globalThis.scrollY = 0; globalThis.pageYOffset = 0; }
   globalThis.screenX = 0; globalThis.screenY = 0; globalThis.screenLeft = 0; globalThis.screenTop = 0;
-  globalThis.scrollTo = fn; globalThis.scrollBy = fn; globalThis.scroll = fn;
+  // scrollTo(x,y) | scrollTo({top}) — request a real scroll the engine applies.
+  globalThis.scrollTo = function (x, y) {
+    var top = (x && typeof x === "object") ? x.top : y;
+    if (top != null) { try { __scrollSet(Number(top) || 0); } catch (e) {} }
+  };
+  globalThis.scroll = globalThis.scrollTo;
+  globalThis.scrollBy = function (x, y) {
+    var dy = (x && typeof x === "object") ? x.top : y;
+    try { __scrollSet((Number(globalThis.scrollY) || 0) + (Number(dy) || 0)); } catch (e) {}
+  };
   globalThis.moveTo = fn; globalThis.moveBy = fn; globalThis.resizeTo = fn; globalThis.resizeBy = fn;
   globalThis.focus = fn; globalThis.blur = fn; globalThis.print = fn;
   globalThis.open = function () { return null; }; globalThis.close = fn; globalThis.stop = fn;
@@ -3416,7 +3473,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         });
       }
     }
-    if (typeof el.scrollIntoView !== "function") { def(el, "scrollIntoView", fn); }
+    if (typeof el.scrollIntoView !== "function") { def(el, "scrollIntoView", function () { try { __scrollIntoView(this.__node); } catch (e) {} }); }
     if (typeof el.focus !== "function") { def(el, "focus", fn); }
     if (typeof el.blur !== "function") { def(el, "blur", fn); }
     if (typeof el.click !== "function") { def(el, "click", fn); }

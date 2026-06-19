@@ -762,6 +762,7 @@ impl Engine {
             *doc = Some(snapshot);
             c.extend(console);
             self.layout_cache = None; // DOM may have changed → re-cascade/layout/paint
+            self.apply_pending_scroll(); // a click handler may have called scrollTo/scrollIntoView
             true
         } else {
             false
@@ -1108,7 +1109,24 @@ impl Engine {
         if self.deliver_observations() {
             dirty = true;
         }
+        if self.apply_pending_scroll() {
+            dirty = true;
+        }
         dirty
+    }
+
+    /// Apply a JS-requested scroll (`window.scrollTo` / `element.scrollIntoView`): the JS native
+    /// stored a document-CSS-px target; convert to device px and move the scroll offset. Returns
+    /// whether the offset changed (so the caller re-renders). The render clamps to the page height.
+    fn apply_pending_scroll(&mut self) -> bool {
+        if let Some(y_css) = js::take_pending_scroll() {
+            let y = (y_css * self.scale).max(0.0);
+            if (y - self.scroll_y).abs() > 0.5 {
+                self.scroll_y = y;
+                return true;
+            }
+        }
+        false
     }
 
     /// Compute IntersectionObserver / ResizeObserver geometry for the page's observed targets and,
