@@ -4880,7 +4880,12 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          sub { vertical-align: sub }
          sup { vertical-align: super }
          q::before { content: \"\\201C\" }
-         q::after { content: \"\\201D\" }",
+         q::after { content: \"\\201D\" }
+         input, textarea, select, button { display: inline-block; border: 1px solid #767676; color: #000000; background-color: #ffffff; padding: 1px 2px }
+         input[type=submit], input[type=reset], input[type=button], button { background-color: #efefef; padding: 2px 8px }
+         input[type=file] { background-color: #efefef; padding: 1px 2px }
+         input[type=checkbox], input[type=radio], input[type=range], input[type=color], progress, meter { border: 0; padding: 0; background-color: transparent }
+         label { display: inline-block }",
     )
 }
 

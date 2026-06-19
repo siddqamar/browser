@@ -167,6 +167,29 @@ pub enum BoxContent {
     /// at build time (a ~2px-wide bar ≈ the font's cap height). It flows inline (atomically) so it
     /// sits immediately after the value text (or at the start of an empty field).
     Caret,
+    /// A native-looking form widget the painter draws as shapes (no glyphs), sized at build time:
+    /// a checkbox/radio box, a range slider, a color swatch, or a progress/meter bar. The
+    /// element's attributes (`checked`/`value`/`min`/`max`) are resolved to the variant's fields at
+    /// build time so the painter only draws. Flows atomically (like an image) so it sits inline.
+    Widget(WidgetKind),
+}
+
+/// A form control the painter renders as primitive shapes (rects/circles/lines) rather than text.
+/// Built from the element's attributes in `build_replaced_or_control`; the painter only draws.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WidgetKind {
+    /// `<input type=checkbox>`: a small square; `checked` → a filled check mark.
+    Checkbox { checked: bool },
+    /// `<input type=radio>`: a small circle; `checked` → a filled inner dot.
+    Radio { checked: bool },
+    /// `<input type=range>`: a horizontal track with a thumb at `fraction` (0..=1) along it.
+    Range { fraction: f32 },
+    /// `<input type=color>`: a swatch filled with `rgb`, thin border.
+    Color { rgb: (u8, u8, u8) },
+    /// `<progress>`: a track with a fill = `fraction` (0..=1); `None` = indeterminate (full fill).
+    Progress { fraction: Option<f32> },
+    /// `<meter>`: a track with a greenish fill = `fraction` (0..=1).
+    Meter { fraction: f32 },
 }
 
 /// A node in the layout tree: geometry + paint info + children.
@@ -494,22 +517,81 @@ fn input_display_text(el: &dom::ElementData) -> Option<String> {
         };
         return Some(attr("value").unwrap_or(default).to_string());
     }
+    // Date/time pickers: a bordered field showing the value, or a format placeholder. We don't
+    // build a real picker — just visible text so the control reads as a field.
+    if matches!(ty.as_str(), "date" | "time" | "datetime-local" | "month" | "week") {
+        let placeholder = match ty.as_str() {
+            "date" => "mm/dd/yyyy",
+            "time" => "--:-- --",
+            "datetime-local" => "mm/dd/yyyy --:-- --",
+            "month" => "mm/yyyy",
+            "week" => "Week --, ----",
+            _ => "",
+        };
+        let value = attr("value").unwrap_or("");
+        return Some(if value.is_empty() { placeholder.to_string() } else { value.to_string() });
+    }
+    // File chooser: a "Choose File" button label followed by the chosen filename (or the
+    // conventional "No file chosen"). The button chrome comes from the UA stylesheet border.
+    if ty == "file" {
+        return Some("Choose File  No file chosen".to_string());
+    }
     None
 }
 
-/// If `el` is an `<input type=checkbox>` or `<input type=radio>`, return the glyph to render for
-/// its current `checked` state: checkbox uses ☑/☐, radio uses ●/○. `None` for anything else.
-fn checkable_glyph(el: &dom::ElementData) -> Option<String> {
-    if !el.tag.eq_ignore_ascii_case("input") {
-        return None;
+/// Parse a numeric attribute (`min`/`max`/`value`), returning `None` when absent/unparseable.
+fn num_attr(el: &dom::ElementData, name: &str) -> Option<f32> {
+    el.attrs.get(name).and_then(|v| v.trim().parse::<f32>().ok())
+}
+
+/// Resolve an `<input type=range>`'s thumb position as a fraction (0..=1) of the track:
+/// `(value - min) / (max - min)`, with the HTML defaults (min 0, max 100, value = midpoint).
+fn range_fraction(el: &dom::ElementData) -> f32 {
+    let min = num_attr(el, "min").unwrap_or(0.0);
+    let max = num_attr(el, "max").unwrap_or(100.0);
+    let span = max - min;
+    let value = num_attr(el, "value").unwrap_or(min + span / 2.0);
+    if span.abs() < f32::EPSILON {
+        0.0
+    } else {
+        ((value - min) / span).clamp(0.0, 1.0)
     }
-    let ty = el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
-    let checked = el.attrs.contains_key("checked");
-    match ty.as_str() {
-        "checkbox" => Some(if checked { "\u{2611}" } else { "\u{2610}" }.to_string()), // ☑ / ☐
-        "radio" => Some(if checked { "\u{25CF}" } else { "\u{25CB}" }.to_string()), // ● / ○
+}
+
+/// Parse a CSS hex color (`#rgb` / `#rrggbb`, leading `#` optional). Used for the `<input
+/// type=color>` swatch (whose `value` is always a 7-char hex string per spec). `None` on failure.
+fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.trim().trim_start_matches('#');
+    let hex = |a: u8, b: u8| u8::from_str_radix(&format!("{}{}", a as char, b as char), 16).ok();
+    let bytes = h.as_bytes();
+    match bytes.len() {
+        3 => {
+            let d = |c: u8| u8::from_str_radix(&format!("{}{}", c as char, c as char), 16).ok();
+            Some((d(bytes[0])?, d(bytes[1])?, d(bytes[2])?))
+        }
+        6 => Some((hex(bytes[0], bytes[1])?, hex(bytes[2], bytes[3])?, hex(bytes[4], bytes[5])?)),
         _ => None,
     }
+}
+
+/// The `<progress>`/`<meter>` fill fraction (0..=1) = `value / max` (max defaults to 1). For a
+/// `<progress>` with no `value`, returns `None` (indeterminate). `is_progress` selects the
+/// indeterminate behavior (meter always has a value: defaults to 0).
+fn bar_fraction(el: &dom::ElementData, is_progress: bool) -> Option<f32> {
+    let max = num_attr(el, "max").unwrap_or(1.0).max(f32::EPSILON);
+    match num_attr(el, "value") {
+        Some(v) => Some((v / max).clamp(0.0, 1.0)),
+        None if is_progress => None,    // indeterminate progress bar
+        None => Some(0.0),              // a meter with no value reads as empty
+    }
+}
+
+/// Give a drawn-widget box an explicit content size: the element's CSS width/height if set, else
+/// the supplied intrinsic default. Widgets are replaced-element-like, so block layout must not try
+/// to stretch/shrink them past this; we set the content rect directly (like the image/caret path).
+fn size_widget_box(bx: &mut LayoutBox, cs: &style::ComputedStyle, default_w: f32, default_h: f32) {
+    bx.dimensions.content.width = cs.width.unwrap_or(default_w).max(1.0);
+    bx.dimensions.content.height = cs.height.unwrap_or(default_h).max(1.0);
 }
 
 /// The label a `<select>` (id `select_id`) should display in its (single-line) dropdown control:
@@ -773,13 +855,54 @@ fn build_replaced_or_control(
     bx.dimensions.padding = edges_of(cs.padding);
     bx.dimensions.border = edges_of(cs.border);
 
-    // Checkbox / radio: a small box with a glyph (☑/☐, ●/○) reflecting the checked state.
-    if let Some(glyph) = checkable_glyph(el) {
-        let mut gps = ps;
-        if gps.font_size <= 0.0 {
-            gps.font_size = 13.0;
-        }
-        bx.children.push(LayoutBox::new(BoxContent::Text(glyph), gps, Some(id)));
+    // <progress> / <meter>: a horizontal bar widget (track + proportional fill). Sized to a
+    // conventional 160×16 (honoring any explicit CSS width/height); the painter draws the bar.
+    if el.tag.eq_ignore_ascii_case("progress") || el.tag.eq_ignore_ascii_case("meter") {
+        let is_progress = el.tag.eq_ignore_ascii_case("progress");
+        let kind = if is_progress {
+            WidgetKind::Progress { fraction: bar_fraction(el, true) }
+        } else {
+            WidgetKind::Meter { fraction: bar_fraction(el, false).unwrap_or(0.0) }
+        };
+        size_widget_box(&mut bx, cs, 160.0, 16.0);
+        bx.content = BoxContent::Widget(kind);
+        return Some(bx);
+    }
+
+    let input_ty =
+        el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let is_input = el.tag.eq_ignore_ascii_case("input");
+
+    // Checkbox / radio: a small (~13px) drawn box/circle reflecting the checked state. Drawn by the
+    // painter (the ☑/☐/●/○ code points aren't in the bundled font), keeping the existing toggle.
+    if is_input && (input_ty == "checkbox" || input_ty == "radio") {
+        let checked = el.attrs.contains_key("checked");
+        let kind = if input_ty == "checkbox" {
+            WidgetKind::Checkbox { checked }
+        } else {
+            WidgetKind::Radio { checked }
+        };
+        size_widget_box(&mut bx, cs, 13.0, 13.0);
+        bx.content = BoxContent::Widget(kind);
+        return Some(bx);
+    }
+
+    // <input type=range>: a horizontal slider (track + thumb) at the value's position.
+    if is_input && input_ty == "range" {
+        size_widget_box(&mut bx, cs, 129.0, 21.0);
+        bx.content = BoxContent::Widget(WidgetKind::Range { fraction: range_fraction(el) });
+        return Some(bx);
+    }
+
+    // <input type=color>: a small swatch filled with the chosen color (default #000000).
+    if is_input && input_ty == "color" {
+        let rgb = el
+            .attrs
+            .get("value")
+            .and_then(|v| parse_hex_color(v))
+            .unwrap_or((0, 0, 0));
+        size_widget_box(&mut bx, cs, 44.0, 23.0);
+        bx.content = BoxContent::Widget(WidgetKind::Color { rgb });
         return Some(bx);
     }
 
@@ -932,6 +1055,8 @@ fn build_box(
                 || el.tag.eq_ignore_ascii_case("input")
                 || el.tag.eq_ignore_ascii_case("textarea")
                 || el.tag.eq_ignore_ascii_case("select")
+                || el.tag.eq_ignore_ascii_case("progress")
+                || el.tag.eq_ignore_ascii_case("meter")
             {
                 if let Some(produced) =
                     build_replaced_or_control(doc, el, id, cs, intrinsic_sizes, focused)
@@ -1208,6 +1333,14 @@ fn layout_block(
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
 ) {
+    // A drawn form widget is replaced-like: its content size was fixed at build time. Place it like
+    // an image (origin inside the containing block) and don't run block/inline formatting (which
+    // would zero its pre-set height).
+    if matches!(boxx.content, BoxContent::Widget(_) | BoxContent::Image(_)) {
+        layout_image_box(boxx, containing);
+        return;
+    }
+
     let margin = boxx.dimensions.margin;
     let border = boxx.dimensions.border;
     let padding = boxx.dimensions.padding;
@@ -1263,7 +1396,8 @@ fn layout_block(
                 .children
                 .iter()
                 .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
-                    || (matches!(c.content, BoxContent::Image(_)) && image_is_block(c, styles)));
+                    || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
+                        && image_is_block(c, styles)));
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -1322,7 +1456,7 @@ fn layout_block_children(
         let containing = Rect { x: content.x, y: cursor_y, width: content.width, height: 0.0 };
         match &child.content {
             BoxContent::Block => layout_block(child, containing, ctx, styles, measurer),
-            BoxContent::Image(_) => layout_image_box(child, containing),
+            BoxContent::Image(_) | BoxContent::Widget(_) => layout_image_box(child, containing),
             BoxContent::Anonymous => {
                 // Anonymous blocks inherit the establishing block's text-align.
                 layout_anonymous(child, containing, parent_align, ctx, styles, measurer)
@@ -1448,7 +1582,8 @@ fn layout_out_of_flow(
                 .children
                 .iter()
                 .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
-                    || (matches!(c.content, BoxContent::Image(_)) && image_is_block(c, styles)));
+                    || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
+                        && image_is_block(c, styles)));
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -2053,7 +2188,8 @@ fn layout_flex_item_contents(
                 .children
                 .iter()
                 .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
-                    || (matches!(c.content, BoxContent::Image(_)) && image_is_block(c, styles)));
+                    || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
+                        && image_is_block(c, styles)));
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -3201,6 +3337,14 @@ fn collect_inline_items(
                 // The focused-field caret: an atomic, pre-sized thin bar. Like an image, give it a
                 // well-formed margin box at a tentative origin, then flow it inline so it sits
                 // right after the value text (its top margin centers it on the line).
+                let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+                layout_image_box(&mut child, containing);
+                out.push(InlineItem::Atomic(Box::new(child)));
+            }
+            BoxContent::Widget(_) => {
+                // A drawn form widget: pre-sized (content set at build time), replaced-like. Treat
+                // it as an atomic inline box (like an image) so it advances the line by its
+                // border-box width and is repositioned on its line.
                 let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
                 layout_image_box(&mut child, containing);
                 out.push(InlineItem::Atomic(Box::new(child)));
@@ -4592,8 +4736,14 @@ mod tests {
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
-        // The checked checkbox glyph (☑) appears in a text run under the input box.
-        assert!(has_text(ibox, "\u{2611}"), "expected ☑ checked indicator");
+        // The checkbox is a drawn Widget; checked state is carried on the Widget content.
+        assert!(
+            matches!(ibox.content, BoxContent::Widget(WidgetKind::Checkbox { checked: true })),
+            "expected a checked Checkbox widget, got {:?}",
+            ibox.content
+        );
+        // It has a non-zero box so it paints (and hit-tests).
+        assert!(ibox.dimensions.content.width > 0.0 && ibox.dimensions.content.height > 0.0);
     }
 
     #[test]
@@ -4610,8 +4760,11 @@ mod tests {
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
-        assert!(has_text(ibox, "\u{2610}"), "expected ☐ unchecked indicator");
-        assert!(!has_text(ibox, "\u{2611}"));
+        assert!(
+            matches!(ibox.content, BoxContent::Widget(WidgetKind::Checkbox { checked: false })),
+            "expected an unchecked Checkbox widget, got {:?}",
+            ibox.content
+        );
     }
 
     /// Build a `<select>` with the given options. Each option is `(value_attr, text, selected)`;

@@ -1522,6 +1522,28 @@ impl Engine {
         Some((lx, ly - self.scroll_y))
     }
 
+    /// Test-only: the device-px border-box rect of a node (scroll-folded, viewport-relative).
+    #[cfg(test)]
+    fn node_device_rect(&self, id: dom::NodeId) -> Option<layout::Rect> {
+        fn find(b: &layout::LayoutBox, id: dom::NodeId) -> Option<&layout::LayoutBox> {
+            for c in &b.children {
+                if let Some(f) = find(c, id) {
+                    return Some(f);
+                }
+            }
+            if b.node == Some(id) {
+                Some(b)
+            } else {
+                None
+            }
+        }
+        let cache = self.layout_cache.as_ref()?;
+        let bx = find(&cache.root, id)?;
+        let mut r = bx.dimensions.border_box();
+        r.y -= self.scroll_y;
+        Some(r)
+    }
+
     /// Test-only: walk the live DOM for the first element with the given `id` attribute.
     #[cfg(test)]
     fn node_by_attr_id(&self, attr_id: &str) -> Option<dom::NodeId> {
@@ -2505,6 +2527,12 @@ fn paint_box_opacity(
             fill_box(fb, xf, content.x, content.y, content.width, content.height, 0.0, cc, axis);
         }
 
+        // (c3) Form widget: a checkbox/radio, range slider, color swatch, or progress/meter bar,
+        // drawn as primitive shapes (no glyphs) in the content rect.
+        if let layout::BoxContent::Widget(kind) = &b.content {
+            paint_widget(fb, xf, content, *kind, opacity);
+        }
+
         // (d) Replaced image content: blit the decoded pixels into the content rect, scaled.
         // (Axis-aligned transforms map the destination rect exactly; rotation is approximated by
         // the bounding box.)
@@ -2561,6 +2589,184 @@ fn fill_box(fb: &mut Framebuffer, xf: &Affine, x: f32, y: f32, w: f32, h: f32, r
         let p2 = xf.apply(x + w, y + h);
         let p3 = xf.apply(x, y + h);
         fill_quad(fb, [p0, p1, p2, p3], c);
+    }
+}
+
+/// Stroke a rectangle outline `t` device-px thick (inside the rect's edges), source-over at `c`.
+/// Used for widget borders (checkbox/swatch/bar tracks). Coordinates are device px.
+fn stroke_rect(fb: &mut Framebuffer, r: Rect, t: i32, c: Color) {
+    if r.w <= 0 || r.h <= 0 || t <= 0 {
+        return;
+    }
+    let t = t.min(r.w).min(r.h);
+    fb.fill_rect(Rect { x: r.x, y: r.y, w: r.w, h: t }, c); // top
+    fb.fill_rect(Rect { x: r.x, y: r.y + r.h - t, w: r.w, h: t }, c); // bottom
+    fb.fill_rect(Rect { x: r.x, y: r.y, w: t, h: r.h }, c); // left
+    fb.fill_rect(Rect { x: r.x + r.w - t, y: r.y, w: t, h: r.h }, c); // right
+}
+
+/// Fill a circle (device-space center `cx,cy`, radius `rad`) source-over at `c`, with 1px AA at the
+/// rim. Used for radio dials and range thumbs.
+fn fill_circle(fb: &mut Framebuffer, cx: f32, cy: f32, rad: f32, c: Color) {
+    if rad <= 0.0 {
+        return;
+    }
+    let x0 = (cx - rad).floor() as i32;
+    let x1 = (cx + rad).ceil() as i32;
+    let y0 = (cy - rad).floor() as i32;
+    let y1 = (cy + rad).ceil() as i32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            // Full coverage inside (rad-1), linear AA over the outer 1px band.
+            let cov = (rad - d + 0.5).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                // blend_coverage folds c.a in itself; pass coverage as 0..=255.
+                fb.blend_coverage(x, y, (cov * 255.0).round() as u8, c);
+            }
+        }
+    }
+}
+
+/// Draw a 1px-ish line between two device-space points (Bresenham, `t`-px square brush) at `c`.
+/// Used for the checkbox check mark's two strokes.
+fn draw_line(fb: &mut Framebuffer, x0: f32, y0: f32, x1: f32, y1: f32, t: i32, c: Color) {
+    let t = t.max(1);
+    let (mut x0, mut y0) = (x0.round() as i32, y0.round() as i32);
+    let (x1, y1) = (x1.round() as i32, y1.round() as i32);
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        fb.fill_rect(Rect { x: x0 - t / 2, y: y0 - t / 2, w: t, h: t }, c);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/// Paint a drawn form widget into its (CSS-space) content rect, mapped through the affine. Widgets
+/// are primitive shapes only (no glyphs): a checkbox/radio, a range slider, a color swatch, or a
+/// progress/meter bar. Sized at layout-build time; here we just rasterize.
+fn paint_widget(
+    fb: &mut Framebuffer,
+    xf: &Affine,
+    content: layout::Rect,
+    kind: layout::WidgetKind,
+    opacity: f32,
+) {
+    let a = scale_alpha(255, opacity);
+    // Device-space content rect.
+    let r = xf_rect(xf, content.x, content.y, content.width, content.height);
+    if r.w <= 0 || r.h <= 0 {
+        return;
+    }
+    let border = Color { r: 118, g: 118, b: 118, a }; // #767676, the UA control border
+    match kind {
+        layout::WidgetKind::Checkbox { checked } => {
+            // A square box (centered in the content rect), white fill, gray border; a check mark
+            // (two strokes) when checked. The font lacks ☑/☐ so we draw it.
+            let s = r.w.min(r.h);
+            let bx = r.x + (r.w - s) / 2;
+            let by = r.y + (r.h - s) / 2;
+            let sq = Rect { x: bx, y: by, w: s, h: s };
+            fb.fill_round_rect(sq, 2.0, Color { r: 255, g: 255, b: 255, a });
+            stroke_rect(fb, sq, 1, border);
+            if checked {
+                // A blue-ish fill behind a white check, or just a dark check on white. We draw a
+                // filled accent box + white check for a clear "on" state.
+                let inset = (s as f32 * 0.0).max(0.0) as i32;
+                let acc = Rect { x: bx + inset, y: by + inset, w: s - 2 * inset, h: s - 2 * inset };
+                fb.fill_round_rect(acc, 2.0, Color { r: 36, g: 110, b: 230, a }); // accent blue
+                let fx = bx as f32;
+                let fy = by as f32;
+                let fs = s as f32;
+                let check = Color { r: 255, g: 255, b: 255, a };
+                let t = (fs / 7.0).round().clamp(1.0, 3.0) as i32;
+                // ✓ : down-stroke from (0.22,0.52) to (0.42,0.74), up-stroke to (0.78,0.28).
+                draw_line(fb, fx + fs * 0.24, fy + fs * 0.52, fx + fs * 0.43, fy + fs * 0.72, t, check);
+                draw_line(fb, fx + fs * 0.43, fy + fs * 0.72, fx + fs * 0.76, fy + fs * 0.30, t, check);
+            }
+        }
+        layout::WidgetKind::Radio { checked } => {
+            // A circle outline; a filled inner dot when checked.
+            let s = r.w.min(r.h);
+            let cx = r.x as f32 + r.w as f32 / 2.0;
+            let cy = r.y as f32 + r.h as f32 / 2.0;
+            let rad = s as f32 / 2.0;
+            fill_circle(fb, cx, cy, rad, Color { r: 255, g: 255, b: 255, a });
+            // Border ring: a slightly larger circle in border color, then the white re-fill.
+            fill_circle(fb, cx, cy, rad, border);
+            fill_circle(fb, cx, cy, (rad - 1.0).max(0.5), Color { r: 255, g: 255, b: 255, a });
+            if checked {
+                fill_circle(fb, cx, cy, (rad * 0.5).max(1.0), Color { r: 36, g: 110, b: 230, a });
+            }
+        }
+        layout::WidgetKind::Range { fraction } => {
+            // A thin rounded track centered vertically, with a circular thumb at `fraction`.
+            let track_h = (r.h / 4).max(3);
+            let ty = r.y + (r.h - track_h) / 2;
+            let pad = r.h / 2; // keep the thumb inside the box at the extremes
+            let track = Rect { x: r.x + pad, y: ty, w: (r.w - 2 * pad).max(1), h: track_h };
+            fb.fill_round_rect(track, track_h as f32 / 2.0, Color { r: 180, g: 180, b: 180, a });
+            // Filled (left) portion in the accent color.
+            let filled_w = (track.w as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
+            if filled_w > 0 {
+                fb.fill_round_rect(
+                    Rect { x: track.x, y: ty, w: filled_w, h: track_h },
+                    track_h as f32 / 2.0,
+                    Color { r: 36, g: 110, b: 230, a },
+                );
+            }
+            let thumb_cx = track.x as f32 + track.w as f32 * fraction.clamp(0.0, 1.0);
+            let thumb_cy = r.y as f32 + r.h as f32 / 2.0;
+            let thumb_r = (r.h as f32 / 2.0 - 1.0).max(3.0);
+            fill_circle(fb, thumb_cx, thumb_cy, thumb_r, Color { r: 240, g: 240, b: 240, a });
+            fill_circle(fb, thumb_cx, thumb_cy, thumb_r, border);
+            fill_circle(fb, thumb_cx, thumb_cy, (thumb_r - 1.0).max(1.0), Color { r: 245, g: 245, b: 245, a });
+        }
+        layout::WidgetKind::Color { rgb } => {
+            // A swatch filled with the chosen color, thin gray border (with a small inner inset so
+            // the color reads clearly).
+            stroke_rect(fb, r, 1, border);
+            let inner = Rect { x: r.x + 2, y: r.y + 2, w: (r.w - 4).max(1), h: (r.h - 4).max(1) };
+            fb.fill_rect(inner, Color { r: rgb.0, g: rgb.1, b: rgb.2, a });
+        }
+        layout::WidgetKind::Progress { fraction } => {
+            // A rounded track (light bg) with a blue filled portion = fraction. Indeterminate
+            // (None) → a fully filled track (a reasonable static stand-in for the animation).
+            let rad = (r.h as f32 / 2.0).min(6.0);
+            fb.fill_round_rect(r, rad, Color { r: 225, g: 225, b: 225, a });
+            stroke_rect(fb, r, 1, Color { r: 190, g: 190, b: 190, a });
+            let frac = fraction.unwrap_or(1.0).clamp(0.0, 1.0);
+            let fw = (r.w as f32 * frac).round() as i32;
+            if fw > 0 {
+                fb.fill_round_rect(Rect { x: r.x, y: r.y, w: fw, h: r.h }, rad, Color { r: 36, g: 110, b: 230, a });
+            }
+        }
+        layout::WidgetKind::Meter { fraction } => {
+            // Like progress but a greenish fill.
+            let rad = (r.h as f32 / 2.0).min(6.0);
+            fb.fill_round_rect(r, rad, Color { r: 225, g: 225, b: 225, a });
+            stroke_rect(fb, r, 1, Color { r: 190, g: 190, b: 190, a });
+            let fw = (r.w as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
+            if fw > 0 {
+                fb.fill_round_rect(Rect { x: r.x, y: r.y, w: fw, h: r.h }, rad, Color { r: 76, g: 174, b: 80, a });
+            }
+        }
     }
 }
 
@@ -4562,6 +4768,173 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Form-widget rendering -----------------------------------------------------------------
+
+    /// Load `html`, size the viewport, render, and return the engine (with a built layout cache).
+    #[cfg(test)]
+    fn load_rendered(html: &str, name: &str, w: u32, h: u32) -> Engine {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, html).unwrap();
+        let mut e = Engine::new();
+        e.set_viewport(w, h, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+        let _ = std::fs::remove_file(&path);
+        e
+    }
+
+    /// The (r,g,b) of the framebuffer pixel at device (x, y).
+    #[cfg(test)]
+    fn px_at(e: &Engine, x: i32, y: i32) -> (u8, u8, u8) {
+        let fb = e.framebuffer().unwrap();
+        let i = (y as u32 * fb.stride) as usize + (x as usize) * 4;
+        (fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2])
+    }
+
+    /// Count non-background pixels in a node's device rect (bg taken as the top-left page color).
+    #[cfg(test)]
+    fn painted_pixels_in(e: &Engine, r: layout::Rect) -> usize {
+        let fb = e.framebuffer().unwrap();
+        let bg = px_at(e, 1, 1);
+        let mut n = 0;
+        let x0 = (r.x.max(0.0)) as i32;
+        let y0 = (r.y.max(0.0)) as i32;
+        let x1 = ((r.x + r.width) as i32).min(fb.width as i32);
+        let y1 = ((r.y + r.height) as i32).min(fb.height as i32);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if px_at(e, x, y) != bg {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn range_renders_track_and_thumb_offset_by_value() {
+        // Two ranges: low value (thumb near left) vs high value (thumb near right). The thumb's
+        // horizontal centroid of painted pixels must move right as the value increases.
+        let html = "<html><body>\
+            <input id=lo type=range min=0 max=100 value=10>\
+            <input id=hi type=range min=0 max=100 value=90>\
+            </body></html>";
+        let e = load_rendered(html, "browser_range_test.html", 400, 200);
+        let centroid_x = |id: &str| -> f32 {
+            let n = e.node_by_attr_id(id).unwrap();
+            let r = e.node_device_rect(n).unwrap();
+            let fb = e.framebuffer().unwrap();
+            let bg = px_at(&e, 1, 1);
+            let (mut sum, mut cnt) = (0.0f32, 0.0f32);
+            for y in r.y as i32..(r.y + r.height) as i32 {
+                for x in r.x as i32..(r.x + r.width) as i32 {
+                    if x >= 0 && y >= 0 && x < fb.width as i32 && y < fb.height as i32 && px_at(&e, x, y) != bg {
+                        sum += x as f32;
+                        cnt += 1.0;
+                    }
+                }
+            }
+            assert!(cnt > 0.0, "range {id} painted nothing");
+            sum / cnt
+        };
+        let lo = centroid_x("lo");
+        let hi = centroid_x("hi");
+        assert!(hi > lo + 10.0, "thumb should move right with value: lo={lo}, hi={hi}");
+    }
+
+    #[test]
+    fn color_swatch_shows_the_value_color() {
+        let html = "<html><body><input id=c type=color value=\"#3366ff\"></body></html>";
+        let e = load_rendered(html, "browser_color_test.html", 200, 120);
+        let n = e.node_by_attr_id("c").unwrap();
+        let r = e.node_device_rect(n).unwrap();
+        // The swatch center should be ≈ #3366ff.
+        let (cr, cg, cb) = px_at(&e, (r.x + r.width / 2.0) as i32, (r.y + r.height / 2.0) as i32);
+        assert!(
+            (cr as i32 - 0x33).abs() < 24 && (cg as i32 - 0x66).abs() < 24 && (cb as i32 - 0xff).abs() < 24,
+            "swatch center {:?} should be ~#3366ff",
+            (cr, cg, cb)
+        );
+    }
+
+    #[test]
+    fn progress_and_meter_fill_proportionally() {
+        let html = "<html><body>\
+            <progress id=p value=0.6 max=1></progress><br>\
+            <meter id=m value=0.3 max=1></meter>\
+            </body></html>";
+        let e = load_rendered(html, "browser_bar_test.html", 400, 200);
+        // The filled portion (a darker/colored band starting at the left) must span ≈ value/max of
+        // the bar width. We measure the colored run on the bar's mid row.
+        let filled_frac = |id: &str, accent: (u8, u8, u8)| -> f32 {
+            let n = e.node_by_attr_id(id).unwrap();
+            let r = e.node_device_rect(n).unwrap();
+            let y = (r.y + r.height / 2.0) as i32;
+            let mut filled = 0;
+            for x in r.x as i32..(r.x + r.width) as i32 {
+                let (pr, pg, pb) = px_at(&e, x, y);
+                if (pr as i32 - accent.0 as i32).abs() < 40
+                    && (pg as i32 - accent.1 as i32).abs() < 40
+                    && (pb as i32 - accent.2 as i32).abs() < 40
+                {
+                    filled += 1;
+                }
+            }
+            filled as f32 / r.width
+        };
+        let pf = filled_frac("p", (36, 110, 230)); // progress: blue
+        let mf = filled_frac("m", (76, 174, 80)); // meter: green
+        assert!((pf - 0.6).abs() < 0.15, "progress fill {pf} should be ~0.6");
+        assert!((mf - 0.3).abs() < 0.15, "meter fill {mf} should be ~0.3");
+    }
+
+    #[test]
+    fn checkbox_paints_a_visible_box_that_differs_checked_vs_unchecked() {
+        let html = "<html><body>\
+            <input id=u type=checkbox>\
+            <input id=c type=checkbox checked>\
+            </body></html>";
+        let e = load_rendered(html, "browser_checkbox_paint_test.html", 200, 120);
+        let u = e.node_by_attr_id("u").unwrap();
+        let c = e.node_by_attr_id("c").unwrap();
+        let ur = e.node_device_rect(u).unwrap();
+        let cr = e.node_device_rect(c).unwrap();
+        // Both paint a visible box.
+        assert!(painted_pixels_in(&e, ur) > 0, "unchecked checkbox painted nothing");
+        assert!(painted_pixels_in(&e, cr) > 0, "checked checkbox painted nothing");
+        // The checked one (filled accent + check) has more painted/colored pixels than the empty one.
+        assert!(
+            painted_pixels_in(&e, cr) > painted_pixels_in(&e, ur),
+            "checked checkbox should differ (more fill) than unchecked"
+        );
+    }
+
+    #[test]
+    fn label_for_has_geometry_and_click_toggles_target() {
+        // A no-op <script> so the JS runtime/session exists (dispatch_click routes through it).
+        let html = "<html><body>\
+            <input id=cb type=checkbox>\
+            <label id=lbl for=cb>Toggle me</label>\
+            <script>/* keep a session alive */</script>\
+            </body></html>";
+        let mut e = load_rendered(html, "browser_label_for_test.html", 300, 120);
+        let lbl = e.node_by_attr_id("lbl").expect("label node");
+        // The label now lays out with a real, non-zero box (was 0x0 before).
+        let r = e.node_device_rect(lbl).expect("label laid out");
+        assert!(r.width > 0.0 && r.height > 0.0, "label should have a non-zero rect: {r:?}");
+
+        let cb = e.node_by_attr_id("cb").unwrap();
+        assert!(e.node_attr(cb, "checked").is_none(), "starts unchecked");
+        // Click the center of the label → the for= target checkbox toggles on.
+        let (lx, ly) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        assert!(e.dispatch_click(lx, ly), "clicking the label warrants a re-render");
+        let cb2 = e.node_by_attr_id("cb").unwrap();
+        assert!(
+            e.node_attr(cb2, "checked").is_some(),
+            "clicking <label for> should toggle the target checkbox"
+        );
     }
 
     #[test]
