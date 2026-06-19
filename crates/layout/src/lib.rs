@@ -77,17 +77,18 @@ pub struct PaintStyle {
     pub overline: bool,
     /// `vertical-align` (sub/super) for inline runs. Drives the painter's baseline shift.
     pub vertical_align: style::VerticalAlign,
+    /// `white-space` mode (collapse vs preserve spaces/newlines). Read by inline layout to decide
+    /// whether a text run's spaces are preserved and `\n`s are forced breaks.
+    pub white_space: style::WhiteSpace,
     /// Per-box opacity (0.0..=1.0); the painter multiplies painted alpha by this (and threads it
     /// to the subtree). 1.0 = fully opaque.
     pub opacity: f32,
-    /// Uniform corner radius (px) for the background/border (0 = square).
-    pub border_radius: f32,
     /// Extra px advance added per character (`letter-spacing`). Painter uses it to space glyphs.
     pub letter_spacing: f32,
     /// Resolved `line-height` in px (`None` = use the font metric). Drives inline line advance.
     pub line_height: Option<f32>,
-    /// Rarely-used paint features (gradients / shadows / transforms), boxed so the common box stays
-    /// small (one pointer) and allocates nothing — `None` = no gradient/shadow/transform.
+    /// Rarely-used paint features (gradients / shadows / transforms / border-radius), boxed so the
+    /// common box stays small (one pointer) and allocates nothing — `None` = none of them set.
     pub extras: Option<Box<PaintExtras>>,
 }
 
@@ -103,6 +104,9 @@ pub struct PaintExtras {
     pub transform: Option<[f32; 6]>,
     /// `transform-origin` as fractions of the box's own size (x, y); default (0.5, 0.5).
     pub transform_origin: (f32, f32),
+    /// Uniform corner radius (px) for the background/border (0 = square). Lives here (rather than on
+    /// the hot `PaintStyle`) to keep the per-box paint style small for deeply nested layouts.
+    pub border_radius: f32,
 }
 
 impl Default for PaintStyle {
@@ -118,12 +122,20 @@ impl Default for PaintStyle {
             line_through: false,
             overline: false,
             vertical_align: style::VerticalAlign::Baseline,
+            white_space: style::WhiteSpace::Normal,
             opacity: 1.0,
-            border_radius: 0.0,
             letter_spacing: 0.0,
             line_height: None,
             extras: None,
         }
+    }
+}
+
+impl PaintStyle {
+    /// The uniform corner radius (px); 0 when no `border-radius` is set (it lives in [`PaintExtras`]
+    /// to keep the common `PaintStyle` small).
+    pub fn border_radius(&self) -> f32 {
+        self.extras.as_deref().map(|e| e.border_radius).unwrap_or(0.0)
     }
 }
 
@@ -136,8 +148,17 @@ pub enum BoxContent {
     Inline,
     /// An anonymous box created to hold inline content / line boxes.
     Anonymous,
-    /// A run of laid-out text. The string is the (whitespace-collapsed) text to paint.
+    /// A run of laid-out text. The string is the text to paint. Normally whitespace-collapsed; under
+    /// `white-space: pre`/`pre-wrap` (per the box's `style.white_space`) spaces are preserved and the
+    /// run is treated atomically by line layout.
     Text(String),
+    /// A list-item marker (the bullet / number string for an `<li>`). Positioned by layout in the
+    /// list's left padding (to the left of the li content) and painted as text. `Box<str>` (16B,
+    /// not 24B) so this extra variant doesn't widen `BoxContent` past its niche-packed 24 bytes.
+    Marker(Box<str>),
+    /// A forced line break (`<br>`, or a preserved `\n` under `white-space: pre`). Carries no
+    /// glyphs; inline layout ends the current line box and starts a new one.
+    LineBreak,
     /// A replaced image box for the given DOM node. Sized from CSS width/height and/or the
     /// node's intrinsic size; the painter blits the decoded pixels into its content rect.
     Image(dom::NodeId),
@@ -574,20 +595,23 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         line_through: cs.line_through,
         overline: cs.overline,
         vertical_align: cs.vertical_align,
+        white_space: cs.white_space,
         opacity: cs.opacity,
-        border_radius: cs.border_radius,
         letter_spacing: cs.letter_spacing,
         line_height: cs.line_height,
-        // Only allocate the extras box when the element actually has a gradient/shadow/transform.
+        // Only allocate the extras box when the element actually has a gradient/shadow/transform/
+        // border-radius (all rare). border-radius lives here to keep the common PaintStyle small.
         extras: if cs.background_gradient.is_some()
             || !cs.box_shadows.is_empty()
             || cs.transform.is_some()
+            || cs.border_radius != 0.0
         {
             Some(Box::new(PaintExtras {
                 background_gradient: cs.background_gradient.clone(),
                 box_shadows: cs.box_shadows.clone(),
                 transform: cs.transform,
                 transform_origin: cs.transform_origin,
+                border_radius: cs.border_radius,
             }))
         } else {
             None
@@ -834,6 +858,15 @@ fn build_box(
     let node = doc.get(id);
     match &node.data {
         dom::NodeData::Text(text) => {
+            // Under `white-space: pre`/`pre-wrap` (inherited from the nearest element), spaces and
+            // newlines are PRESERVED: emitted as `Text` runs split by `LineBreak`s (helper keeps
+            // this recursive frame small). The runs carry `white_space` so inline layout doesn't
+            // re-collapse them.
+            let ws = nearest_element_white_space(doc, id, styles);
+            if ws.preserves_spaces() {
+                push_pre_text(doc, id, text, styles, out);
+                return;
+            }
             let collapsed = collapse_whitespace(text);
             if collapsed.is_empty() {
                 return;
@@ -857,6 +890,12 @@ fn build_box(
                 None => return,
             };
             if cs.display_none {
+                return;
+            }
+            // <br>: a forced line break. Emit a LineBreak box (inline-level, no glyphs); inline
+            // layout ends the current line and starts a new one when it sees it.
+            if el.tag.eq_ignore_ascii_case("br") {
+                out.push(LayoutBox::new(BoxContent::LineBreak, paint_style_of(cs), Some(id)));
                 return;
             }
             // Replaced elements (<img>) and form controls (<input>/<textarea>) build a dedicated
@@ -891,20 +930,20 @@ fn build_box(
                 style::Display::Block | style::Display::Flex | style::Display::Grid
             ) || (cs.display == style::Display::Inline && cs.display_block);
             let is_block = out_of_flow || block_display;
-            let ps = paint_style_of(cs);
             let content = if is_block { BoxContent::Block } else { BoxContent::Inline };
-            let mut bx = LayoutBox::new(content, ps, Some(id));
-            // Carry the box-model edges so layout can use them.
-            bx.dimensions.margin = edges_of(cs.margin);
-            bx.dimensions.padding = edges_of(cs.padding);
-            bx.dimensions.border = edges_of(cs.border);
-            // Generated content: a ::before box becomes the first child, ::after the last, around
-            // the element's real children.
+            // Build children FIRST (the deep recursion happens here) so this element's large
+            // `LayoutBox` is not alive on the stack during descent — keeps the recursive frame small.
             let mut children: Vec<LayoutBox> = Vec::new();
             if let Some(before) = &cs.before {
                 if let Some(b) = build_pseudo_box(id, before) {
                     children.push(b);
                 }
+            }
+            // List-item marker: a leading bullet/number box positioned in the list's left padding.
+            // Generated for `<li>` (decimal markers count `<li>` siblings) unless `list-style-type:
+            // none`. In an `#[inline(never)]` helper so this recursive frame stays small.
+            if el.tag.eq_ignore_ascii_case("li") {
+                push_li_marker(doc, id, cs, &mut children);
             }
             children.extend(build_children(doc, id, bx_ctx));
             if let Some(after) = &cs.after {
@@ -912,12 +951,96 @@ fn build_box(
                     children.push(b);
                 }
             }
+            // Assemble this element's box after recursion unwinds.
+            let mut bx = LayoutBox::new(content, paint_style_of(cs), Some(id));
+            bx.dimensions.margin = edges_of(cs.margin);
+            bx.dimensions.padding = edges_of(cs.padding);
+            bx.dimensions.border = edges_of(cs.border);
             bx.children = children;
             out.push(bx);
         }
         _ => {
             // Document / Comment nodes contribute nothing themselves, but a Document child
             // (shouldn't normally appear mid-tree) would have its children walked elsewhere.
+        }
+    }
+}
+
+/// Emit the boxes for a `white-space: pre`/`pre-wrap` text node: spaces are preserved and each
+/// source line becomes a `Text` run carrying `white_space` (so inline layout keeps it atomic), with
+/// a `LineBreak` between consecutive lines (so multi-line `<pre>` content renders on multiple lines,
+/// including blank lines). `#[inline(never)]` to keep the recursive box-builder frame small.
+#[inline(never)]
+fn push_pre_text(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    text: &str,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    out: &mut Vec<LayoutBox>,
+) {
+    let ps = nearest_element_style(doc, id, styles);
+    let transform = nearest_element_text_transform(doc, id, styles);
+    let mut lines = text.split('\n').peekable();
+    while let Some(seg) = lines.next() {
+        if !seg.is_empty() {
+            let rendered = apply_text_transform(seg, transform);
+            out.push(LayoutBox::new(BoxContent::Text(rendered), ps.clone(), Some(id)));
+        }
+        if lines.peek().is_some() {
+            out.push(LayoutBox::new(BoxContent::LineBreak, ps.clone(), Some(id)));
+        }
+    }
+}
+
+/// Generate an `<li>`'s marker box (bullet/number) and insert it as the first of `children`, unless
+/// the list-style-type is `none`. `#[inline(never)]` to keep the recursive box-builder frame small.
+#[inline(never)]
+fn push_li_marker(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    cs: &style::ComputedStyle,
+    children: &mut Vec<LayoutBox>,
+) {
+    if let Some(marker) = li_marker_text(doc, id, cs) {
+        let mut mps = paint_style_of(cs);
+        if mps.font_size <= 0.0 {
+            mps.font_size = 16.0;
+        }
+        children.insert(0, LayoutBox::new(BoxContent::Marker(marker.into()), mps, Some(id)));
+    }
+}
+
+/// Compute the marker string for an `<li>` from its computed `list-style-type` (inherited from the
+/// enclosing `ul`/`ol`). Bullet types render a glyph; `decimal` renders the 1-based ordinal of this
+/// `<li>` among its `<li>` siblings followed by a dot. `None` for `list-style-type: none`.
+fn li_marker_text(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    cs: &style::ComputedStyle,
+) -> Option<String> {
+    match cs.list_style_type {
+        style::ListStyleType::None => None,
+        style::ListStyleType::Disc => Some("\u{2022}".to_string()), // •
+        style::ListStyleType::Circle => Some("\u{25E6}".to_string()), // ◦
+        style::ListStyleType::Square => Some("\u{25AA}".to_string()), // ▪
+        style::ListStyleType::Decimal => {
+            let mut ordinal = 0usize;
+            if let Some(parent) = doc.get(id).parent {
+                for &sib in &doc.get(parent).children {
+                    if sib.0 >= doc.len() {
+                        continue;
+                    }
+                    if let dom::NodeData::Element(e) = &doc.get(sib).data {
+                        if e.tag.eq_ignore_ascii_case("li") {
+                            ordinal += 1;
+                            if sib == id {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(format!("{}.", ordinal.max(1)))
         }
     }
 }
@@ -937,6 +1060,26 @@ fn nearest_element_style(
         id = parent;
     }
     PaintStyle::default()
+}
+
+/// The `white-space` of the nearest element ancestor of node `id` (defaults to Normal). Resolved at
+/// box-build time so the inline layout never needs the document (it reads the box tree only).
+fn nearest_element_white_space(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> style::WhiteSpace {
+    if let Some(cs) = styles.get(&id) {
+        return cs.white_space;
+    }
+    let mut id = id;
+    while let Some(parent) = doc.get(id).parent {
+        if let Some(cs) = styles.get(&parent) {
+            return cs.white_space;
+        }
+        id = parent;
+    }
+    style::WhiteSpace::Normal
 }
 
 /// Find the `text-transform` of the nearest element ancestor of a text node (defaults to None).
@@ -1002,6 +1145,35 @@ fn collapse_whitespace(s: &str) -> String {
 // Block layout
 // ---------------------------------------------------------------------------------------------
 
+/// Remove a leading list-item `Marker` child from `boxx` (if present), boxed. `#[inline(never)]`
+/// so its locals don't enlarge the recursive `layout_block` stack frame.
+#[inline(never)]
+fn take_marker(boxx: &mut LayoutBox) -> Option<Box<LayoutBox>> {
+    if matches!(boxx.children.first().map(|c| &c.content), Some(BoxContent::Marker(_))) {
+        Some(Box::new(boxx.children.remove(0)))
+    } else {
+        None
+    }
+}
+
+/// Position a previously-extracted list-item marker `mb` to the LEFT of the box's content origin
+/// (`x`, `y`) — in the list's left padding — and re-insert it as the first child for painting.
+/// `#[inline(never)]` to keep `layout_block`'s frame small. The `mb` is taken boxed (despite
+/// clippy's `boxed_local`) deliberately: it's the boxed `Option<Box<LayoutBox>>` held in the
+/// deeply-recursive `layout_block` frame, so keeping it boxed avoids inflating that frame.
+#[inline(never)]
+#[allow(clippy::boxed_local)]
+fn place_marker(boxx: &mut LayoutBox, mut mb: Box<LayoutBox>, x: f32, y: f32, measurer: &dyn TextMeasurer) {
+    if let BoxContent::Marker(text) = &mb.content {
+        let fs = if mb.style.font_size > 0.0 { mb.style.font_size } else { 16.0 };
+        let mw = measurer.text_width(text, fs, mb.style.bold);
+        let gap = (fs * 0.5).max(4.0);
+        let lh = mb.style.line_height.unwrap_or_else(|| measurer.line_height(fs));
+        mb.dimensions.content = Rect { x: (x - mw - gap).max(0.0), y, width: mw, height: lh };
+    }
+    boxx.children.insert(0, *mb);
+}
+
 /// Lay out a block box (or anonymous/root block) given its containing block's content rect.
 /// Fills `boxx.dimensions.content` (position + width + height) and recurses. Dispatches to the
 /// flex / grid algorithm when this box establishes such a formatting context.
@@ -1036,6 +1208,11 @@ fn layout_block(
     let y = containing.y + margin.top + border.top + padding.top;
 
     boxx.dimensions.content = Rect { x, y, width: content_width, height: 0.0 };
+
+    // List-item marker: pull a leading `Marker` child out of normal flow so it doesn't flow into the
+    // content as a word. Positioned (in `place_marker`) once content height is known. Boxed +
+    // `#[inline(never)]` helpers so the recursive `layout_block` frame stays small.
+    let marker: Option<Box<LayoutBox>> = take_marker(boxx);
 
     // If this box is positioned (relative/absolute/fixed/sticky), it becomes the containing
     // block for its absolutely-positioned descendants. Update the context's `positioned` rect to
@@ -1077,6 +1254,11 @@ fn layout_block(
     // Clamp the used height to min-height / max-height (% against the containing block height).
     let final_height = clamp_height(boxx, final_height, containing.height, styles);
     boxx.dimensions.content.height = final_height;
+
+    // Position the list-item marker (if any) in the left padding, aligned with the first line.
+    if let Some(mb) = marker {
+        place_marker(boxx, mb, x, y, measurer);
+    }
 
     // Resolve any out-of-flow children now that this box's geometry (and thus the containing
     // block for absolutes) is known. `child_ctx.positioned` was captured before this box's height
@@ -2275,6 +2457,22 @@ fn layout_inline_children(
     let mut line_h = 0.0f32;
 
     for item in items {
+        // A forced break (`<br>` / preserved `\n`) ends the current line unconditionally and starts
+        // a fresh one — even when the line is empty (so consecutive breaks produce blank lines).
+        if let InlineItem::Break { font_size } = &item {
+            let h = if line_h > 0.0 { line_h } else { measurer.line_height(*font_size) };
+            let fs = if max_fs > 0.0 { max_fs } else { *font_size };
+            lines.push(PlacedLine {
+                items: std::mem::take(&mut cur),
+                width: cursor_x,
+                height: h,
+                max_font_size: fs,
+            });
+            cursor_x = 0.0;
+            max_fs = 0.0;
+            line_h = 0.0;
+            continue;
+        }
         let (w, fs, h, leads_space) = item.metrics(measurer);
         let space_w = if cur.is_empty() || !leads_space {
             0.0
@@ -2366,7 +2564,7 @@ fn layout_inline_children(
         };
         for (item, off) in &line.items {
             match item {
-                InlineItem::Word { text, style, node } => {
+                InlineItem::Word { text, style, node, .. } => {
                     match &mut run {
                         // Continue the current run only if the node matches.
                         Some(r) if r.node == *node => r.texts.push(text.clone()),
@@ -2380,6 +2578,10 @@ fn layout_inline_children(
                             });
                         }
                     }
+                }
+                InlineItem::Break { .. } => {
+                    // Breaks are consumed during line building and never placed onto a line.
+                    flush(&mut run, &mut new_children);
                 }
                 InlineItem::Atomic(b) => {
                     // An atomic box interrupts any word run.
@@ -2434,11 +2636,16 @@ struct InlineWord {
 
 /// An inline-level item participating in line layout: either a word or an atomic inline-block.
 enum InlineItem {
-    /// A word carrying the DOM node of its source text box (used for hit-testing).
-    Word { text: String, style: PaintStyle, node: Option<dom::NodeId> },
+    /// A word carrying the DOM node of its source text box (used for hit-testing). `leads_space` is
+    /// whether an inter-word space precedes it on a line (true for normal words; false for a
+    /// `white-space: pre` run, whose spaces are already inside `text`).
+    Word { text: String, style: PaintStyle, node: Option<dom::NodeId>, leads_space: bool },
     /// An atomic box (inline-block / inline-flex / inline-grid) already laid out at a tentative
     /// origin; it advances the pen by its margin-box width and is repositioned on its line.
     Atomic(Box<LayoutBox>),
+    /// A forced line break (`<br>` or a preserved `\n`): ends the current line box. `font_size` lets
+    /// an empty break line still advance by a sensible line height.
+    Break { font_size: f32 },
 }
 
 impl InlineItem {
@@ -2446,15 +2653,16 @@ impl InlineItem {
     /// preferred line advance: the element's computed `line-height` if set, else the font metric.
     fn metrics(&self, measurer: &dyn TextMeasurer) -> (f32, f32, f32, bool) {
         match self {
-            InlineItem::Word { text, style, .. } => {
+            InlineItem::Word { text, style, leads_space, .. } => {
                 let w = run_width(measurer, text, style.font_size, style.bold, style.letter_spacing);
                 let lh = style.line_height.unwrap_or_else(|| measurer.line_height(style.font_size));
-                (w, style.font_size, lh, true)
+                (w, style.font_size, lh, *leads_space)
             }
             InlineItem::Atomic(b) => {
                 let mb = b.dimensions.margin_box();
                 (mb.width, b.style.font_size, mb.height, false)
             }
+            InlineItem::Break { font_size } => (0.0, *font_size, measurer.line_height(*font_size), false),
         }
     }
 }
@@ -2504,13 +2712,31 @@ fn collect_inline_items(
                 // Carry the source text box's DOM node onto each word so emitted line `Text`
                 // boxes can be traced back to their element for hit-testing.
                 let node = child.node;
-                for word in text.split_whitespace() {
-                    out.push(InlineItem::Word {
-                        text: word.to_string(),
-                        style: child.style.clone(),
-                        node,
-                    });
+                if child.style.white_space.preserves_spaces() {
+                    // `white-space: pre`/`pre-wrap`: the run is atomic — spaces are PRESERVED (no
+                    // split) and no inter-word space precedes it (its spaces are inside `text`).
+                    // Newlines were already split into separate runs + `LineBreak`s at build time.
+                    if !text.is_empty() {
+                        out.push(InlineItem::Word {
+                            text: text.clone(),
+                            style: child.style.clone(),
+                            node,
+                            leads_space: false,
+                        });
+                    }
+                } else {
+                    for word in text.split_whitespace() {
+                        out.push(InlineItem::Word {
+                            text: word.to_string(),
+                            style: child.style.clone(),
+                            node,
+                            leads_space: true,
+                        });
+                    }
                 }
+            }
+            BoxContent::LineBreak => {
+                out.push(InlineItem::Break { font_size: child.style.font_size });
             }
             BoxContent::Inline => {
                 collect_inline_items(child.children, ctx, styles, measurer, out);
@@ -2601,6 +2827,141 @@ mod tests {
             n += count_boxes(c, pred);
         }
         n
+    }
+
+    /// Collect every Text box (DFS) into a flat list.
+    fn collect_text_box_list(b: &LayoutBox) -> Vec<&LayoutBox> {
+        let mut v = Vec::new();
+        fn go<'a>(b: &'a LayoutBox, v: &mut Vec<&'a LayoutBox>) {
+            if matches!(b.content, BoxContent::Text(_)) {
+                v.push(b);
+            }
+            for c in &b.children {
+                go(c, v);
+            }
+        }
+        go(b, &mut v);
+        v
+    }
+
+    #[test]
+    fn br_splits_text_onto_two_lines() {
+        // body > p > "first" <br> "second"
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("first".into()));
+        let br = doc.append_element(p, "br");
+        doc.append_child(p, dom::NodeData::Text("second".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(p, block_style(true));
+        // <br> is inline; the build path special-cases the tag, so any style works.
+        styles.insert(br, style::ComputedStyle::default());
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let texts = collect_text_box_list(&root_box);
+        let first = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "first")).unwrap();
+        let second = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "second")).unwrap();
+        // The <br> forces "second" onto the next line: strictly greater y.
+        assert!(
+            second.dimensions.content.y > first.dimensions.content.y,
+            "second.y={} should be below first.y={}",
+            second.dimensions.content.y,
+            first.dimensions.content.y
+        );
+        // And both start at the same x (left edge), confirming it's a line break, not a wrap mid-line.
+        assert_eq!(first.dimensions.content.x, second.dimensions.content.x);
+    }
+
+    #[test]
+    fn pre_preserves_spaces_and_newline() {
+        // body > pre  with text "a   b\nc": 3 spaces preserved, newline → two lines.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let pre = doc.append_element(body, "pre");
+        doc.append_child(pre, dom::NodeData::Text("a   b\nc".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            pre,
+            style::ComputedStyle {
+                display_block: true,
+                white_space: style::WhiteSpace::Pre,
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let texts = collect_text_box_list(&root_box);
+        // Two runs: "a   b" (line 1) and "c" (line 2).
+        let l1 = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "a   b")).expect("first pre line preserved with 3 spaces");
+        let l2 = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "c")).expect("second pre line after the newline");
+        // The newline put them on different lines.
+        assert!(l2.dimensions.content.y > l1.dimensions.content.y, "newline should drop 'c' to a new line");
+        // The first run's width reflects the preserved spaces: "a   b" = 5 chars at 0.6*16.
+        let expected = Stub.text_width("a   b", 16.0, false);
+        assert!((l1.dimensions.content.width - expected).abs() < 0.01, "width {} != {}", l1.dimensions.content.width, expected);
+    }
+
+    #[test]
+    fn ul_generates_bullet_markers_and_ol_numbers() {
+        // body > ul > li,li   and   body > ol > li,li
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let ul = doc.append_element(body, "ul");
+        let li1 = doc.append_element(ul, "li");
+        doc.append_child(li1, dom::NodeData::Text("one".into()));
+        let li2 = doc.append_element(ul, "li");
+        doc.append_child(li2, dom::NodeData::Text("two".into()));
+        let ol = doc.append_element(body, "ol");
+        let oli1 = doc.append_element(ol, "li");
+        doc.append_child(oli1, dom::NodeData::Text("x".into()));
+        let oli2 = doc.append_element(ol, "li");
+        doc.append_child(oli2, dom::NodeData::Text("y".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        // ul: disc markers; padding-left 40 like the UA sheet.
+        let mut ul_s = block_style(true);
+        ul_s.list_style_type = style::ListStyleType::Disc;
+        ul_s.padding = style::Edges { left: 40.0, ..Default::default() };
+        styles.insert(ul, ul_s);
+        // ol: decimal markers (li inherit list_style_type).
+        let mut ol_s = block_style(true);
+        ol_s.list_style_type = style::ListStyleType::Decimal;
+        ol_s.padding = style::Edges { left: 40.0, ..Default::default() };
+        styles.insert(ol, ol_s);
+        for (id, lst) in [(li1, style::ListStyleType::Disc), (li2, style::ListStyleType::Disc), (oli1, style::ListStyleType::Decimal), (oli2, style::ListStyleType::Decimal)] {
+            let mut s = block_style(true);
+            s.list_style_type = lst;
+            styles.insert(id, s);
+        }
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        // Collect markers.
+        fn markers(b: &LayoutBox, out: &mut Vec<String>) {
+            if let BoxContent::Marker(s) = &b.content {
+                out.push(s.to_string());
+            }
+            for c in &b.children {
+                markers(c, out);
+            }
+        }
+        let mut ms = Vec::new();
+        markers(&root_box, &mut ms);
+        // Two bullets (•) for the ul, then "1." and "2." for the ol.
+        assert!(ms.iter().filter(|m| *m == "\u{2022}").count() == 2, "expected two disc bullets, got {ms:?}");
+        assert!(ms.contains(&"1.".to_string()) && ms.contains(&"2.".to_string()), "expected 1. and 2. ol markers, got {ms:?}");
+        // The first ul li's marker sits to the LEFT of the li content (in the 40px padding).
+        let li1_box = find_box(&root_box, &|x| x.node == Some(li1) && matches!(x.content, BoxContent::Block)).unwrap();
+        let marker_box = find_box(&root_box, &|x| matches!(x.content, BoxContent::Marker(_)) && x.node == Some(li1)).unwrap();
+        assert!(marker_box.dimensions.content.x < li1_box.dimensions.content.x, "marker should be left of li content");
     }
 
     #[test]

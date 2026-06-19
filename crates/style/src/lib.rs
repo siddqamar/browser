@@ -219,6 +219,10 @@ pub struct ComputedStyle {
     pub text_transform: TextTransform,
     /// `letter-spacing` in px added per character (0 = normal). Inherits.
     pub letter_spacing: f32,
+    /// `white-space` processing mode (collapse vs preserve spaces/newlines). Inherits.
+    pub white_space: WhiteSpace,
+    /// `list-style-type` marker style for `display: list-item` boxes (`ul`/`ol`/`li`). Inherits.
+    pub list_style_type: ListStyleType,
 
     // --- Paint extras ---
     /// `text-decoration` underline flag. Inherits.
@@ -330,6 +334,48 @@ pub enum TextTransform {
     Capitalize,
 }
 
+/// CSS `white-space` processing mode. Inherits. Controls whitespace collapsing and whether the
+/// source newlines / spaces are preserved by layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WhiteSpace {
+    /// Collapse runs of whitespace to a single space; newlines are whitespace; wrap as needed.
+    #[default]
+    Normal,
+    /// Collapse whitespace but never wrap (single line).
+    Nowrap,
+    /// Preserve spaces and newlines; do NOT wrap (newlines are forced breaks).
+    Pre,
+    /// Preserve spaces and newlines; DO wrap long lines too.
+    PreWrap,
+}
+
+impl WhiteSpace {
+    /// Whether runs of spaces are preserved (not collapsed) under this mode.
+    pub fn preserves_spaces(self) -> bool {
+        matches!(self, WhiteSpace::Pre | WhiteSpace::PreWrap)
+    }
+    /// Whether `\n` in the source is a forced line break under this mode.
+    pub fn preserves_newlines(self) -> bool {
+        matches!(self, WhiteSpace::Pre | WhiteSpace::PreWrap)
+    }
+}
+
+/// CSS `list-style-type`: the marker drawn before a `display: list-item` box. Inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListStyleType {
+    /// A filled bullet `•` (the `ul` default).
+    #[default]
+    Disc,
+    /// A hollow bullet `◦`.
+    Circle,
+    /// A filled square `▪`.
+    Square,
+    /// `1.`, `2.`, `3.` … (the `ol` default).
+    Decimal,
+    /// No marker.
+    None,
+}
+
 /// A length that may be a fixed px value or a percentage of the containing block. Used for
 /// min/max sizing constraints so percentages can be resolved in layout (like `width`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -397,6 +443,8 @@ impl Default for ComputedStyle {
             line_height: None,
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
+            white_space: WhiteSpace::Normal,
+            list_style_type: ListStyleType::Disc,
             underline: false,
             line_through: false,
             overline: false,
@@ -517,6 +565,21 @@ impl ComputedStyle {
                 Some(v) => px(v),
                 None => "normal".to_string(),
             },
+            "white-space" => match self.white_space {
+                WhiteSpace::Normal => "normal",
+                WhiteSpace::Nowrap => "nowrap",
+                WhiteSpace::Pre => "pre",
+                WhiteSpace::PreWrap => "pre-wrap",
+            }
+            .to_string(),
+            "list-style-type" => match self.list_style_type {
+                ListStyleType::Disc => "disc",
+                ListStyleType::Circle => "circle",
+                ListStyleType::Square => "square",
+                ListStyleType::Decimal => "decimal",
+                ListStyleType::None => "none",
+            }
+            .to_string(),
             "text-decoration-line" | "text-decoration" => {
                 let mut parts = Vec::new();
                 if self.underline {
@@ -671,6 +734,8 @@ impl ComputedStyle {
             "text-transform",
             "letter-spacing",
             "line-height",
+            "white-space",
+            "list-style-type",
             "text-decoration",
             "text-decoration-line",
             "vertical-align",
@@ -1024,6 +1089,8 @@ fn compute_element_style<'a>(
         line_height: parent.line_height,
         text_transform: parent.text_transform,
         letter_spacing: parent.letter_spacing,
+        white_space: parent.white_space,
+        list_style_type: parent.list_style_type,
         underline: parent.underline,
         line_through: parent.line_through,
         overline: parent.overline,
@@ -2014,25 +2081,25 @@ fn apply_declaration(
 
         // --- Box model: margin ---
         "margin" => {
-            if let Some(e) = parse_edges_shorthand(val) {
+            if let Some(e) = parse_edges_shorthand(val, style.font_size) {
                 style.margin = e;
             }
         }
-        "margin-top" => set_edge(&mut style.margin, EdgeSide::Top, val),
-        "margin-right" => set_edge(&mut style.margin, EdgeSide::Right, val),
-        "margin-bottom" => set_edge(&mut style.margin, EdgeSide::Bottom, val),
-        "margin-left" => set_edge(&mut style.margin, EdgeSide::Left, val),
+        "margin-top" => set_edge(&mut style.margin, EdgeSide::Top, val, style.font_size),
+        "margin-right" => set_edge(&mut style.margin, EdgeSide::Right, val, style.font_size),
+        "margin-bottom" => set_edge(&mut style.margin, EdgeSide::Bottom, val, style.font_size),
+        "margin-left" => set_edge(&mut style.margin, EdgeSide::Left, val, style.font_size),
 
         // --- Box model: padding ---
         "padding" => {
-            if let Some(e) = parse_edges_shorthand(val) {
+            if let Some(e) = parse_edges_shorthand(val, style.font_size) {
                 style.padding = e;
             }
         }
-        "padding-top" => set_edge(&mut style.padding, EdgeSide::Top, val),
-        "padding-right" => set_edge(&mut style.padding, EdgeSide::Right, val),
-        "padding-bottom" => set_edge(&mut style.padding, EdgeSide::Bottom, val),
-        "padding-left" => set_edge(&mut style.padding, EdgeSide::Left, val),
+        "padding-top" => set_edge(&mut style.padding, EdgeSide::Top, val, style.font_size),
+        "padding-right" => set_edge(&mut style.padding, EdgeSide::Right, val, style.font_size),
+        "padding-bottom" => set_edge(&mut style.padding, EdgeSide::Bottom, val, style.font_size),
+        "padding-left" => set_edge(&mut style.padding, EdgeSide::Left, val, style.font_size),
 
         // --- Box model: border ---
         "border" => apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color),
@@ -2041,14 +2108,14 @@ fn apply_declaration(
         "border-bottom" => apply_border_shorthand(style, val, EdgeSide::Bottom, current_color, inherited_color),
         "border-left" => apply_border_shorthand(style, val, EdgeSide::Left, current_color, inherited_color),
         "border-width" => {
-            if let Some(e) = parse_edges_shorthand(val) {
+            if let Some(e) = parse_edges_shorthand(val, style.font_size) {
                 style.border = e;
             }
         }
-        "border-top-width" => set_edge(&mut style.border, EdgeSide::Top, val),
-        "border-right-width" => set_edge(&mut style.border, EdgeSide::Right, val),
-        "border-bottom-width" => set_edge(&mut style.border, EdgeSide::Bottom, val),
-        "border-left-width" => set_edge(&mut style.border, EdgeSide::Left, val),
+        "border-top-width" => set_edge(&mut style.border, EdgeSide::Top, val, style.font_size),
+        "border-right-width" => set_edge(&mut style.border, EdgeSide::Right, val, style.font_size),
+        "border-bottom-width" => set_edge(&mut style.border, EdgeSide::Bottom, val, style.font_size),
+        "border-left-width" => set_edge(&mut style.border, EdgeSide::Left, val, style.font_size),
         "border-color" => {
             if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.border_color = c;
@@ -2136,6 +2203,30 @@ fn apply_declaration(
                 style.letter_spacing = 0.0;
             } else if let Some(px) = parse_length(val) {
                 style.letter_spacing = px;
+            }
+        }
+        "white-space" => match val.trim().to_ascii_lowercase().as_str() {
+            "normal" => style.white_space = WhiteSpace::Normal,
+            "nowrap" => style.white_space = WhiteSpace::Nowrap,
+            "pre" => style.white_space = WhiteSpace::Pre,
+            "pre-wrap" => style.white_space = WhiteSpace::PreWrap,
+            // `pre-line` collapses spaces but keeps newlines; approximate as Normal for now.
+            _ => {}
+        },
+        // `list-style-type` (and the `list-style` shorthand, from which we pull the type token).
+        "list-style-type" => {
+            if let Some(t) = parse_list_style_type(val) {
+                style.list_style_type = t;
+            }
+        }
+        "list-style" => {
+            // Shorthand: list-style: <type> || <position> || <image>. We only model the type;
+            // pull the first token that names a known type (or `none`).
+            for tok in val.split_whitespace() {
+                if let Some(t) = parse_list_style_type(tok) {
+                    style.list_style_type = t;
+                    break;
+                }
             }
         }
 
@@ -2308,7 +2399,7 @@ fn parse_pair(val: &str) -> Option<(Option<f32>, Option<f32>)> {
 fn parse_edge_pair(val: &str) -> Option<(f32, f32)> {
     let parts: Vec<f32> = val
         .split_whitespace()
-        .map(|t| parse_edge_length(t).unwrap_or(0.0))
+        .map(|t| parse_edge_length(t, 16.0).unwrap_or(0.0))
         .collect();
     match parts.len() {
         1 => Some((parts[0], parts[0])),
@@ -3115,17 +3206,36 @@ fn has_math_func(value: &str) -> bool {
         || lower.contains("clamp(")
 }
 
+/// Parse a single `list-style-type` keyword into a [`ListStyleType`] (None for unknown tokens).
+fn parse_list_style_type(val: &str) -> Option<ListStyleType> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "disc" => Some(ListStyleType::Disc),
+        "circle" => Some(ListStyleType::Circle),
+        "square" => Some(ListStyleType::Square),
+        "decimal" => Some(ListStyleType::Decimal),
+        "none" => Some(ListStyleType::None),
+        _ => None,
+    }
+}
+
 /// Parse a CSS length to px. Accepts `Npx`, `Npt` (×4/3), and bare numbers (px). `auto`,
 /// percentages, and unparseable values yield `None`. `0` (unitless) yields `Some(0)`.
 /// Length math functions (`calc`/`min`/`max`/`clamp`) are evaluated via [`eval_length`] (with a
 /// default 16px font size for `em`, since this parser has no element context).
 fn parse_length(val: &str) -> Option<f32> {
+    parse_length_fs(val, 16.0)
+}
+
+/// Like [`parse_length`] but resolves `em` against the supplied element `font_size` (CSS px). The
+/// non-em paths are identical. Used for box-model edges (margin/padding), where the UA sheet uses
+/// `em` values that must scale with each element's font size (e.g. `h1 { margin: 0.67em 0 }`).
+fn parse_length_fs(val: &str, font_size: f32) -> Option<f32> {
     let v = val.trim().to_ascii_lowercase();
     if v.is_empty() || v == "auto" {
         return None;
     }
     if has_math_func(&v) {
-        return eval_length(&v, 16.0);
+        return eval_length(&v, font_size);
     }
     if v.ends_with('%') {
         return None; // percentages unsupported for now
@@ -3138,18 +3248,16 @@ fn parse_length(val: &str) -> Option<f32> {
     } else if let Some(em) = num("rem") {
         Some(em * 16.0)
     } else if let Some(em) = num("em") {
-        // em is relative to the element's own font size; we don't thread that here, so approximate
-        // against the 16px default base. Without this, `.15em` borders / `0.5em` padding collapsed
-        // to 0 (e.g. browserscore.dev's fieldset card borders were invisible).
-        Some(em * 16.0)
+        // em resolves against the element's own font size.
+        Some(em * font_size)
     } else {
         v.parse::<f32>().ok()
     }
 }
 
-/// Parse a length for an *edge* (margin/padding/border-width). Like [`parse_length`] but
-/// `auto` → 0 (margin auto is not supported; treated as 0). Unparseable → `None` (leave as-is).
-fn parse_edge_length(val: &str) -> Option<f32> {
+/// Parse a length for an *edge* (margin/padding/border-width), resolving `em` against `font_size`.
+/// Like [`parse_length_fs`] but `auto`/`none` → 0. Unparseable → `None` (leave as-is).
+fn parse_edge_length(val: &str, font_size: f32) -> Option<f32> {
     let v = val.trim().to_ascii_lowercase();
     if v == "auto" {
         return Some(0.0); // limitation: margin/padding `auto` collapses to 0
@@ -3157,12 +3265,13 @@ fn parse_edge_length(val: &str) -> Option<f32> {
     if v == "none" {
         return Some(0.0);
     }
-    parse_length(val)
+    parse_length_fs(val, font_size)
 }
 
-/// Set one side of an `Edges` from a single length value (ignored if unparseable).
-fn set_edge(edges: &mut Edges, side: EdgeSide, val: &str) {
-    if let Some(px) = parse_edge_length(val) {
+/// Set one side of an `Edges` from a single length value (ignored if unparseable). `em` resolves
+/// against `font_size`.
+fn set_edge(edges: &mut Edges, side: EdgeSide, val: &str, font_size: f32) {
+    if let Some(px) = parse_edge_length(val, font_size) {
         match side {
             EdgeSide::Top => edges.top = px,
             EdgeSide::Right => edges.right = px,
@@ -3176,10 +3285,10 @@ fn set_edge(edges: &mut Edges, side: EdgeSide, val: &str) {
 /// Parse a `margin`/`padding`/`border-width` shorthand of 1–4 values.
 /// CSS order: `all` / `vert horiz` / `top horiz bottom` / `top right bottom left`.
 /// Returns `None` if no token parsed (leaves the existing value untouched).
-fn parse_edges_shorthand(val: &str) -> Option<Edges> {
+fn parse_edges_shorthand(val: &str, font_size: f32) -> Option<Edges> {
     let parts: Vec<f32> = val
         .split_whitespace()
-        .map(|t| parse_edge_length(t).unwrap_or(0.0))
+        .map(|t| parse_edge_length(t, font_size).unwrap_or(0.0))
         .collect();
     match parts.len() {
         1 => Some(Edges::all(parts[0])),
@@ -4675,13 +4784,13 @@ fn user_agent_stylesheet() -> css::Stylesheet {
     css::parse(
         "html { color: #d8d8d8; font-size: 16px }
          body { color: #d8d8d8; font-size: 16px }
-         h1 { font-size: 32px; font-weight: bold; display: block }
-         h2 { font-size: 26px; font-weight: bold; display: block }
-         h3 { font-size: 20px; font-weight: bold; display: block }
-         h4 { font-size: 17px; font-weight: bold; display: block }
-         h5 { font-size: 15px; font-weight: bold; display: block }
-         h6 { font-size: 13px; font-weight: bold; display: block }
-         p { display: block }
+         h1 { font-size: 32px; font-weight: bold; display: block; margin: 0.67em 0 }
+         h2 { font-size: 26px; font-weight: bold; display: block; margin: 0.83em 0 }
+         h3 { font-size: 20px; font-weight: bold; display: block; margin: 1em 0 }
+         h4 { font-size: 17px; font-weight: bold; display: block; margin: 1.33em 0 }
+         h5 { font-size: 15px; font-weight: bold; display: block; margin: 1.67em 0 }
+         h6 { font-size: 13px; font-weight: bold; display: block; margin: 2.33em 0 }
+         p { display: block; margin: 1em 0 }
          div { display: block }
          section { display: block }
          article { display: block }
@@ -4690,25 +4799,25 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          nav { display: block }
          main { display: block }
          aside { display: block }
-         ul { display: block }
-         ol { display: block }
+         ul { display: block; margin: 1em 0; padding-left: 40px; list-style-type: disc }
+         ol { display: block; margin: 1em 0; padding-left: 40px; list-style-type: decimal }
          li { display: block }
-         blockquote { display: block }
-         pre { display: block }
+         blockquote { display: block; margin: 1em 40px }
+         pre { display: block; margin: 1em 0; white-space: pre }
          table { display: block }
          tr { display: block }
          details { display: block }
          summary { display: block }
-         figure { display: block }
+         figure { display: block; margin: 1em 40px }
          figcaption { display: block }
          fieldset { display: block }
          legend { display: block }
          form { display: block }
-         dl { display: block }
+         dl { display: block; margin: 1em 0 }
          dt { display: block }
-         dd { display: block }
+         dd { display: block; margin-left: 40px }
          address { display: block }
-         hr { display: block }
+         hr { display: block; margin: 0.5em 0; height: 1px; background-color: #888888; border-top: 1px solid #888888 }
          caption { display: block }
          details:not([open]) > :not(summary) { display: none }
          summary::before { content: \"\\25B8 \" }
@@ -4933,6 +5042,65 @@ mod tests {
     }
 
     #[test]
+    fn ua_default_p_margin_is_one_em() {
+        // The UA sheet gives <p> `margin: 1em 0`; with the default 16px font that's 16px top/bottom.
+        let doc = html::parse("<html><body><p>x</p></body></html>");
+        let map = cascade(&doc, &[]);
+        let p = elem(&doc, |e| e.tag == "p");
+        let s = &map[&p];
+        assert_eq!(s.margin.top, 16.0, "p margin-top should be 1em = 16px");
+        assert_eq!(s.margin.bottom, 16.0);
+        assert_eq!(s.margin.left, 0.0);
+        // getComputedStyle string form.
+        assert_eq!(s.get_property("margin-top"), "16px");
+    }
+
+    #[test]
+    fn ua_em_margin_scales_with_heading_font_size() {
+        // h1 has font-size 32px and `margin: 0.67em 0` → 0.67 * 32 ≈ 21.44px (resolved against the
+        // element's OWN font size, not the 16px default).
+        let doc = html::parse("<html><body><h1>Hi</h1></body></html>");
+        let map = cascade(&doc, &[]);
+        let h1 = elem(&doc, |e| e.tag == "h1");
+        let mt = map[&h1].margin.top;
+        assert!((mt - 0.67 * 32.0).abs() < 0.01, "h1 margin-top {mt} should be 0.67em of 32px");
+    }
+
+    #[test]
+    fn ua_ul_padding_and_list_style_and_pre_white_space() {
+        let doc = html::parse(
+            "<html><body><ul><li>a</li></ul><ol><li>b</li></ol><pre>code</pre></body></html>",
+        );
+        let map = cascade(&doc, &[]);
+        let ul = elem(&doc, |e| e.tag == "ul");
+        assert_eq!(map[&ul].padding.left, 40.0, "ul padding-left 40px");
+        assert_eq!(map[&ul].list_style_type, ListStyleType::Disc);
+        let ol = elem(&doc, |e| e.tag == "ol");
+        assert_eq!(map[&ol].list_style_type, ListStyleType::Decimal);
+        let pre = elem(&doc, |e| e.tag == "pre");
+        assert_eq!(map[&pre].white_space, WhiteSpace::Pre);
+        assert_eq!(map[&pre].get_property("white-space"), "pre");
+    }
+
+    #[test]
+    fn ua_hr_has_height_and_background() {
+        let doc = html::parse("<html><body><hr></body></html>");
+        let map = cascade(&doc, &[]);
+        let hr = elem(&doc, |e| e.tag == "hr");
+        let s = &map[&hr];
+        assert_eq!(s.height, Some(1.0), "hr should have a 1px height so it paints");
+        assert!(s.background_color.is_some(), "hr should have a visible background fill");
+    }
+
+    #[test]
+    fn white_space_pre_parses() {
+        let doc = html::parse(r#"<html><body><span style="white-space: pre">x</span></body></html>"#);
+        let map = cascade(&doc, &[]);
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&span].white_space, WhiteSpace::Pre);
+    }
+
+    #[test]
     fn id_beats_class_beats_type() {
         let sheet = css::parse(
             "p { color: red } .c { color: green } #x { color: blue }",
@@ -5020,14 +5188,14 @@ mod tests {
 
     #[test]
     fn margin_shorthand_one_value() {
-        assert_eq!(parse_edges_shorthand("10px"), Some(Edges::all(10.0)));
+        assert_eq!(parse_edges_shorthand("10px", 16.0), Some(Edges::all(10.0)));
     }
 
     #[test]
     fn margin_shorthand_two_values() {
         // vertical horizontal
         assert_eq!(
-            parse_edges_shorthand("10px 20px"),
+            parse_edges_shorthand("10px 20px", 16.0),
             Some(Edges { top: 10.0, bottom: 10.0, right: 20.0, left: 20.0 })
         );
     }
@@ -5036,7 +5204,7 @@ mod tests {
     fn margin_shorthand_four_values() {
         // top right bottom left
         assert_eq!(
-            parse_edges_shorthand("1px 2px 3px 4px"),
+            parse_edges_shorthand("1px 2px 3px 4px", 16.0),
             Some(Edges { top: 1.0, right: 2.0, bottom: 3.0, left: 4.0 })
         );
     }

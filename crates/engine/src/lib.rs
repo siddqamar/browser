@@ -2322,7 +2322,7 @@ fn paint_box_opacity(
 
     let border = b.dimensions.border_box();
     let content = b.dimensions.content;
-    let radius = b.style.border_radius;
+    let radius = b.style.border_radius();
     let extras = b.style.extras.as_deref();
 
     // Fast-path: the common no-transform box keeps the incoming affine. A CSS `transform` composes
@@ -2478,6 +2478,22 @@ fn paint_box_opacity(
                         fb.fill_rect(Rect { x: x.round() as i32, y: oy, w: run_w.round() as i32, h: thickness }, color);
                     }
                 }
+            }
+        }
+
+        // (c1b) List-item marker: a bullet/number drawn like a text run at the marker's content
+        // origin (positioned by layout in the list's left padding). No selection handling.
+        if let layout::BoxContent::Marker(s) = &b.content {
+            let (dx, dy) = xf.apply(content.x, content.y);
+            if dy < clip_bottom && !s.is_empty() {
+                let sx = (xf.a * xf.a + xf.b * xf.b).sqrt();
+                let sy = (xf.c * xf.c + xf.d * xf.d).sqrt();
+                let scale = ((sx + sy) * 0.5).max(0.01);
+                let fs = b.style.font_size * scale;
+                let ta = scale_alpha(255, opacity);
+                let color = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ta };
+                let baseline = dy + fs * 0.8;
+                draw_run(fb, font, s, dx, baseline, fs, color, b.style.bold, b.style.letter_spacing * scale);
             }
         }
 
@@ -4331,6 +4347,40 @@ mod tests {
                 fb.pixels[i..i + 3].to_vec()
             })
             .collect()
+    }
+
+    #[test]
+    fn hr_paints_a_visible_horizontal_rule() {
+        // An <hr> gets a UA height + gray background, so it must paint a horizontal band of
+        // non-background (gray ~#888) pixels. Backgrounds paint without a font (deterministic in CI).
+        let html = "<html><body><hr></body></html>";
+        let path = std::env::temp_dir().join("browser_hr_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 200, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let fb = e.render();
+
+        // Scan rows for a row that is mostly gray (~136 per channel, the #888 rule).
+        let mut found_band = false;
+        for y in 0..fb.height {
+            let mut gray = 0u32;
+            for x in 0..fb.width {
+                let i = (y * fb.stride) as usize + (x as usize) * 4;
+                let (r, g, b) = (fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]);
+                if (r as i32 - 136).abs() < 30 && (g as i32 - 136).abs() < 30 && (b as i32 - 136).abs() < 30 {
+                    gray += 1;
+                }
+            }
+            // A real rule spans most of the width.
+            if gray > fb.width / 2 {
+                found_band = true;
+                break;
+            }
+        }
+        assert!(found_band, "expected a horizontal band of gray rule pixels for <hr>");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
