@@ -2392,6 +2392,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webdriver"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "engine",
+ "image",
+]
+
+[[package]]
 name = "webpki-roots"
 version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

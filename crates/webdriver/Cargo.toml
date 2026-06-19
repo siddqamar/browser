@@ -1,0 +1,10 @@
+[package]
+name = "webdriver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+base64 = "0.22"
+image = "0.25"

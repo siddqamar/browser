@@ -4843,9 +4843,11 @@ fn start_session(
     let (entries, module_sources, mod_notes) = collect_module_graph(&doc, base);
     notes.extend(mod_notes);
 
-    if classic.is_empty() && entries.is_empty() {
-        return (None, doc, notes);
-    }
+    // Note: we previously short-circuited to `(None, …)` when a page had no scripts. That left
+    // script-less pages with no live JS runtime, so `console_eval` / WebDriver script execution
+    // (and any later runtime DOM query) returned "(no live page)". A real browser always exposes a
+    // scriptable document, so we now start a session even with zero author scripts — the cost is one
+    // idle isolate, and it makes `Engine::console_eval` work on every loaded HTML page.
 
     let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
         net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())

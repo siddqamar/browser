@@ -12,6 +12,7 @@ members = [
     "crates/engine",
     "crates/ffi",
     "crates/wpt-runner",
+    "crates/webdriver",
 ]
 
 [workspace.package]
