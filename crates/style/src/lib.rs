@@ -39,6 +39,24 @@ pub enum Display {
     InlineFlex,
     Grid,
     InlineGrid,
+    /// `display: table` — establishes a table formatting context (a grid of rows/cells).
+    Table,
+    /// `display: table-row` (`<tr>`).
+    TableRow,
+    /// `display: table-cell` (`<td>`/`<th>`).
+    TableCell,
+    /// `display: table-row-group` (`<tbody>`).
+    TableRowGroup,
+    /// `display: table-header-group` (`<thead>`).
+    TableHeaderGroup,
+    /// `display: table-footer-group` (`<tfoot>`).
+    TableFooterGroup,
+    /// `display: table-caption` (`<caption>`).
+    TableCaption,
+    /// `display: table-column` (`<col>`).
+    TableColumn,
+    /// `display: table-column-group` (`<colgroup>`).
+    TableColumnGroup,
 }
 
 /// CSS `position`.
@@ -515,6 +533,15 @@ impl ComputedStyle {
                 Display::InlineFlex => "inline-flex",
                 Display::Grid => "grid",
                 Display::InlineGrid => "inline-grid",
+                Display::Table => "table",
+                Display::TableRow => "table-row",
+                Display::TableCell => "table-cell",
+                Display::TableRowGroup => "table-row-group",
+                Display::TableHeaderGroup => "table-header-group",
+                Display::TableFooterGroup => "table-footer-group",
+                Display::TableCaption => "table-caption",
+                Display::TableColumn => "table-column",
+                Display::TableColumnGroup => "table-column-group",
             }
             .to_string(),
             "position" => match self.position {
@@ -1938,6 +1965,15 @@ fn apply_declaration(
             "inline-flex" => style.display = Display::InlineFlex,
             "grid" => style.display = Display::Grid,
             "inline-grid" => style.display = Display::InlineGrid,
+            "table" => style.display = Display::Table,
+            "table-row" => style.display = Display::TableRow,
+            "table-cell" => style.display = Display::TableCell,
+            "table-row-group" => style.display = Display::TableRowGroup,
+            "table-header-group" => style.display = Display::TableHeaderGroup,
+            "table-footer-group" => style.display = Display::TableFooterGroup,
+            "table-caption" => style.display = Display::TableCaption,
+            "table-column" => style.display = Display::TableColumn,
+            "table-column-group" => style.display = Display::TableColumnGroup,
             _ => {}
         },
         "position" => match val.trim().to_ascii_lowercase().as_str() {
@@ -4804,8 +4840,15 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          li { display: block }
          blockquote { display: block; margin: 1em 40px }
          pre { display: block; margin: 1em 0; white-space: pre }
-         table { display: block }
-         tr { display: block }
+         table { display: table }
+         tr { display: table-row }
+         td, th { display: table-cell; padding: 1px }
+         th { font-weight: bold; text-align: center }
+         thead { display: table-header-group }
+         tbody { display: table-row-group }
+         tfoot { display: table-footer-group }
+         colgroup { display: table-column-group }
+         col { display: table-column }
          details { display: block }
          summary { display: block }
          figure { display: block; margin: 1em 40px }
@@ -4818,7 +4861,7 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          dd { display: block; margin-left: 40px }
          address { display: block }
          hr { display: block; margin: 0.5em 0; height: 1px; background-color: #888888; border-top: 1px solid #888888 }
-         caption { display: block }
+         caption { display: table-caption }
          details:not([open]) > :not(summary) { display: none }
          summary::before { content: \"\\25B8 \" }
          details[open] > summary::before { content: \"\\25BE \" }
@@ -5263,6 +5306,39 @@ mod tests {
         let map = cascade(&doc, &[sheet]);
         let d = elem(&doc, |e| e.tag == "div");
         assert_eq!(map[&d].border, Edges::all(0.0));
+    }
+
+    #[test]
+    fn ua_table_display_values() {
+        // The UA stylesheet maps table tags to their table-* display values, and styles <th>.
+        let doc = html::parse(
+            r#"<html><body><table>
+                <caption>Cap</caption>
+                <thead><tr><th>H</th></tr></thead>
+                <tbody><tr><td>D</td></tr></tbody>
+                <tfoot><tr><td>F</td></tr></tfoot>
+                <colgroup><col></colgroup>
+            </table></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let d = |tag: &str| map[&elem(&doc, |e| e.tag == tag)].display;
+        assert_eq!(d("table"), Display::Table);
+        assert_eq!(d("tr"), Display::TableRow);
+        assert_eq!(d("td"), Display::TableCell);
+        assert_eq!(d("th"), Display::TableCell);
+        assert_eq!(d("thead"), Display::TableHeaderGroup);
+        assert_eq!(d("tbody"), Display::TableRowGroup);
+        assert_eq!(d("tfoot"), Display::TableFooterGroup);
+        assert_eq!(d("caption"), Display::TableCaption);
+        assert_eq!(d("colgroup"), Display::TableColumnGroup);
+        assert_eq!(d("col"), Display::TableColumn);
+        // <th> defaults: bold + centered + 1px padding (the cells get a little padding).
+        let th = map[&elem(&doc, |e| e.tag == "th")].clone();
+        assert!(th.bold, "th should be bold");
+        assert_eq!(th.text_align, TextAlign::Center);
+        assert_eq!(th.padding, Edges::all(1.0));
+        // getComputedStyle reports the table display string.
+        assert_eq!(map[&elem(&doc, |e| e.tag == "table")].get_property("display"), "table");
     }
 
     #[test]
