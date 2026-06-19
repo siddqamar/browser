@@ -229,6 +229,18 @@ pub struct ComputedStyle {
     pub opacity: f32,
     /// Uniform `border-radius` in px (0 = square corners). Not inherited.
     pub border_radius: f32,
+    /// A `background-image` gradient (linear/radial), if any. `None` = no gradient. Painted as the
+    /// box's background fill (over any solid `background-color`). Not inherited.
+    pub background_gradient: Option<Gradient>,
+    /// `box-shadow` layers (outer + inset), painted back-to-front. Empty = none. Not inherited.
+    pub box_shadows: Vec<BoxShadow>,
+    /// A composed 2D affine `transform` `[a b c d e f]` (maps (x,y)→(a*x+c*y+e, b*x+d*y+f)),
+    /// expressed in the box's local coordinate space *before* origin adjustment. `None` = identity
+    /// (no transform). A paint-time remap only; does not affect layout. Not inherited.
+    pub transform: Option<[f32; 6]>,
+    /// `transform-origin` as fractions of the box's own size (x, y); default (0.5, 0.5). Used to
+    /// pivot the `transform`. Not inherited.
+    pub transform_origin: (f32, f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +248,54 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// An RGBA color used by gradients and shadows (where alpha is significant, unlike the opaque
+/// `(u8,u8,u8)` used elsewhere). Channels are 0..=255.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// A resolved gradient color stop: a color and its position as a 0..1 fraction of the gradient
+/// line (distributed evenly when the author omits positions).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradientStop {
+    pub color: Rgba,
+    /// Position along the gradient line, 0.0..=1.0.
+    pub pos: f32,
+}
+
+/// A `background-image` gradient. Simplifications: `radial-gradient` is always a centered circle
+/// whose radius is the box's half-diagonal (size keywords and `at <position>` are ignored);
+/// `repeating-linear-gradient` is treated as a plain `linear-gradient`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Gradient {
+    /// A linear gradient. `angle_deg` follows the CSS convention: 0deg = to top, 90deg = to
+    /// right, 180deg = to bottom. Stops are sorted by `pos` ascending, each in 0..=1.
+    Linear { angle_deg: f32, stops: Vec<GradientStop> },
+    /// A radial gradient (centered circle, half-diagonal radius). Stops sorted by `pos`.
+    Radial { stops: Vec<GradientStop> },
+}
+
+/// A single `box-shadow` layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxShadow {
+    /// Inner (`inset`) shadow vs outer (default).
+    pub inset: bool,
+    /// Horizontal offset (px).
+    pub dx: f32,
+    /// Vertical offset (px).
+    pub dy: f32,
+    /// Blur radius (px); 0 = hard edge.
+    pub blur: f32,
+    /// Spread radius (px); inflates (outer) / deflates (inset) the rect.
+    pub spread: f32,
+    /// Shadow color (rgba).
+    pub color: Rgba,
 }
 
 /// CSS `text-transform`. Inherits.
@@ -318,6 +378,10 @@ impl Default for ComputedStyle {
             line_through: false,
             opacity: 1.0,
             border_radius: 0.0,
+            background_gradient: None,
+            box_shadows: Vec::new(),
+            transform: None,
+            transform_origin: (0.5, 0.5),
         }
     }
 }
@@ -583,6 +647,10 @@ fn compute_element_style<'a>(
         // Paint extras: opacity & border-radius are not inherited.
         opacity: 1.0,
         border_radius: 0.0,
+        background_gradient: None,
+        box_shadows: Vec::new(),
+        transform: None,
+        transform_origin: (0.5, 0.5),
     };
     if parent_hidden {
         style.display_none = true;
@@ -1246,11 +1314,39 @@ fn apply_declaration(
             }
         }
         "background-color" | "background" => {
-            // For `background`, only attempt a solid-color interpretation; gradients/images
-            // and `transparent`/`none` leave the background unchanged (None stays None).
-            if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
+            // First try a gradient (works for the `background` shorthand and `background-image`).
+            if let Some(g) = parse_gradient(val, current_color, inherited_color) {
+                style.background_gradient = Some(g);
+            } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
+                // Solid color interpretation; `transparent`/`none` leave it unchanged.
                 style.background_color = Some(c);
             }
+        }
+        "background-image" => {
+            if let Some(g) = parse_gradient(val, current_color, inherited_color) {
+                style.background_gradient = Some(g);
+            } else if val.trim().eq_ignore_ascii_case("none") {
+                style.background_gradient = None;
+            }
+        }
+        "box-shadow" => {
+            let shadows = parse_box_shadows(val, current_color, inherited_color);
+            if val.trim().eq_ignore_ascii_case("none") {
+                style.box_shadows.clear();
+            } else if !shadows.is_empty() {
+                style.box_shadows = shadows;
+            }
+        }
+        "transform" => {
+            let v = val.trim();
+            if v.eq_ignore_ascii_case("none") {
+                style.transform = None;
+            } else if let Some(m) = parse_transform(v) {
+                style.transform = Some(m);
+            }
+        }
+        "transform-origin" => {
+            style.transform_origin = parse_transform_origin(val);
         }
         "font-size" => {
             if let Some(sz) = parse_font_size(val, parent.font_size) {
@@ -1709,6 +1805,496 @@ fn parse_border_radius(val: &str) -> Option<f32> {
     parse_length(first).map(|r| r.max(0.0))
 }
 
+/// Split `s` on top-level commas (not inside parens). Returns trimmed non-empty parts.
+fn split_top_commas(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                let p: String = chars[start..i].iter().collect();
+                let p = p.trim();
+                if !p.is_empty() {
+                    parts.push(p.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let p: String = chars[start..].iter().collect();
+    let p = p.trim();
+    if !p.is_empty() {
+        parts.push(p.to_string());
+    }
+    parts
+}
+
+/// Parse an angle token (`90deg`, `0.5turn`, `1.57rad`, bare number=deg) to degrees.
+fn parse_angle_deg(tok: &str) -> Option<f32> {
+    let t = tok.trim().to_ascii_lowercase();
+    if let Some(n) = t.strip_suffix("deg") {
+        n.trim().parse::<f32>().ok()
+    } else if let Some(n) = t.strip_suffix("grad") {
+        n.trim().parse::<f32>().ok().map(|x| x * 0.9)
+    } else if let Some(n) = t.strip_suffix("rad") {
+        n.trim().parse::<f32>().ok().map(|x| x.to_degrees())
+    } else if let Some(n) = t.strip_suffix("turn") {
+        n.trim().parse::<f32>().ok().map(|x| x * 360.0)
+    } else {
+        t.parse::<f32>().ok()
+    }
+}
+
+/// Parse a `linear-gradient(...)` / `radial-gradient(...)` (incl. `repeating-*`) value into a
+/// [`Gradient`], or `None` if the value isn't a recognized gradient. Color stops without an
+/// explicit position are distributed evenly between their neighbors (0..1). Stop positions
+/// expressed as `%` resolve directly; `px` lengths are resolved as a fraction of an assumed
+/// 200px gradient line (best-effort, since the real line length isn't known until paint).
+fn parse_gradient(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) -> Option<Gradient> {
+    let v = val.trim();
+    let lower = v.to_ascii_lowercase();
+    let (is_radial, body) = if let Some(rest) = strip_func(&lower, v, "linear-gradient") {
+        (false, rest)
+    } else if let Some(rest) = strip_func(&lower, v, "repeating-linear-gradient") {
+        (false, rest)
+    } else if let Some(rest) = strip_func(&lower, v, "radial-gradient") {
+        (true, rest)
+    } else if let Some(rest) = strip_func(&lower, v, "repeating-radial-gradient") {
+        (true, rest)
+    } else {
+        return None;
+    };
+
+    let mut parts = split_top_commas(body);
+    if parts.is_empty() {
+        return None;
+    }
+
+    // The first part may be a direction/angle (linear) or a shape/size/position prelude (radial)
+    // rather than a color stop. Detect by checking whether it parses as a color stop.
+    let mut angle_deg = 180.0_f32; // default: to bottom
+    let first_lower = parts[0].to_ascii_lowercase();
+    let first_is_prelude = if is_radial {
+        // Radial prelude starts with a shape/size keyword or `at`.
+        first_lower.starts_with("at ")
+            || first_lower.contains(" at ")
+            || first_lower.starts_with("circle")
+            || first_lower.starts_with("ellipse")
+            || first_lower.contains("closest")
+            || first_lower.contains("farthest")
+    } else {
+        first_lower.starts_with("to ") || parse_angle_deg(&first_lower).is_some()
+    };
+    if first_is_prelude {
+        if !is_radial {
+            angle_deg = parse_linear_direction(&first_lower).unwrap_or(180.0);
+        }
+        parts.remove(0);
+    }
+
+    let mut stops: Vec<GradientStop> = Vec::new();
+    // Parse each "color [pos]" stop; remember which positions were explicit for distribution.
+    let mut explicit: Vec<Option<f32>> = Vec::new();
+    for part in &parts {
+        // Split the color from a trailing position. The color may contain spaces (rgb( ... )),
+        // so split off a trailing token only if it looks like a position (ends with % or a unit).
+        let (color_str, pos) = split_stop(part);
+        let color = parse_rgba_ctx(color_str, current, inherited)?;
+        stops.push(GradientStop { color, pos: 0.0 });
+        explicit.push(pos);
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+
+    // Distribute positions: clamp to 0..1, default ends to 0 and 1, interpolate gaps.
+    let n = stops.len();
+    if explicit[0].is_none() {
+        explicit[0] = Some(0.0);
+    }
+    if explicit[n - 1].is_none() {
+        explicit[n - 1] = Some(1.0);
+    }
+    let mut i = 0;
+    while i < n {
+        if explicit[i].is_some() {
+            i += 1;
+            continue;
+        }
+        // Find the next explicit stop.
+        let prev = explicit[i - 1].unwrap();
+        let mut j = i;
+        while j < n && explicit[j].is_none() {
+            j += 1;
+        }
+        let next = explicit[j].unwrap();
+        let gap = (j - (i - 1)) as f32;
+        for k in i..j {
+            let frac = (k - (i - 1)) as f32 / gap;
+            explicit[k] = Some(prev + (next - prev) * frac);
+        }
+        i = j;
+    }
+    for (s, p) in stops.iter_mut().zip(explicit.iter()) {
+        s.pos = p.unwrap().clamp(0.0, 1.0);
+    }
+    // Ensure non-decreasing positions.
+    for k in 1..n {
+        if stops[k].pos < stops[k - 1].pos {
+            stops[k].pos = stops[k - 1].pos;
+        }
+    }
+
+    if is_radial {
+        Some(Gradient::Radial { stops })
+    } else {
+        Some(Gradient::Linear { angle_deg, stops })
+    }
+}
+
+/// If `lower` (the lowercased value) starts with `name(` and `v` ends with `)`, return the inner
+/// body (from the original-case `v`). Else `None`.
+fn strip_func<'a>(lower: &str, v: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}(");
+    if lower.starts_with(&prefix) && v.ends_with(')') {
+        Some(&v[prefix.len()..v.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Parse a linear-gradient direction (`to right`, `to top left`, or an angle) into degrees in the
+/// CSS convention (0=to top, 90=to right, 180=to bottom, 270=to left).
+fn parse_linear_direction(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("to ") {
+        let mut to_top = false;
+        let mut to_bottom = false;
+        let mut to_left = false;
+        let mut to_right = false;
+        for kw in rest.split_whitespace() {
+            match kw {
+                "top" => to_top = true,
+                "bottom" => to_bottom = true,
+                "left" => to_left = true,
+                "right" => to_right = true,
+                _ => {}
+            }
+        }
+        let deg = match (to_top, to_bottom, to_left, to_right) {
+            (true, _, false, false) => 0.0,
+            (false, true, false, false) => 180.0,
+            (false, false, true, false) => 270.0,
+            (false, false, false, true) => 90.0,
+            (true, _, false, true) => 45.0,
+            (true, _, true, false) => 315.0,
+            (false, true, false, true) => 135.0,
+            (false, true, true, false) => 225.0,
+            _ => 180.0,
+        };
+        return Some(deg);
+    }
+    parse_angle_deg(s)
+}
+
+/// Split a gradient color-stop into `(color_str, Option<position 0..1>)`. The position is the
+/// trailing token if it ends with `%` or a length unit; `%` resolves directly, `px` against an
+/// assumed 200px line.
+fn split_stop(part: &str) -> (&str, Option<f32>) {
+    let trimmed = part.trim();
+    // Find the last whitespace-delimited token.
+    if let Some(idx) = trimmed.rfind(char::is_whitespace) {
+        let last = trimmed[idx + 1..].trim();
+        let pos = if let Some(p) = last.strip_suffix('%') {
+            p.trim().parse::<f32>().ok().map(|x| x / 100.0)
+        } else if last.ends_with("px") || last.ends_with("rem") || last.ends_with("em") {
+            parse_length(last).map(|px| px / 200.0)
+        } else {
+            None
+        };
+        if pos.is_some() {
+            return (trimmed[..idx].trim(), pos);
+        }
+    }
+    (trimmed, None)
+}
+
+/// Parse a `box-shadow` value (comma-separated list) into [`BoxShadow`] layers. Each layer is
+/// `[inset]? <dx> <dy> [<blur>] [<spread>] [<color>]`. Color defaults to `current` (currentColor).
+/// Returns an empty vec if nothing parsed.
+fn parse_box_shadows(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) -> Vec<BoxShadow> {
+    let v = val.trim();
+    if v.eq_ignore_ascii_case("none") || v.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for layer in split_top_commas(v) {
+        let mut inset = false;
+        let mut lengths: Vec<f32> = Vec::new();
+        let mut color: Option<Rgba> = None;
+        // Tokenize respecting parens (so `rgba(0,0,0,.5)` stays one token).
+        for tok in tokenize_paren_aware(&layer) {
+            let tl = tok.to_ascii_lowercase();
+            if tl == "inset" {
+                inset = true;
+                continue;
+            }
+            if lengths.len() < 4 {
+                if let Some(px) = parse_length(&tok) {
+                    lengths.push(px);
+                    continue;
+                }
+            }
+            if color.is_none() {
+                if let Some(c) = parse_rgba_ctx(&tok, current, inherited) {
+                    color = Some(c);
+                    continue;
+                }
+            }
+        }
+        if lengths.len() < 2 {
+            continue; // need at least dx, dy
+        }
+        out.push(BoxShadow {
+            inset,
+            dx: lengths[0],
+            dy: lengths[1],
+            blur: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+            spread: lengths.get(3).copied().unwrap_or(0.0),
+            color: color.unwrap_or(Rgba { r: current.0, g: current.1, b: current.2, a: 255 }),
+        });
+    }
+    out
+}
+
+/// Tokenize a value on whitespace, keeping balanced parens together (so functional colors with
+/// internal spaces/commas survive as one token).
+fn tokenize_paren_aware(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut in_tok = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() && depth == 0 {
+            if in_tok {
+                out.push(chars[start..i].iter().collect());
+                in_tok = false;
+            }
+        } else {
+            if !in_tok {
+                start = i;
+                in_tok = true;
+            }
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth = (depth - 1).max(0);
+            }
+        }
+        i += 1;
+    }
+    if in_tok {
+        out.push(chars[start..].iter().collect());
+    }
+    out
+}
+
+/// Parse a `transform` value (a space-separated list of functions) into a composed 2D affine
+/// `[a b c d e f]` (column-major-ish: x'=a*x+c*y+e, y'=b*x+d*y+f). Supported: `translate`,
+/// `translateX`/`Y`, `scale`/`X`/`Y`, `rotate`, `matrix`. `skewX`/`skewY` are best-effort
+/// (applied as shear); unknown functions are skipped. Percentages in `translate` are left as 0
+/// here and resolved at paint time against the box size — see [`transform_translate_pct`].
+/// Returns `None` if no function parsed (so the caller leaves transform unset).
+fn parse_transform(val: &str) -> Option<[f32; 6]> {
+    let v = val.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut m = IDENTITY;
+    let mut any = false;
+    for (name, args) in transform_functions(v) {
+        let nums: Vec<f32> = split_top_commas(&args)
+            .iter()
+            .filter_map(|a| transform_arg(a))
+            .collect();
+        let t = match name.as_str() {
+            "translate" => {
+                let x = nums.first().copied().unwrap_or(0.0);
+                let y = nums.get(1).copied().unwrap_or(0.0);
+                [1.0, 0.0, 0.0, 1.0, x, y]
+            }
+            "translatex" => [1.0, 0.0, 0.0, 1.0, nums.first().copied().unwrap_or(0.0), 0.0],
+            "translatey" => [1.0, 0.0, 0.0, 1.0, 0.0, nums.first().copied().unwrap_or(0.0)],
+            "scale" => {
+                let sx = nums.first().copied().unwrap_or(1.0);
+                let sy = nums.get(1).copied().unwrap_or(sx);
+                [sx, 0.0, 0.0, sy, 0.0, 0.0]
+            }
+            "scalex" => [nums.first().copied().unwrap_or(1.0), 0.0, 0.0, 1.0, 0.0, 0.0],
+            "scaley" => [1.0, 0.0, 0.0, nums.first().copied().unwrap_or(1.0), 0.0, 0.0],
+            "rotate" => {
+                let deg = parse_angle_deg(&args).unwrap_or(0.0);
+                let r = deg.to_radians();
+                [r.cos(), r.sin(), -r.sin(), r.cos(), 0.0, 0.0]
+            }
+            "skewx" => {
+                let deg = parse_angle_deg(&args).unwrap_or(0.0);
+                [1.0, 0.0, deg.to_radians().tan(), 1.0, 0.0, 0.0]
+            }
+            "skewy" => {
+                let deg = parse_angle_deg(&args).unwrap_or(0.0);
+                [1.0, deg.to_radians().tan(), 0.0, 1.0, 0.0, 0.0]
+            }
+            "matrix" => {
+                if nums.len() == 6 {
+                    [nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]]
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        m = mat_mul(m, t);
+        any = true;
+    }
+    if any { Some(m) } else { None }
+}
+
+/// The 2D-affine identity.
+const IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// Multiply two affines `a` then `b` applied as `a * b` (apply `b` first, then `a`), matching CSS
+/// left-to-right function composition (first listed transform is outermost).
+fn mat_mul(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+    // a = [a0 a2 a4; a1 a3 a5], b similarly. result = a · b (3x3 augmented).
+    [
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    ]
+}
+
+/// Parse a `transform` argument to px/number (`deg`/etc. handled by callers; `%` → left as 0,
+/// since the real basis is the box size, resolved at paint).
+fn transform_arg(a: &str) -> Option<f32> {
+    let t = a.trim();
+    if t.ends_with('%') {
+        return Some(0.0); // percentage translate resolved at paint time (approx: ignore here)
+    }
+    parse_length(t).or_else(|| t.parse::<f32>().ok())
+}
+
+/// Split a transform value into `(function_name_lowercased, args_string)` pairs.
+fn transform_functions(s: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ',') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < chars.len() && chars[i] != '(' {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let name: String = chars[name_start..i].iter().collect::<String>().trim().to_ascii_lowercase();
+        i += 1; // skip '('
+        let args_start = i;
+        let mut depth = 1i32;
+        while i < chars.len() && depth > 0 {
+            match chars[i] {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+            i += 1;
+        }
+        let args: String = chars[args_start..i].iter().collect();
+        i += 1; // skip ')'
+        if !name.is_empty() {
+            out.push((name, args));
+        }
+    }
+    out
+}
+
+/// Parse `transform-origin` into (x, y) fractions of the box size. Supports keywords
+/// (`left`/`right`/`top`/`bottom`/`center`) and percentages; px values are approximated as a
+/// fraction of an assumed 200px box (best-effort). Default (0.5, 0.5).
+fn parse_transform_origin(val: &str) -> (f32, f32) {
+    let toks: Vec<String> = val.split_whitespace().map(|t| t.to_ascii_lowercase()).collect();
+    let mut x = 0.5;
+    let mut y = 0.5;
+    let resolve = |t: &str, _horizontal: bool| -> Option<f32> {
+        match t {
+            "left" | "top" => Some(0.0),
+            "right" | "bottom" => Some(1.0),
+            "center" => Some(0.5),
+            _ => {
+                if let Some(p) = t.strip_suffix('%') {
+                    p.trim().parse::<f32>().ok().map(|v| v / 100.0)
+                } else {
+                    parse_length(t).map(|px| px / 200.0)
+                }
+            }
+        }
+    };
+    // Keywords can appear in either order; handle the common 1-2 token forms positionally,
+    // promoting vertical keywords to y.
+    match toks.len() {
+        1 => {
+            let t = &toks[0];
+            if t == "top" || t == "bottom" {
+                if let Some(v) = resolve(t, false) {
+                    y = v;
+                }
+            } else if let Some(v) = resolve(t, true) {
+                x = v;
+            }
+        }
+        n if n >= 2 => {
+            // Detect swapped order (e.g. "top left").
+            let (a, b) = (&toks[0], &toks[1]);
+            let a_vert = a == "top" || a == "bottom";
+            let b_horiz = b == "left" || b == "right";
+            if a_vert && b_horiz {
+                if let Some(v) = resolve(a, false) {
+                    y = v;
+                }
+                if let Some(v) = resolve(b, true) {
+                    x = v;
+                }
+            } else {
+                if let Some(v) = resolve(a, true) {
+                    x = v;
+                }
+                if let Some(v) = resolve(b, false) {
+                    y = v;
+                }
+            }
+        }
+        _ => {}
+    }
+    (x, y)
+}
+
 /// Which side(s) of a box a value targets.
 #[derive(Clone, Copy)]
 enum EdgeSide {
@@ -2157,6 +2743,93 @@ fn parse_color_ctx(
 #[cfg(test)]
 fn parse_color(val: &str) -> Option<(u8, u8, u8)> {
     parse_color_ctx(val, (0, 0, 0), (0, 0, 0))
+}
+
+/// Parse a color into [`Rgba`], preserving alpha (unlike [`parse_color_ctx`] which drops it).
+/// Handles `transparent` (→ alpha 0), `#rgba`/`#rrggbbaa` hex alpha, and the `/ alpha` or
+/// 4th-component alpha of `rgba()`/`hsla()`. `currentColor` resolves to `current` (opaque).
+/// Used by gradients and box-shadows where alpha matters. Returns `None` if unrecognized.
+fn parse_rgba_ctx(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) -> Option<Rgba> {
+    let v = val.trim();
+    let lower = v.to_ascii_lowercase();
+    match lower.as_str() {
+        "currentcolor" => return Some(Rgba { r: current.0, g: current.1, b: current.2, a: 255 }),
+        "inherit" => return Some(Rgba { r: inherited.0, g: inherited.1, b: inherited.2, a: 255 }),
+        "transparent" => return Some(Rgba { r: 0, g: 0, b: 0, a: 0 }),
+        "initial" | "unset" | "none" | "revert" => return None,
+        _ => {}
+    }
+    if let Some(hex) = v.strip_prefix('#') {
+        return parse_hex_alpha(hex);
+    }
+    // Functional form: extract alpha from the args, then defer the rgb to parse_color_function.
+    if let Some(open) = v.find('(') {
+        if v.ends_with(')') {
+            let func = v[..open].trim().to_ascii_lowercase();
+            let inner = &v[open + 1..v.len() - 1];
+            let (r, g, b) = parse_color_function(&func, inner)?;
+            let alpha = parse_func_alpha(inner).unwrap_or(255);
+            return Some(Rgba { r, g, b, a: alpha });
+        }
+    }
+    parse_named_color(&lower).map(|(r, g, b)| Rgba { r, g, b, a: 255 })
+}
+
+/// Extract the alpha byte from a functional color's argument body (between the parens). Looks for
+/// either a `/ <alpha>` segment or a 4th comma/space-separated component. `None` if no alpha.
+fn parse_func_alpha(inner: &str) -> Option<u8> {
+    // `/ alpha` form (modern syntax).
+    if let Some(slash) = inner.split('/').nth(1) {
+        return alpha_to_u8(slash.trim());
+    }
+    // Legacy 4-component form: rgba(r,g,b,a) / hsla(h,s,l,a).
+    let toks: Vec<&str> = inner
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if toks.len() >= 4 {
+        return alpha_to_u8(toks[3]);
+    }
+    None
+}
+
+/// Parse an alpha token (`0.5`, `50%`, `1`) into a 0..=255 byte.
+fn alpha_to_u8(tok: &str) -> Option<u8> {
+    let t = tok.trim();
+    let f = if let Some(p) = t.strip_suffix('%') {
+        p.trim().parse::<f32>().ok()? / 100.0
+    } else {
+        t.parse::<f32>().ok()?
+    };
+    Some((f.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// Parse a hex color preserving alpha (`#rgba`/`#rrggbbaa` carry alpha; `#rgb`/`#rrggbb` → opaque).
+fn parse_hex_alpha(hex: &str) -> Option<Rgba> {
+    let h = hex.trim();
+    let hx = |s: &str| u8::from_str_radix(s, 16).ok();
+    match h.len() {
+        3 => {
+            let (r, g, b) = parse_hex(h)?;
+            Some(Rgba { r, g, b, a: 255 })
+        }
+        4 => {
+            let (r, g, b) = parse_hex(&h[0..3])?;
+            let a = hx(&h[3..4])?;
+            Some(Rgba { r, g, b, a: a * 17 })
+        }
+        6 => {
+            let (r, g, b) = parse_hex(h)?;
+            Some(Rgba { r, g, b, a: 255 })
+        }
+        8 => {
+            let (r, g, b) = parse_hex(&h[0..6])?;
+            let a = hx(&h[6..8])?;
+            Some(Rgba { r, g, b, a })
+        }
+        _ => None,
+    }
 }
 
 /// Parse a functional color body (the text between the parens), given the lowercased function
@@ -3402,6 +4075,161 @@ mod tests {
             None
         }
         walk(doc, doc.root(), &tag_and_pred).expect("element not found")
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Gradient / box-shadow / transform value parsing
+    // ------------------------------------------------------------------------------------------
+
+    fn grad(val: &str) -> Gradient {
+        parse_gradient(val, (0, 0, 0), (0, 0, 0)).expect("expected a gradient")
+    }
+
+    #[test]
+    fn linear_gradient_angle_two_stops() {
+        match grad("linear-gradient(90deg, red, blue)") {
+            Gradient::Linear { angle_deg, stops } => {
+                assert_eq!(angle_deg, 90.0);
+                assert_eq!(stops.len(), 2);
+                assert!((stops[0].pos - 0.0).abs() < 1e-6);
+                assert!((stops[1].pos - 1.0).abs() < 1e-6);
+                assert_eq!(stops[0].color, Rgba { r: 255, g: 0, b: 0, a: 255 });
+                assert_eq!(stops[1].color, Rgba { r: 0, g: 0, b: 255, a: 255 });
+            }
+            _ => panic!("expected linear"),
+        }
+    }
+
+    #[test]
+    fn linear_gradient_to_right_with_percent_stops() {
+        match grad("linear-gradient(to right, #fff 0%, #000 100%)") {
+            Gradient::Linear { angle_deg, stops } => {
+                assert_eq!(angle_deg, 90.0); // to right == 90deg
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0].color, Rgba { r: 255, g: 255, b: 255, a: 255 });
+                assert!((stops[0].pos - 0.0).abs() < 1e-6);
+                assert!((stops[1].pos - 1.0).abs() < 1e-6);
+            }
+            _ => panic!("expected linear"),
+        }
+    }
+
+    #[test]
+    fn linear_gradient_distributes_three_unpositioned_stops() {
+        match grad("linear-gradient(red, green, blue)") {
+            Gradient::Linear { stops, .. } => {
+                assert_eq!(stops.len(), 3);
+                assert!((stops[0].pos - 0.0).abs() < 1e-6);
+                assert!((stops[1].pos - 0.5).abs() < 1e-6);
+                assert!((stops[2].pos - 1.0).abs() < 1e-6);
+            }
+            _ => panic!("expected linear"),
+        }
+    }
+
+    #[test]
+    fn radial_gradient_parses() {
+        match grad("radial-gradient(red, blue)") {
+            Gradient::Radial { stops } => {
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0].color, Rgba { r: 255, g: 0, b: 0, a: 255 });
+            }
+            _ => panic!("expected radial"),
+        }
+    }
+
+    #[test]
+    fn repeating_linear_treated_as_linear() {
+        assert!(matches!(grad("repeating-linear-gradient(0deg, red, blue)"), Gradient::Linear { .. }));
+    }
+
+    #[test]
+    fn box_shadow_single_with_rgba() {
+        let s = parse_box_shadows("2px 4px 8px rgba(0,0,0,.5)", (0, 0, 0), (0, 0, 0));
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].dx, 2.0);
+        assert_eq!(s[0].dy, 4.0);
+        assert_eq!(s[0].blur, 8.0);
+        assert_eq!(s[0].spread, 0.0);
+        assert!(!s[0].inset);
+        assert_eq!(s[0].color.a, 128);
+    }
+
+    #[test]
+    fn box_shadow_two_layers() {
+        let s = parse_box_shadows("2px 2px 4px black, 0 0 10px red", (0, 0, 0), (0, 0, 0));
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[1].blur, 10.0);
+        assert_eq!(s[1].color, Rgba { r: 255, g: 0, b: 0, a: 255 });
+    }
+
+    #[test]
+    fn box_shadow_inset_with_spread() {
+        let s = parse_box_shadows("inset 1px 2px 3px 4px #000", (0, 0, 0), (0, 0, 0));
+        assert_eq!(s.len(), 1);
+        assert!(s[0].inset);
+        assert_eq!(s[0].spread, 4.0);
+    }
+
+    #[test]
+    fn transform_translate_scale_composes() {
+        let m = parse_transform("translate(10px, 20px) scale(2)").expect("matrix");
+        // Composed: first translate then scale (translate outermost). Apply to origin (0,0):
+        // result = T * S * (0,0) = (10, 20). Apply to (1,1): T*S = scale then translate.
+        // x' = a*x + c*y + e = 2*1 + 0 + 10 = 12; y' = b*x + d*y + f = 0 + 2*1 + 20 = 22.
+        assert_eq!(m[0], 2.0); // a (scale x)
+        assert_eq!(m[3], 2.0); // d (scale y)
+        assert_eq!(m[4], 10.0); // e
+        assert_eq!(m[5], 20.0); // f
+    }
+
+    #[test]
+    fn transform_rotate_90_matrix() {
+        let m = parse_transform("rotate(90deg)").expect("matrix");
+        // rotate(90deg): cos=0, sin=1 → [0, 1, -1, 0, 0, 0].
+        assert!((m[0] - 0.0).abs() < 1e-5, "a={}", m[0]);
+        assert!((m[1] - 1.0).abs() < 1e-5, "b={}", m[1]);
+        assert!((m[2] - (-1.0)).abs() < 1e-5, "c={}", m[2]);
+        assert!((m[3] - 0.0).abs() < 1e-5, "d={}", m[3]);
+    }
+
+    #[test]
+    fn transform_matrix_passthrough() {
+        let m = parse_transform("matrix(1,2,3,4,5,6)").expect("matrix");
+        assert_eq!(m, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn transform_origin_top_left() {
+        assert_eq!(parse_transform_origin("top left"), (0.0, 0.0));
+        assert_eq!(parse_transform_origin("left top"), (0.0, 0.0));
+        assert_eq!(parse_transform_origin("bottom right"), (1.0, 1.0));
+        assert_eq!(parse_transform_origin("center"), (0.5, 0.5));
+        assert_eq!(parse_transform_origin("50% 50%"), (0.5, 0.5));
+    }
+
+    #[test]
+    fn gradient_applied_via_cascade_background() {
+        let doc = html::parse(
+            r#"<html><body><div style="background: linear-gradient(to right, red, blue)">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let div = elem(&doc, |e| e.tag == "div");
+        assert!(map[&div].background_gradient.is_some());
+        // Solid background-color must remain unset when a gradient is used.
+        assert!(map[&div].background_color.is_none());
+    }
+
+    #[test]
+    fn box_shadow_and_transform_via_cascade() {
+        let doc = html::parse(
+            r#"<html><body><div style="box-shadow: 2px 4px 8px black; transform: translate(10px,20px) scale(2); transform-origin: top left">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let div = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&div].box_shadows.len(), 1);
+        assert_eq!(map[&div].transform, Some([2.0, 0.0, 0.0, 2.0, 10.0, 20.0]));
+        assert_eq!(map[&div].transform_origin, (0.0, 0.0));
     }
 
     #[test]

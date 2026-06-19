@@ -1063,7 +1063,61 @@ fn paint_box(
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
 ) {
-    paint_box_opacity(fb, font, b, ox, oy, clip_top, clip_bottom, images, 1.0);
+    // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
+    // declarations compose additional affines on top per-box.
+    let xf = Affine::translate(ox, oy);
+    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, 1.0);
+}
+
+/// A 2D affine mapping a CSS-space point `(x, y)` to a device-space point: `x' = a*x + c*y + e`,
+/// `y' = b*x + d*y + f`. Used to remap painted geometry for CSS `transform` (and to carry the
+/// scroll translation). Translate + scale stay axis-aligned (painted exactly); rotation/skew make
+/// it non-axis-aligned (background/border rects rasterized as transformed quads; text is positioned
+/// by the transform but glyphs are not themselves rotated — see [`paint_box_opacity`]).
+#[derive(Clone, Copy, Debug)]
+struct Affine {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Affine {
+    fn translate(tx: f32, ty: f32) -> Affine {
+        Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
+    }
+    /// Map a CSS point to device space.
+    fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+    }
+    /// `self` ∘ `m`: apply `m` first (in CSS space), then `self`.
+    fn then(&self, m: &Affine) -> Affine {
+        Affine {
+            a: self.a * m.a + self.c * m.b,
+            b: self.b * m.a + self.d * m.b,
+            c: self.a * m.c + self.c * m.d,
+            d: self.b * m.c + self.d * m.d,
+            e: self.a * m.e + self.c * m.f + self.e,
+            f: self.b * m.e + self.d * m.f + self.f,
+        }
+    }
+    /// True if the linear part has no rotation/skew (axis-aligned: b == c == 0), so a rect stays a
+    /// rect and can be filled with the fast axis-aligned primitives.
+    fn is_axis_aligned(&self) -> bool {
+        self.b.abs() < 1e-4 && self.c.abs() < 1e-4
+    }
+}
+
+/// Map a CSS-space rect `(x, y, w, h)` through an axis-aligned affine into a device `Rect`.
+/// Caller must ensure `xf.is_axis_aligned()`.
+fn xf_rect(xf: &Affine, x: f32, y: f32, w: f32, h: f32) -> Rect {
+    let (x0, y0) = xf.apply(x, y);
+    let (x1, y1) = xf.apply(x + w, y + h);
+    let (lx, rx) = (x0.min(x1), x0.max(x1));
+    let (ty, by) = (y0.min(y1), y0.max(y1));
+    Rect { x: lx.round() as i32, y: ty.round() as i32, w: (rx - lx).round() as i32, h: (by - ty).round() as i32 }
 }
 
 /// Scale a u8 alpha by an effective opacity in 0.0..=1.0.
@@ -1080,8 +1134,7 @@ fn paint_box_opacity(
     fb: &mut Framebuffer,
     font: &dyn GlyphRasterizer,
     b: &layout::LayoutBox,
-    ox: f32,
-    oy: f32,
+    xf: &Affine,
     clip_top: f32,
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
@@ -1093,68 +1146,123 @@ fn paint_box_opacity(
     let border = b.dimensions.border_box();
     let content = b.dimensions.content;
     let radius = b.style.border_radius;
-    // Translate the box's vertical extent into device space for clipping.
-    let top = border.y.min(content.y) + oy;
-    let bottom = (border.y + border.height).max(content.y + content.height) + oy;
-    // Fully outside the visible band: skip this box (children may still be inside, so only
-    // skip when even the box's lower edge is above the band, or its top is below it).
+    let extras = b.style.extras.as_deref();
+
+    // Fast-path: the common no-transform box keeps the incoming affine. A CSS `transform` composes
+    // an extra affine pivoted at the transform-origin (in this box's border-box space), so the box
+    // *and its whole subtree* are remapped by that affine (translate/scale exactly; rotate/skew via
+    // transformed quads for fills).
+    let local_xf;
+    let xf: &Affine = if let Some(m) = extras.and_then(|e| e.transform) {
+        let origin = extras.map(|e| e.transform_origin).unwrap_or((0.5, 0.5));
+        let ox = border.x + origin.0 * border.width;
+        let oy = border.y + origin.1 * border.height;
+        // Resolve percentage translates against the box size (parser left them at 0; CSS uses the
+        // element's own size). We re-resolve here by scaling the affine's translate columns — but
+        // since the parser already produced absolute px for px translates, only the matrix's e/f
+        // (which were 0 for %), this is a no-op for the common case. Keeping it simple: apply m
+        // about (ox, oy): T(ox,oy) * m * T(-ox,-oy).
+        let pivot = Affine { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] };
+        let to_origin = Affine::translate(ox, oy);
+        let from_origin = Affine::translate(-ox, -oy);
+        local_xf = xf.then(&to_origin.then(&pivot).then(&from_origin));
+        &local_xf
+    } else {
+        xf
+    };
+
+    let axis = xf.is_axis_aligned();
+    // Device-space vertical extent of the box (for the visible-band clip). With a non-axis-aligned
+    // transform we conservatively take the bounding box of the four mapped corners.
+    let (top, bottom) = {
+        let y0 = border.y.min(content.y);
+        let y1 = (border.y + border.height).max(content.y + content.height);
+        let x0 = border.x.min(content.x);
+        let x1 = (border.x + border.width).max(content.x + content.width);
+        let corners = [xf.apply(x0, y0), xf.apply(x1, y0), xf.apply(x0, y1), xf.apply(x1, y1)];
+        let mut t = f32::MAX;
+        let mut bt = f32::MIN;
+        for (_, cy) in corners {
+            t = t.min(cy);
+            bt = bt.max(cy);
+        }
+        (t, bt)
+    };
     let offscreen = bottom < clip_top || top >= clip_bottom;
 
     if !offscreen && opacity > 0.0 {
-        // (a) Background fills the border box (rounded if border-radius is set).
-        if let Some((r, g, bl)) = b.style.background_color {
-            let c = Color { r, g, b: bl, a: scale_alpha(255, opacity) };
-            fb.fill_round_rect(
-                rect_i(border.x + ox, border.y + oy, border.width, border.height),
-                radius,
-                c,
-            );
+        // (0) OUTER box-shadows: painted BEFORE the background so the box sits on top.
+        if let Some(ex) = extras {
+            for sh in &ex.box_shadows {
+                if !sh.inset {
+                    paint_box_shadow(fb, xf, border, radius, sh, opacity, false);
+                }
+            }
         }
 
-        // (b) Borders: four filled edge rects, each `border.<side>` thick. With a corner radius we
-        // approximate by rounding the outer outline (the inner straight edges still butt the
-        // background); the background corners are the visually dominant effect.
+        // (a) Background fills the border box: a gradient if set, else the solid color.
+        if let Some(grad) = extras.and_then(|e| e.background_gradient.as_ref()) {
+            paint_gradient_fill(fb, xf, border, radius, grad, opacity, axis);
+        } else if let Some((r, g, bl)) = b.style.background_color {
+            let c = Color { r, g, b: bl, a: scale_alpha(255, opacity) };
+            fill_box(fb, xf, border.x, border.y, border.width, border.height, radius, c, axis);
+        }
+
+        // (b) Borders: four filled edge rects, each `border.<side>` thick.
         let e = b.dimensions.border;
         let ba = scale_alpha(255, opacity);
         let bc = Color { r: b.style.border_color.0, g: b.style.border_color.1, b: b.style.border_color.2, a: ba };
-        let bx = border.x + ox;
-        let by = border.y + oy;
         if e.top > 0.0 {
-            fb.fill_round_rect(rect_i(bx, by, border.width, e.top), radius.min(e.top.max(1.0)), bc);
+            fill_box(fb, xf, border.x, border.y, border.width, e.top, radius.min(e.top.max(1.0)), bc, axis);
         }
         if e.bottom > 0.0 {
-            fb.fill_round_rect(rect_i(bx, by + border.height - e.bottom, border.width, e.bottom), radius.min(e.bottom.max(1.0)), bc);
+            fill_box(fb, xf, border.x, border.y + border.height - e.bottom, border.width, e.bottom, radius.min(e.bottom.max(1.0)), bc, axis);
         }
         if e.left > 0.0 {
-            fb.fill_rect(rect_i(bx, by, e.left, border.height), bc);
+            fill_box(fb, xf, border.x, border.y, e.left, border.height, 0.0, bc, axis);
         }
         if e.right > 0.0 {
-            fb.fill_rect(rect_i(bx + border.width - e.right, by, e.right, border.height), bc);
+            fill_box(fb, xf, border.x + border.width - e.right, border.y, e.right, border.height, 0.0, bc, axis);
+        }
+
+        // (a2) INSET box-shadows: painted inside the box AFTER the background (best-effort: a
+        // feathered inner band, no rounded clipping).
+        if let Some(ex) = extras {
+            for sh in &ex.box_shadows {
+                if sh.inset {
+                    paint_box_shadow(fb, xf, border, radius, sh, opacity, true);
+                }
+            }
         }
 
         // (c) Text content, at the content rect's baseline. Don't paint into the console area.
+        // Text is positioned through the affine's mapped origin; glyphs are not rotated (NOTE:
+        // rotated/skewed text is positioned but rendered upright — an approximation).
         if let layout::BoxContent::Text(s) = &b.content {
-            if content.y + oy < clip_bottom {
+            let (dx, dy) = xf.apply(content.x, content.y);
+            if dy < clip_bottom {
+                // Scale font size by the affine's average linear magnitude so scale() enlarges text.
+                let sx = (xf.a * xf.a + xf.b * xf.b).sqrt();
+                let sy = (xf.c * xf.c + xf.d * xf.d).sqrt();
+                let scale = ((sx + sy) * 0.5).max(0.01);
+                let fs = b.style.font_size * scale;
                 let ta = scale_alpha(255, opacity);
                 let color = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ta };
-                let x = content.x + ox;
-                let baseline = content.y + oy + b.style.font_size * 0.8;
+                let x = dx;
+                let baseline = dy + fs * 0.8;
                 let end_x = draw_run(
-                    fb, font, s, x, baseline, b.style.font_size, color, b.style.bold,
-                    b.style.letter_spacing,
+                    fb, font, s, x, baseline, fs, color, b.style.bold,
+                    b.style.letter_spacing * scale,
                 );
-                // (c2) text-decoration lines, drawn in the text color across the run width.
                 let run_w = (end_x - x).max(0.0);
                 if run_w > 0.0 {
-                    let thickness = (b.style.font_size / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
+                    let thickness = (fs / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
                     if b.style.underline {
-                        // Just below the baseline.
                         let uy = (baseline + 1.0).round() as i32;
                         fb.fill_rect(Rect { x: x.round() as i32, y: uy, w: run_w.round() as i32, h: thickness }, color);
                     }
                     if b.style.line_through {
-                        // Roughly the text mid-height (baseline is ~0.8 of em below content top).
-                        let my = (baseline - b.style.font_size * 0.3).round() as i32;
+                        let my = (baseline - fs * 0.3).round() as i32;
                         fb.fill_rect(Rect { x: x.round() as i32, y: my, w: run_w.round() as i32, h: thickness }, color);
                     }
                 }
@@ -1162,13 +1270,14 @@ fn paint_box_opacity(
         }
 
         // (d) Replaced image content: blit the decoded pixels into the content rect, scaled.
+        // (Axis-aligned transforms map the destination rect exactly; rotation is approximated by
+        // the bounding box.)
         if let layout::BoxContent::Image(node) = &b.content {
-            if content.y + oy < clip_bottom {
-                let dst = rect_i(content.x + ox, content.y + oy, content.width, content.height);
+            let dst = xf_rect(xf, content.x, content.y, content.width, content.height);
+            if dst.y < clip_bottom as i32 {
                 match images.get(node) {
                     Some(img) if opacity >= 0.999 => fb.blit_rgba(dst, &img.rgba, img.w, img.h),
                     Some(img) => {
-                        // Apply opacity by pre-scaling each source pixel's alpha.
                         let mut scaled = img.rgba.clone();
                         for px in scaled.chunks_exact_mut(4) {
                             px[3] = scale_alpha(px[3], opacity);
@@ -1176,7 +1285,6 @@ fn paint_box_opacity(
                         fb.blit_rgba(dst, &scaled, img.w, img.h);
                     }
                     None => {
-                        // Missing / undecoded image: draw a faint placeholder border.
                         let ph = Color { r: 140, g: 140, b: 150, a: scale_alpha(120, opacity) };
                         if dst.w > 0 && dst.h > 0 {
                             fb.fill_rect(Rect { x: dst.x, y: dst.y, w: dst.w, h: 1 }, ph);
@@ -1191,14 +1299,283 @@ fn paint_box_opacity(
     }
 
     for child in &b.children {
-        paint_box_opacity(fb, font, child, ox, oy, clip_top, clip_bottom, images, opacity);
+        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, opacity);
     }
 }
 
-/// Round an `f32` CSS-pixel rect into a device-pixel [`Rect`].
-fn rect_i(x: f32, y: f32, w: f32, h: f32) -> Rect {
-    Rect { x: x.round() as i32, y: y.round() as i32, w: w.round() as i32, h: h.round() as i32 }
+/// Fill a CSS-space rect through an affine: axis-aligned → a (rounded) device rect; otherwise a
+/// transformed quad (rounding ignored). `radius` only applies in the axis-aligned case.
+fn fill_box(fb: &mut Framebuffer, xf: &Affine, x: f32, y: f32, w: f32, h: f32, radius: f32, c: Color, axis: bool) {
+    if axis {
+        fb.fill_round_rect(xf_rect(xf, x, y, w, h), radius, c);
+    } else {
+        let p0 = xf.apply(x, y);
+        let p1 = xf.apply(x + w, y);
+        let p2 = xf.apply(x + w, y + h);
+        let p3 = xf.apply(x, y + h);
+        fill_quad(fb, [p0, p1, p2, p3], c);
+    }
 }
+
+/// Rasterize a (convex) quadrilateral given its 4 device-space corners (in order), source-over at
+/// `c`. Used to paint rotated/skewed backgrounds and borders. Scanline fill over the bounding box,
+/// testing each pixel center for inclusion (consistent winding). Used only off the no-transform
+/// fast path.
+fn fill_quad(fb: &mut Framebuffer, pts: [(f32, f32); 4], c: Color) {
+    let xs = [pts[0].0, pts[1].0, pts[2].0, pts[3].0];
+    let ys = [pts[0].1, pts[1].1, pts[2].1, pts[3].1];
+    let minx = xs.iter().cloned().fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+    let maxx = xs.iter().cloned().fold(f32::MIN, f32::max).ceil().min(fb.width as f32) as i32;
+    let miny = ys.iter().cloned().fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+    let maxy = ys.iter().cloned().fold(f32::MIN, f32::max).ceil().min(fb.height as f32) as i32;
+    if maxx <= minx || maxy <= miny {
+        return;
+    }
+    // Sign of the cross product of each edge with the point; convex quad → all same sign inside.
+    let inside = |px: f32, py: f32| -> bool {
+        let mut sign = 0.0_f32;
+        for i in 0..4 {
+            let (ax, ay) = pts[i];
+            let (bx, by) = pts[(i + 1) % 4];
+            let cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+            if cross.abs() > 1e-6 {
+                if sign == 0.0 {
+                    sign = cross.signum();
+                } else if cross.signum() != sign {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    for y in miny..maxy {
+        let py = y as f32 + 0.5;
+        for x in minx..maxx {
+            let px = x as f32 + 0.5;
+            if inside(px, py) {
+                let i = (y as u32 * fb.stride) as usize + (x as usize) * 4;
+                blend_pixel(&mut fb.pixels[i..i + 4], c);
+            }
+        }
+    }
+}
+
+/// Source-over one color onto a device pixel (mirrors paint's internal blend, exposed for the
+/// engine's quad/gradient/shadow rasterizers).
+fn blend_pixel(dst: &mut [u8], src: Color) {
+    if src.a == 0 {
+        return;
+    }
+    if src.a == 255 {
+        dst[0] = src.r;
+        dst[1] = src.g;
+        dst[2] = src.b;
+        dst[3] = 255;
+        return;
+    }
+    let sa = src.a as u32;
+    let ia = 255 - sa;
+    dst[0] = ((src.r as u32 * sa + dst[0] as u32 * ia) / 255) as u8;
+    dst[1] = ((src.g as u32 * sa + dst[1] as u32 * ia) / 255) as u8;
+    dst[2] = ((src.b as u32 * sa + dst[2] as u32 * ia) / 255) as u8;
+    dst[3] = (sa + dst[3] as u32 * ia / 255).min(255) as u8;
+}
+
+/// Fill a box's border-box with a gradient. Each device pixel inside the (axis-aligned) destination
+/// rect is mapped back to the box's local 0..1 space, its gradient parameter `t` computed (linear:
+/// projection onto the angle vector; radial: normalized distance from center), and the surrounding
+/// color stops lerped. Respects `border_radius` (corner clipping like the solid fill) and `opacity`.
+/// Non-axis-aligned transforms fall back to the bounding-box rect (rotation of the gradient itself
+/// is approximate).
+fn paint_gradient_fill(
+    fb: &mut Framebuffer,
+    xf: &Affine,
+    border: layout::Rect,
+    radius: f32,
+    grad: &style::Gradient,
+    opacity: f32,
+    _axis: bool,
+) {
+    let dst = xf_rect(xf, border.x, border.y, border.width, border.height);
+    let x0 = dst.x.max(0);
+    let y0 = dst.y.max(0);
+    let x1 = (dst.x + dst.w).min(fb.width as i32);
+    let y1 = (dst.y + dst.h).min(fb.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let dw = (dst.w.max(1)) as f32;
+    let dh = (dst.h.max(1)) as f32;
+    let r = radius.min(dst.w as f32 / 2.0).min(dst.h as f32 / 2.0).max(0.0);
+    // Linear gradient axis direction in normalized box space (CSS angle: 0=up, 90=right).
+    let (dirx, diry, half_len);
+    match grad {
+        style::Gradient::Linear { angle_deg, .. } => {
+            let a = angle_deg.to_radians();
+            // Direction the gradient progresses (toward 100%).
+            dirx = a.sin();
+            diry = -a.cos();
+            // Projection length so the gradient spans corner-to-corner along the axis.
+            half_len = (dw * dirx.abs() + dh * diry.abs()) * 0.5;
+        }
+        style::Gradient::Radial { .. } => {
+            dirx = 0.0;
+            diry = 0.0;
+            half_len = (dw * dw + dh * dh).sqrt() * 0.5;
+        }
+    }
+    let cx = (x0 + x1) as f32 * 0.5;
+    let cy = (y0 + y1) as f32 * 0.5;
+    let stops = match grad {
+        style::Gradient::Linear { stops, .. } => stops,
+        style::Gradient::Radial { stops } => stops,
+    };
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        let row = (y as u32 * fb.stride) as usize;
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            // Rounded-corner clip (matches fill_round_rect).
+            if r > 0.0 && !inside_round_rect(px, py, dst, r) {
+                continue;
+            }
+            let t = match grad {
+                style::Gradient::Linear { .. } => {
+                    let proj = (px - cx) * dirx + (py - cy) * diry;
+                    if half_len > 0.0 { (proj / half_len) * 0.5 + 0.5 } else { 0.5 }
+                }
+                style::Gradient::Radial { .. } => {
+                    let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                    if half_len > 0.0 { dist / half_len } else { 0.0 }
+                }
+            };
+            let col = sample_stops(stops, t.clamp(0.0, 1.0));
+            let a = scale_alpha(col.a, opacity);
+            if a == 0 {
+                continue;
+            }
+            let i = row + (x as usize) * 4;
+            blend_pixel(&mut fb.pixels[i..i + 4], Color { r: col.r, g: col.g, b: col.b, a });
+        }
+    }
+}
+
+/// True if a pixel center lies inside a rounded rect (used to clip the gradient/shadow corners).
+fn inside_round_rect(px: f32, py: f32, rect: Rect, r: f32) -> bool {
+    let left_cx = rect.x as f32 + r;
+    let right_cx = (rect.x + rect.w) as f32 - r;
+    let top_cy = rect.y as f32 + r;
+    let bottom_cy = (rect.y + rect.h) as f32 - r;
+    let cx = if px < left_cx { Some(left_cx) } else if px > right_cx { Some(right_cx) } else { None };
+    let cy = if py < top_cy { Some(top_cy) } else if py > bottom_cy { Some(bottom_cy) } else { None };
+    match (cx, cy) {
+        (Some(cx), Some(cy)) => ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() <= r,
+        _ => true,
+    }
+}
+
+/// Linearly interpolate the gradient stops at parameter `t` in 0..1 (stops sorted by `pos`).
+fn sample_stops(stops: &[style::GradientStop], t: f32) -> style::Rgba {
+    if stops.is_empty() {
+        return style::Rgba { r: 0, g: 0, b: 0, a: 0 };
+    }
+    if t <= stops[0].pos {
+        return stops[0].color;
+    }
+    let last = stops.len() - 1;
+    if t >= stops[last].pos {
+        return stops[last].color;
+    }
+    for i in 0..last {
+        let a = stops[i];
+        let b = stops[i + 1];
+        if t >= a.pos && t <= b.pos {
+            let span = (b.pos - a.pos).max(1e-6);
+            let f = (t - a.pos) / span;
+            return style::Rgba {
+                r: lerp_u8(a.color.r, b.color.r, f),
+                g: lerp_u8(a.color.g, b.color.g, f),
+                b: lerp_u8(a.color.b, b.color.b, f),
+                a: lerp_u8(a.color.a, b.color.a, f),
+            };
+        }
+    }
+    stops[last].color
+}
+
+fn lerp_u8(a: u8, b: u8, f: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * f).round().clamp(0.0, 255.0) as u8
+}
+
+/// Paint one box-shadow layer. OUTER: a rect offset by (dx,dy), inflated by `spread`, with a `blur`
+/// px feathered edge (concentric alpha-decreasing bands approximating a Gaussian falloff). INSET:
+/// a feathered inner band along the box edges. Border-radius rounding is honored for the solid
+/// core (corner clip) but the feather is rectangular. Honors `opacity`.
+fn paint_box_shadow(
+    fb: &mut Framebuffer,
+    xf: &Affine,
+    border: layout::Rect,
+    radius: f32,
+    sh: &style::BoxShadow,
+    opacity: f32,
+    inset: bool,
+) {
+    let base_a = scale_alpha(sh.color.a, opacity);
+    if base_a == 0 {
+        return;
+    }
+    let col = |a: u8| Color { r: sh.color.r, g: sh.color.g, b: sh.color.b, a };
+    if !inset {
+        // Outer: core rect = border box, offset by (dx,dy), inflated by spread.
+        let bx = border.x + sh.dx - sh.spread;
+        let by = border.y + sh.dy - sh.spread;
+        let bw = border.width + 2.0 * sh.spread;
+        let bh = border.height + 2.0 * sh.spread;
+        let core = xf_rect(xf, bx, by, bw, bh);
+        let blur = sh.blur.max(0.0);
+        if blur <= 0.5 {
+            // Hard shadow: a single solid (rounded) rect.
+            fb.fill_round_rect(core, radius, col(base_a));
+            return;
+        }
+        // Feather: draw the core, then expand outward in 1px bands with linearly falling alpha.
+        let bands = blur.ceil() as i32;
+        fb.fill_round_rect(core, radius, col(base_a));
+        for k in 1..=bands {
+            let frac = 1.0 - (k as f32 / (bands as f32 + 1.0));
+            let a = (base_a as f32 * frac * 0.6).round() as u8;
+            if a == 0 {
+                continue;
+            }
+            let ring = Rect { x: core.x - k, y: core.y - k, w: core.w + 2 * k, h: core.h + 2 * k };
+            // Draw just the 1px ring (top/bottom/left/right strips) to avoid re-darkening the core.
+            fb.fill_rect(Rect { x: ring.x, y: ring.y, w: ring.w, h: 1 }, col(a));
+            fb.fill_rect(Rect { x: ring.x, y: ring.y + ring.h - 1, w: ring.w, h: 1 }, col(a));
+            fb.fill_rect(Rect { x: ring.x, y: ring.y, w: 1, h: ring.h }, col(a));
+            fb.fill_rect(Rect { x: ring.x + ring.w - 1, y: ring.y, w: 1, h: ring.h }, col(a));
+        }
+    } else {
+        // Inset (best-effort): a feathered band just inside the border box, offset by (dx,dy).
+        let inner = xf_rect(xf, border.x, border.y, border.width, border.height);
+        let blur = sh.blur.max(1.0);
+        let bands = (blur + sh.spread.abs()).ceil().max(1.0) as i32;
+        for k in 0..bands {
+            let frac = 1.0 - (k as f32 / (bands as f32));
+            let a = (base_a as f32 * frac * 0.5).round() as u8;
+            if a == 0 {
+                continue;
+            }
+            let dxk = sh.dx.round() as i32;
+            let dyk = sh.dy.round() as i32;
+            // Top & left bands shift with the offset.
+            fb.fill_rect(Rect { x: inner.x + dxk, y: inner.y + k + dyk, w: inner.w, h: 1 }, col(a));
+            fb.fill_rect(Rect { x: inner.x + k + dxk, y: inner.y + dyk, w: 1, h: inner.h }, col(a));
+            fb.fill_rect(Rect { x: inner.x + dxk, y: inner.y + inner.h - 1 - k + dyk, w: inner.w, h: 1 }, col(a));
+            fb.fill_rect(Rect { x: inner.x + inner.w - 1 - k + dxk, y: inner.y + dyk, w: 1, h: inner.h }, col(a));
+        }
+    }
+}
+
 
 /// Tags whose subtrees contribute no visible text.
 const SKIP_SUBTREE: &[&str] = &["script", "style", "head", "title", "noscript"];
@@ -3261,6 +3638,106 @@ mod tests {
         // but lighter than the bare gradient (which is < ~50).
         assert!(half[0] < opaque[0], "half {:?} should be darker than opaque {:?}", half, opaque);
         assert!(half[0] > 80, "half white over dark should still be fairly light, r={}", half[0]);
+    }
+
+    // A no-op text measurer/font used by the paint render tests below.
+    struct TM;
+    impl layout::TextMeasurer for TM {
+        fn text_width(&self, t: &str, px: f32, _b: bool) -> f32 {
+            t.chars().count() as f32 * px * 0.5
+        }
+        fn line_height(&self, px: f32) -> f32 {
+            px * 1.3
+        }
+    }
+    struct NF;
+    impl GlyphRasterizer for NF {
+        fn rasterize(&self, _c: char, _p: f32) -> Option<paint::GlyphBitmap> {
+            None
+        }
+        fn advance(&self, _c: char, p: f32) -> f32 {
+            p * 0.5
+        }
+    }
+
+    /// Render an HTML body into a `w`x`h` framebuffer (black background) via the real paint path.
+    fn render_html(html: &str, w: u32, h: u32) -> Framebuffer {
+        let doc = html::parse(html);
+        let (sheets, _c) = collect_stylesheets(&doc, "https://example.com/");
+        let computed = style::cascade(&doc, &sheets);
+        let root = layout::layout_document(&doc, &computed, w as f32, h as f32, &TM, &HashMap::new(), None);
+        let mut fb = Framebuffer::new(w, h);
+        fb.clear(Color::BLACK);
+        let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs);
+        fb
+    }
+
+    fn px_rgb(fb: &Framebuffer, x: i32, y: i32) -> [u8; 3] {
+        let i = (y as u32 * fb.stride) as usize + (x as usize) * 4;
+        [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
+    }
+
+    #[test]
+    fn linear_gradient_left_dark_right_light() {
+        // A full-width div with a left-to-right black→white gradient: left edge ≈ black, right ≈
+        // white.
+        let fb = render_html(
+            r#"<html><body><div style="height:60px; background: linear-gradient(to right, rgb(0,0,0), rgb(255,255,255))"></div></body></html>"#,
+            200, 80,
+        );
+        let left = px_rgb(&fb, 2, 30);
+        let right = px_rgb(&fb, 197, 30);
+        assert!(left[0] < 40, "left edge should be near black, got {left:?}");
+        assert!(right[0] > 215, "right edge should be near white, got {right:?}");
+        assert!(right[0] > left[0] + 150, "gradient should ramp dark→light");
+    }
+
+    #[test]
+    fn box_shadow_paints_outside_the_box() {
+        // A small box offset from the top-left with a box-shadow toward the bottom-right. Pixels
+        // just outside the box's lower-right should be non-background (shadow), while the far
+        // top-left corner stays background-black.
+        let fb = render_html(
+            r#"<html><body><div style="width:40px; height:40px; margin:20px; background:rgb(0,0,255); box-shadow: 12px 12px 0px rgb(255,0,0)"></div></body></html>"#,
+            120, 120,
+        );
+        // The box occupies roughly x∈[20,60], y∈[20,60] (margin 20). Shadow offset +12,+12.
+        // Sample a point inside the shadow but outside the box (e.g. x=66, y=66).
+        let shadow = px_rgb(&fb, 66, 66);
+        assert!(shadow[0] > 100, "expected red-ish shadow outside the box, got {shadow:?}");
+        // Far above-left of everything: untouched background.
+        let bg = px_rgb(&fb, 5, 5);
+        assert_eq!(bg, [0, 0, 0], "top-left should be background black");
+    }
+
+    #[test]
+    fn transform_translate_shifts_painted_pixels_right() {
+        // The same box with and without translate(40px,0): the translated render has its colored
+        // pixels shifted right by ~40px.
+        let base = render_html(
+            r#"<html><body><div style="width:30px; height:30px; background:rgb(0,200,0)"></div></body></html>"#,
+            200, 60,
+        );
+        let moved = render_html(
+            r#"<html><body><div style="width:30px; height:30px; background:rgb(0,200,0); transform: translate(40px,0)"></div></body></html>"#,
+            200, 60,
+        );
+        // Find the rightmost green pixel on row y=15 in each render.
+        let rightmost_green = |fb: &Framebuffer| -> i32 {
+            let mut last = -1;
+            for x in 0..fb.width as i32 {
+                let p = px_rgb(fb, x, 15);
+                if p[1] > 120 && p[0] < 80 {
+                    last = x;
+                }
+            }
+            last
+        };
+        let b = rightmost_green(&base);
+        let m = rightmost_green(&moved);
+        assert!(b >= 0 && m >= 0, "green not found base={b} moved={m}");
+        assert!((m - b - 40).abs() <= 3, "translate should shift ~40px: base={b} moved={m}");
     }
 
     #[test]

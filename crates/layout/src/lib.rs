@@ -82,6 +82,23 @@ pub struct PaintStyle {
     pub letter_spacing: f32,
     /// Resolved `line-height` in px (`None` = use the font metric). Drives inline line advance.
     pub line_height: Option<f32>,
+    /// Rarely-used paint features (gradients / shadows / transforms), boxed so the common box stays
+    /// small (one pointer) and allocates nothing — `None` = no gradient/shadow/transform.
+    pub extras: Option<Box<PaintExtras>>,
+}
+
+/// Gradient / box-shadow / transform paint data, kept behind an `Option<Box<…>>` on [`PaintStyle`]
+/// so unstyled boxes (the overwhelming majority) carry only a null pointer and never allocate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaintExtras {
+    /// A `background-image` gradient (linear/radial), if any. Painted as the box's background.
+    pub background_gradient: Option<style::Gradient>,
+    /// `box-shadow` layers, painted back-to-front. Empty = none.
+    pub box_shadows: Vec<style::BoxShadow>,
+    /// Composed 2D affine `transform` `[a b c d e f]` (local space, pre-origin). `None` = identity.
+    pub transform: Option<[f32; 6]>,
+    /// `transform-origin` as fractions of the box's own size (x, y); default (0.5, 0.5).
+    pub transform_origin: (f32, f32),
 }
 
 impl Default for PaintStyle {
@@ -99,6 +116,7 @@ impl Default for PaintStyle {
             border_radius: 0.0,
             letter_spacing: 0.0,
             line_height: None,
+            extras: None,
         }
     }
 }
@@ -467,6 +485,20 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         border_radius: cs.border_radius,
         letter_spacing: cs.letter_spacing,
         line_height: cs.line_height,
+        // Only allocate the extras box when the element actually has a gradient/shadow/transform.
+        extras: if cs.background_gradient.is_some()
+            || !cs.box_shadows.is_empty()
+            || cs.transform.is_some()
+        {
+            Some(Box::new(PaintExtras {
+                background_gradient: cs.background_gradient.clone(),
+                box_shadows: cs.box_shadows.clone(),
+                transform: cs.transform,
+                transform_origin: cs.transform_origin,
+            }))
+        } else {
+            None
+        },
     }
 }
 
