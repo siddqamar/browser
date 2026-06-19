@@ -2,6 +2,29 @@
 
 See also `docs/CSS-TODO.md` for the CSS backlog and `docs/HTML-SUPPORT.md` for the element audit.
 
+## Active backlog — stubs & partials (prioritized)
+
+### Partial / needs work
+- [ ] **prefers-color-scheme** — `matchMedia` reflects the OS dark/light theme (START HERE)
+- [ ] **Proportional fonts** — load proportional/serif faces + honor `font-family`; everything is SF Mono now (biggest visual gap)
+- [ ] **Form submit navigation** — GET/POST-navigate on submit (we fire the event but don't navigate)
+- [ ] **CSS transitions + `@keyframes`** — nothing animates (static `transform` works)
+- [ ] **CSS Grid** — only partial
+- [ ] **`position: sticky` + scrollable `overflow` regions**
+- [ ] **`border-collapse`** (tables) — separated-borders model only
+- [ ] **Presentational attributes** — `border=`/`bgcolor=`/`align=`/`cellpadding=`/`width=` → style mapping
+- [ ] **`document.cookie` server-sync** — surface the `net` jar's non-HttpOnly cookies to JS
+- [ ] **HTTP cache** — proper RFC cache with headers
+- [ ] **bidi** (`dir=rtl`/`bdo`/`bdi`) + **ruby annotation** layout
+
+### Genuine stubs (present but do nothing)
+- [ ] **Canvas** — `drawImage`, `getImageData`/`putImageData`, `clip()`, shadows, patterns, `setLineDash` are no-ops
+- [ ] **`<video>` / `<audio>`** — no player/playback
+- [ ] **`<iframe>` / `<embed>` / `<object>`** — render nothing (no nested browsing context)
+- [ ] **`<map>` / `<area>`** — image maps inert
+- [ ] **File upload** — multipart/form-data + `File`/`Blob` (FormData is urlencoded-only)
+- [ ] **Web Workers**, **Service Workers**, **IndexedDB**, **WebGL** — not implemented
+
 ## HTML element support fix plan (DONE — 6-agent sequence on main)
 Sequenced (not parallel) because every slice edits the shared `style`/`layout`/`paint` core —
 especially the single `user_agent_stylesheet()` function — so concurrent worktrees would collide.
