@@ -25,10 +25,19 @@
 //! `dataset` write-through, the DOM interface class hierarchy + `instanceof`, navigator/location/
 //! storage/observers, the timer/event loop) lives in that reused, engine-agnostic JavaScript.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::sync::Once;
+
+/// A completion delivered from a background request thread back to the worker: `(request id,
+/// response-envelope JSON or None on transport error)`. Drained on the worker thread inside
+/// [`drain_event_loop`] to resolve/reject the pending JS `fetch()` promise.
+type FetchCompletion = (u64, Option<String>);
 
 /// A JS execution result: the value rendered as a string (if any) plus any console output
 /// captured during execution.
@@ -73,24 +82,46 @@ struct HostState {
     /// Returns a JSON response *envelope* (see `engine`'s builder) or `None` on transport error.
     /// Distinct from `fetcher` (a GET-only body fetcher) which module loading still relies on.
     /// No-DOM / `run_with_dom` paths install a no-op that always returns `None`.
-    request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>>,
+    ///
+    /// `Arc<... + Send + Sync>` (not `Rc`) because `__startFetch` clones this and hands the clone
+    /// to a **background request thread** which runs it off the worker thread. `net::request` is
+    /// stateless + shares an agent, so it is `Send + Sync`-safe.
+    request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
+    /// Channel sender background request threads use to deliver completions back to this worker.
+    /// `Sender` is `Send`; it is only ever cloned/touched on the worker thread (in `__startFetch`),
+    /// so storing it in the (non-`Send`) `HostState` is fine. The matching `Receiver` is owned by
+    /// the worker thread and drained inside [`drain_event_loop`].
+    fetch_tx: Sender<FetchCompletion>,
+    /// Monotonic id source for async `fetch()` requests (handed to JS so it can correlate the
+    /// completion). `Atomic` only for `Send`-ability of the closure capture; logically single-thread.
+    next_fetch_id: AtomicU64,
+    /// Count of async fetches started but not yet drained. Keeps [`drain_event_loop`] looping (on a
+    /// longer budget) while network is outstanding so the `fetch()` promise settles before snapshot.
+    in_flight: Cell<usize>,
 }
 
 impl HostState {
     fn new(doc: SharedDoc) -> Rc<Self> {
-        Self::with_fetcher(doc, Rc::new(|_| None), Rc::new(|_, _, _, _| None))
+        // No-DOM paths: a dead-end channel (its receiver is dropped immediately). `__startFetch`
+        // never runs here in practice; even if it did, the send simply fails harmlessly.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Self::with_fetcher(doc, Rc::new(|_| None), Arc::new(|_, _, _, _| None), tx)
     }
 
     fn with_fetcher(
         doc: SharedDoc,
         fetcher: Rc<dyn Fn(&str) -> Option<String>>,
-        request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>>,
+        request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
+        fetch_tx: Sender<FetchCompletion>,
     ) -> Rc<Self> {
         Rc::new(HostState {
             doc,
             console: RefCell::new(Vec::new()),
             fetcher,
             request_fetcher,
+            fetch_tx,
+            next_fetch_id: AtomicU64::new(1),
+            in_flight: Cell::new(0),
         })
     }
 }
@@ -1148,6 +1179,64 @@ fn prim_request(
     }
 }
 
+/// `__startFetch(method, url, body, headersJson) -> id (number)`
+///
+/// Non-blocking sibling of `__request` backing the async JS `fetch()`. Resolves `url` against
+/// `__pageURL` (on the worker thread, like `__request`), allocates a request id, then spawns a
+/// **background thread** that runs the (`Send + Sync`) host `request_fetcher` and `send`s
+/// `(id, envelope-or-None)` back over the worker's completion channel. Returns the id to JS
+/// immediately so `fetch()` can store its promise resolvers under it. The background thread NEVER
+/// touches V8; the promise is settled later on the worker thread inside [`drain_event_loop`] via
+/// `__resolveFetch`/`__rejectFetch`. Increments the in-flight counter so the drain keeps looping
+/// until this completion is pulled.
+fn prim_start_fetch(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let method = arg_str(scope, &args, 0);
+    let raw = arg_str(scope, &args, 1);
+    let body = arg_str(scope, &args, 2);
+    let headers_json = arg_str(scope, &args, 3);
+    // Resolve against the page URL when present (so relative URLs work like other fetches).
+    let resolved = {
+        let global = scope.get_current_context().global(scope);
+        let key = v8::String::new(scope, "__pageURL").unwrap();
+        let base = global
+            .get(scope, key.into())
+            .filter(|v| v.is_string())
+            .map(|v| v.to_rust_string_lossy(scope));
+        match base {
+            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
+                Ok(u) => u.to_string(),
+                Err(_) => raw.clone(),
+            },
+            _ => raw.clone(),
+        }
+    };
+
+    let state = host_state(scope);
+    let id = state.next_fetch_id.fetch_add(1, Ordering::Relaxed);
+    let request_fetcher = Arc::clone(&state.request_fetcher);
+    let tx = state.fetch_tx.clone();
+    state.in_flight.set(state.in_flight.get() + 1);
+
+    // Thread-per-request: sites fire a bounded handful concurrently, so this is fine. The work is
+    // pure host I/O; it never re-enters V8. On spawn failure we synchronously deliver `None` so the
+    // promise still rejects and the in-flight count is reconciled by the drain.
+    let spawned = std::thread::Builder::new()
+        .name("js-fetch".to_string())
+        .spawn(move || {
+            let env = request_fetcher(&method, &resolved, &body, &headers_json);
+            let _ = tx.send((id, env));
+        });
+    if spawned.is_err() {
+        let _ = state.fetch_tx.send((id, None));
+    }
+
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Installation: register native primitives + evaluate the JS bootstrap onto a fresh context.
 // ---------------------------------------------------------------------------------------------
@@ -1215,6 +1304,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__titleText", prim_title_text);
     set_fn(scope, global, "__fetch", prim_fetch);
     set_fn(scope, global, "__request", prim_request);
+    set_fn(scope, global, "__startFetch", prim_start_fetch);
 }
 
 /// Compile+run a script in the current context, ignoring the result. Used for bootstraps where a
@@ -3172,10 +3262,51 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return parts.join("&");
   }
 
-  // fetch: backed by the native __request primitive (synchronous host request under the hood;
-  // wrapping the result in Promise.resolve is correct for our synchronous drain model). Sends the
-  // method, headers, and serialized body; resolves a Response from the host's JSON envelope.
-  // Rejects with TypeError("Failed to fetch") when the host request fails (null envelope).
+  // Async fetch plumbing. `fetch()` calls the non-blocking native `__startFetch`, which spawns a
+  // background request thread and returns an id immediately; the page promise is parked in
+  // `__pendingFetches[id]` and settled later — on the worker thread, inside the Rust drain — when
+  // the request completes, via `__resolveFetch(id, envelopeStr)` / `__rejectFetch(id)`. This lets
+  // many fetches run concurrently instead of serializing one blocking call at a time.
+  globalThis.__pendingFetches = globalThis.__pendingFetches || {};
+  // Build a Response from a host JSON envelope string (the shape the request fetcher returns).
+  function __responseFromEnvelope(envelope, fallbackUrl) {
+    var env = JSON.parse(envelope);
+    var respBody = env.body != null ? String(env.body) : "";
+    var contentType = env.contentType != null ? String(env.contentType) : "";
+    var rh = new globalThis.Headers();
+    if (contentType) { rh.set("content-type", contentType); }
+    return new globalThis.Response(respBody, {
+      status: env.status != null ? (env.status | 0) : 200,
+      statusText: env.statusText != null ? String(env.statusText) : "",
+      headers: rh,
+      url: env.url != null ? String(env.url) : fallbackUrl,
+      type: "basic"
+    });
+  }
+  // Settle a parked fetch with a host envelope (or null → reject as a failed transport).
+  def(globalThis, "__resolveFetch", function (id, envelope) {
+    var pending = globalThis.__pendingFetches[id];
+    if (!pending) { return; } // already aborted/settled; late completion ignored.
+    delete globalThis.__pendingFetches[id];
+    if (envelope == null) { pending.reject(new TypeError("Failed to fetch")); return; }
+    var resp;
+    try { resp = __responseFromEnvelope(String(envelope), pending.url); }
+    catch (e) { pending.reject(new TypeError("Failed to fetch")); return; }
+    pending.resolve(resp);
+  });
+  // Reject a parked fetch (transport error, or abort).
+  def(globalThis, "__rejectFetch", function (id, reason) {
+    var pending = globalThis.__pendingFetches[id];
+    if (!pending) { return; }
+    delete globalThis.__pendingFetches[id];
+    pending.reject(reason || new TypeError("Failed to fetch"));
+  });
+
+  // fetch: starts the request via the native __startFetch primitive (which runs the host request
+  // on a background thread) and returns a Promise parked in __pendingFetches, settled later by
+  // __resolveFetch/__rejectFetch during the Rust drain. Sends the method, headers, and serialized
+  // body; resolves a Response from the host's JSON envelope. Rejects with TypeError("Failed to
+  // fetch") when the host request fails (null envelope), or with AbortError if the signal aborts.
   if (typeof globalThis.fetch !== "function") {
     def(globalThis, "fetch", function (input, init) {
       init = init || {};
@@ -3230,26 +3361,21 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         }
       }
 
-      var envelope = (typeof __request === "function") ? __request(method, url, bodyStr, JSON.stringify(headers)) : null;
-      if (envelope == null) {
+      if (typeof __startFetch !== "function") {
         return Promise.reject(new TypeError("Failed to fetch"));
       }
-      var env;
-      try { env = JSON.parse(envelope); } catch (e) { return Promise.reject(new TypeError("Failed to fetch")); }
-
-      var respBody = env.body != null ? String(env.body) : "";
-      var contentType = env.contentType != null ? String(env.contentType) : "";
-      var rh = new globalThis.Headers();
-      if (contentType) { rh.set("content-type", contentType); }
-      // Return a real Response instance (so `instanceof Response`, prototype methods work).
-      var response = new globalThis.Response(respBody, {
-        status: env.status != null ? (env.status | 0) : 200,
-        statusText: env.statusText != null ? String(env.statusText) : "",
-        headers: rh,
-        url: env.url != null ? String(env.url) : url,
-        type: "basic"
+      // Kick off the request on a background thread; settle the promise later via the drain.
+      var id = __startFetch(method, url, bodyStr, JSON.stringify(headers));
+      return new Promise(function (resolve, reject) {
+        globalThis.__pendingFetches[id] = { resolve: resolve, reject: reject, url: url };
+        // AbortSignal: if it aborts while the request is in flight, reject this id with the abort
+        // reason and forget it (a late background completion is then ignored — see __resolveFetch).
+        if (signal && typeof signal.addEventListener === "function") {
+          signal.addEventListener("abort", function () {
+            __rejectFetch(id, signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError"));
+          });
+        }
       });
-      return Promise.resolve(response);
     });
   }
 
@@ -3606,7 +3732,11 @@ fn format_exception(tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>) -
 /// drain into the last result (matching the prior behavior).
 /// Returns whether any timer/microtask actually fired (so `tick` can skip a DOM snapshot when
 /// nothing happened).
-fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) -> bool {
+fn drain_event_loop(
+    scope: &mut v8::PinScope,
+    results: &mut [EvalOutput],
+    fetch_rx: Option<&Receiver<FetchCompletion>>,
+) -> bool {
     if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
         state.console.borrow_mut().clear();
     }
@@ -3621,10 +3751,28 @@ fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) -> boo
     );
 
     let start = std::time::Instant::now();
-    let budget = std::time::Duration::from_millis(3000);
+    // Idle budget keeps ticks snappy; the network budget is raised because a page legitimately
+    // waiting on a slow request (the slowest imlunahey _serverFn is ~6.8s) needs longer than 3s.
+    let idle_budget = std::time::Duration::from_millis(3000);
+    let network_budget = std::time::Duration::from_millis(15000);
     let mut iterations = 0usize;
     let mut did_work = false;
     loop {
+        // Pull any completed background fetches and settle their JS promises, then run a microtask
+        // checkpoint so the `.then` chains progress within this same drain.
+        if resolve_completed_fetches(scope, fetch_rx) {
+            did_work = true;
+            scope.perform_microtask_checkpoint();
+        }
+
+        let in_flight = scope
+            .get_current_context()
+            .get_slot::<HostState>()
+            .map(|s| s.in_flight.get())
+            .unwrap_or(0);
+        // While requests are outstanding we use the longer budget (so a network-bound page isn't
+        // cut off); otherwise the short idle budget keeps idle ticks cheap.
+        let budget = if in_flight > 0 { network_budget } else { idle_budget };
         if iterations >= EVENT_LOOP_CAP || start.elapsed() >= budget {
             break;
         }
@@ -3638,14 +3786,36 @@ fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) -> boo
             did_work = true;
         } else {
             // Nothing left in the JS loop; one more microtask checkpoint in case the last timer
-            // queued a job, then stop if still empty.
+            // queued a job.
             scope.perform_microtask_checkpoint();
             if run_due_timers(scope) {
                 did_work = true;
+            } else if in_flight > 0 {
+                // No JS work is due but a request is still in flight: block briefly on the channel
+                // (instead of busy-spinning) for the next completion, then loop to resolve it.
+                if let Some(rx) = fetch_rx {
+                    match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        Ok(completion) => {
+                            deliver_fetch_completion(scope, completion);
+                            did_work = true;
+                            scope.perform_microtask_checkpoint();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        // All senders gone (shouldn't happen mid-flight): stop waiting.
+                        Err(_) => break,
+                    }
+                }
             } else {
                 break;
             }
         }
+    }
+
+    // One final sweep: settle any completions that landed after the loop's last check, then run a
+    // microtask checkpoint so their `.then` chains progress before we snapshot.
+    if resolve_completed_fetches(scope, fetch_rx) {
+        did_work = true;
+        scope.perform_microtask_checkpoint();
     }
 
     // Collect timer/microtask errors recorded JS-side.
@@ -3680,6 +3850,59 @@ fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) -> boo
 /// Run `globalThis.__runDueTimers()` and return its boolean result (false if absent/empty).
 fn run_due_timers(scope: &mut v8::PinScope) -> bool {
     eval_to_bool(scope, "(typeof __runDueTimers === 'function') && __runDueTimers()")
+}
+
+/// Drain all currently-available background fetch completions (non-blocking `try_recv`) and settle
+/// each one's JS promise. Returns whether any completion was delivered. No-op when `fetch_rx` is
+/// `None` (the no-DOM / eval paths that never start async fetches).
+fn resolve_completed_fetches(
+    scope: &mut v8::PinScope,
+    fetch_rx: Option<&Receiver<FetchCompletion>>,
+) -> bool {
+    let rx = match fetch_rx {
+        Some(rx) => rx,
+        None => return false,
+    };
+    let mut any = false;
+    while let Ok(completion) = rx.try_recv() {
+        deliver_fetch_completion(scope, completion);
+        any = true;
+    }
+    any
+}
+
+/// Settle a single fetch completion on the worker thread: decrement the in-flight count, then call
+/// `__resolveFetch(id, envelope)` (success) or `__rejectFetch(id)` (transport error → `None`).
+fn deliver_fetch_completion(scope: &mut v8::PinScope, completion: FetchCompletion) {
+    let (id, env) = completion;
+    if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
+        state.in_flight.set(state.in_flight.get().saturating_sub(1));
+    }
+    match env {
+        Some(envelope) => {
+            // Pass the envelope as a JS string arg; build the call so the envelope can't break out
+            // of the literal (it's user-controlled response data).
+            let global = scope.get_current_context().global(scope);
+            let resolve_key = v8::String::new(scope, "__resolveFetch").unwrap();
+            let resolve_fn = global
+                .get(scope, resolve_key.into())
+                .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok());
+            if let Some(func) = resolve_fn {
+                let id_arg = v8::Number::new(scope, id as f64).into();
+                let env_arg = js_str(scope, &envelope).into();
+                v8::tc_scope!(let tc, scope);
+                let recv = global.into();
+                func.call(tc, recv, &[id_arg, env_arg]);
+            }
+        }
+        None => {
+            eval_internal(
+                scope,
+                &format!("if (typeof __rejectFetch === 'function') {{ __rejectFetch({id}); }}"),
+                "<rejectFetch>",
+            );
+        }
+    }
 }
 
 /// Evaluate an internal expression, returning its boolean coercion. Errors → false.
@@ -3772,7 +3995,8 @@ pub fn eval_batch(sources: Vec<String>) -> Vec<EvalOutput> {
             v8::scope!(let handle_scope, &mut rt.isolate);
             let local_ctx = v8::Local::new(handle_scope, &context);
             let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
-            drain_event_loop(scope, &mut results);
+            // No async fetches on the bare eval path (no real fetcher), so pass no receiver.
+            drain_event_loop(scope, &mut results, None);
             results
         });
 
@@ -3834,7 +4058,8 @@ pub fn run_with_dom(
                 for source in &sources {
                     results.push(eval_source(scope, source, "<script>"));
                 }
-                drain_event_loop(scope, &mut results);
+                // run_with_dom installs no real fetcher, so no async fetches are ever started.
+                drain_event_loop(scope, &mut results, None);
             }
             // Recover the owned Document. Dropping the isolate releases the context (and HostState
             // slot, which holds the only other Rc clone of `shared`), so `try_unwrap` succeeds.
@@ -4224,7 +4449,7 @@ pub fn run_modules(
     entries: Vec<String>,
     modules: HashMap<String, String>,
     fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
-    request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send>,
+    request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
 ) -> (dom::Document, Vec<EvalOutput>) {
     let url = url.to_string();
     let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
@@ -4235,6 +4460,8 @@ pub fn run_modules(
         .spawn(move || {
             ensure_v8_initialized();
             let shared: SharedDoc = Rc::new(RefCell::new(doc));
+            // Background fetch threads deliver completions here; the receiver stays on this worker.
+            let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<FetchCompletion>();
             let mut isolate = v8::Isolate::new(v8::CreateParams::default());
             isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
             isolate.set_promise_reject_callback(promise_reject_callback);
@@ -4251,12 +4478,11 @@ pub fn run_modules(
                 // Share one fetcher between the module loader and the JS `fetch()` primitive.
                 let fetcher: Rc<dyn Fn(&str) -> Option<String>> =
                     Rc::new(move |u: &str| fetcher(u));
-                let request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>> =
-                    Rc::new(move |m, u, b, h| request_fetcher(m, u, b, h));
                 let state = HostState::with_fetcher(
                     Rc::clone(&shared),
                     Rc::clone(&fetcher),
                     request_fetcher,
+                    fetch_tx,
                 );
                 scope.get_current_context().set_slot(state);
                 let registry = Rc::new(ModuleRegistry {
@@ -4275,7 +4501,7 @@ pub fn run_modules(
                     results.push(outcome);
                 }
 
-                drain_event_loop(scope, &mut results);
+                drain_event_loop(scope, &mut results, Some(&fetch_rx));
             }
             drop(isolate);
             let doc = match Rc::try_unwrap(shared) {
@@ -4454,7 +4680,7 @@ impl Session {
         modules: HashMap<String, String>,
         url: &str,
         fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
-        request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send>,
+        request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
     ) -> (Session, dom::Document, Vec<EvalOutput>) {
         let url = url.to_string();
         let fallback = doc.clone();
@@ -4628,12 +4854,15 @@ fn session_thread_main(
     modules: HashMap<String, String>,
     url: String,
     fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
-    request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send>,
+    request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
     init_tx: std::sync::mpsc::Sender<(dom::Document, Vec<EvalOutput>)>,
     cmd_rx: std::sync::mpsc::Receiver<SessionCmd>,
 ) {
     ensure_v8_initialized();
     let shared: SharedDoc = Rc::new(RefCell::new(doc));
+    // Background fetch threads deliver completions here; the receiver lives for the whole session
+    // (used by every drain — init load and each subsequent command).
+    let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<FetchCompletion>();
     // Keep the isolate owned by this thread for the whole session.
     let mut isolate = v8::Isolate::new(v8::CreateParams::default());
     // Register the same isolate-level callbacks run_modules uses so modules + dynamic import work.
@@ -4649,12 +4878,11 @@ fn session_thread_main(
 
         // Share one fetcher between the module loader and the JS `fetch()` primitive (as run_modules).
         let fetcher: Rc<dyn Fn(&str) -> Option<String>> = Rc::new(move |u: &str| fetcher(u));
-        let request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>> =
-            Rc::new(move |m, u, b, h| request_fetcher(m, u, b, h));
         let state = HostState::with_fetcher(
             Rc::clone(&shared),
             Rc::clone(&fetcher),
             request_fetcher,
+            fetch_tx,
         );
         scope.get_current_context().set_slot(state);
         let registry = Rc::new(ModuleRegistry {
@@ -4676,7 +4904,7 @@ fn session_thread_main(
         for entry in &entries {
             results.push(run_one_entry(scope, entry));
         }
-        drain_event_loop(scope, &mut results);
+        drain_event_loop(scope, &mut results, Some(&fetch_rx));
         // Load drain done; switch the timer clock to real time so subsequent ticks/events run
         // setInterval/setTimeout/rAF over actual elapsed time.
         eval_internal(scope, "if (typeof __enterRealtime === 'function') { __enterRealtime(); }", "<realtime>");
@@ -4703,7 +4931,7 @@ fn session_thread_main(
                 );
                 // Run the dispatch as one op, then drain the loop, folding console into a result.
                 let mut results = vec![eval_source(scope, &source, "<dispatch>")];
-                drain_event_loop(scope, &mut results);
+                drain_event_loop(scope, &mut results, Some(&fetch_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
@@ -4719,7 +4947,7 @@ fn session_thread_main(
                     js_string_literal(&code),
                 );
                 let mut results = vec![eval_source(scope, &source, "<key>")];
-                drain_event_loop(scope, &mut results);
+                drain_event_loop(scope, &mut results, Some(&fetch_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
@@ -4729,7 +4957,7 @@ fn session_thread_main(
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![eval_source(scope, &source, "<interact>")];
-                drain_event_loop(scope, &mut results);
+                drain_event_loop(scope, &mut results, Some(&fetch_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
@@ -4739,7 +4967,7 @@ fn session_thread_main(
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![EvalOutput::default()];
-                let did_work = drain_event_loop(scope, &mut results);
+                let did_work = drain_event_loop(scope, &mut results, Some(&fetch_rx));
                 // Only snapshot+report when something actually ran, so idle ticks are cheap.
                 if did_work {
                     let console = results.into_iter().flat_map(|r| r.console).collect();
@@ -5650,8 +5878,8 @@ mod tests {
     }
 
     /// A request fetcher that never serves anything (default for tests not exercising `fetch`).
-    fn no_request() -> Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> {
-        Box::new(|_m, _u, _b, _h| None)
+    fn no_request() -> Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> {
+        Arc::new(|_m, _u, _b, _h| None)
     }
 
     #[test]
@@ -5769,8 +5997,8 @@ mod tests {
 
         // fetch() now routes through the request fetcher (method/url/body/headers) and parses the
         // host's JSON envelope. The URL is resolved against the page URL before it reaches us.
-        let request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> =
-            Box::new(|method, u, _b, _h| {
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|method, u, _b, _h| {
                 assert_eq!(method, "GET");
                 assert_eq!(u, "https://x/data.json", "fetch should resolve relative URLs");
                 Some(
@@ -5801,6 +6029,131 @@ mod tests {
         let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(
+            console.iter().any(|l| l == "caught:TypeError:Failed to fetch"),
+            "console was {console:?}"
+        );
+    }
+
+    #[test]
+    fn async_fetch_resolves_during_init_drain() {
+        // The async fetch() must complete during Session::new's init drain even though the host
+        // request takes time: the request runs on a background thread and the drain keeps looping
+        // while it is in flight, then settles the promise and runs the .then chain. We assert the
+        // page wrote the response into a DOM attribute before the snapshot was taken.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"fetch('https://x/a').then(r => r.text()).then(t => document.body.setAttribute('data-a', t));"#
+                .to_string(),
+        );
+        // Test request fetcher: sleep ~50ms then return a canned envelope. Arc + Send + Sync so the
+        // background request thread can run it.
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, _u, _b, _h| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Some(
+                    r#"{"ok":true,"status":200,"statusText":"OK","url":"https://x/a","contentType":"text/plain","body":"AA"}"#
+                        .to_string(),
+                )
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let got = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-a").cloned(),
+            _ => None,
+        };
+        assert_eq!(got.as_deref(), Some("AA"), "data-a should be set by the resolved fetch");
+    }
+
+    #[test]
+    fn async_fetches_run_concurrently() {
+        // Five fetches each sleeping 100ms in the host fetcher; fired together with Promise.all. If
+        // they were serialized the init drain would take >=500ms; running concurrently (one
+        // background thread per request) it finishes in well under that. We also assert all five
+        // resolved (their bodies collected into a DOM attribute).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var urls = ['a','b','c','d','e'].map(function(s){ return 'https://x/' + s; });
+                Promise.all(urls.map(function(u){ return fetch(u).then(function(r){ return r.text(); }); }))
+                  .then(function(texts){ document.body.setAttribute('data-all', texts.join(',')); });
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Echo the last path segment back as the body so we can verify all five resolved.
+                let seg = u.rsplit('/').next().unwrap_or("");
+                Some(format!(
+                    r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/plain","body":"{seg}"}}"#
+                ))
+            });
+        let start = std::time::Instant::now();
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+        );
+        let elapsed = start.elapsed();
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let got = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-all").cloned(),
+            _ => None,
+        };
+        assert_eq!(got.as_deref(), Some("a,b,c,d,e"), "all five fetches should resolve");
+        // Concurrent: 5x100ms serialized would be >=500ms; concurrently it is ~100ms + overhead.
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "fetches should run concurrently, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn async_fetch_rejects_when_host_returns_none() {
+        // A None envelope from the (async) request fetcher rejects the promise with a TypeError, and
+        // the page's .catch runs during the drain.
+        let (doc, _body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"fetch('https://x/nope').catch(function(e){ console.log('caught:' + e.name + ':' + e.message); });"#
+                .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, _u, _b, _h| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                None
+            });
+        let (_session, _snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+        );
+        let console = all_console(&out);
         assert!(
             console.iter().any(|l| l == "caught:TypeError:Failed to fetch"),
             "console was {console:?}"
@@ -5908,8 +6261,8 @@ mod tests {
         let seen: Arc<Mutex<(String, String, String)>> =
             Arc::new(Mutex::new((String::new(), String::new(), String::new())));
         let seen2 = Arc::clone(&seen);
-        let request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> =
-            Box::new(move |method, url, body, headers| {
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(move |method, url, body, headers| {
                 *seen2.lock().unwrap() =
                     (method.to_string(), body.to_string(), headers.to_string());
                 assert_eq!(url, "https://x/submit");
@@ -5951,8 +6304,8 @@ mod tests {
         let seen: Arc<Mutex<(String, String)>> =
             Arc::new(Mutex::new((String::new(), String::new())));
         let seen2 = Arc::clone(&seen);
-        let request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> =
-            Box::new(move |_method, _url, body, headers| {
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(move |_method, _url, body, headers| {
                 *seen2.lock().unwrap() = (body.to_string(), headers.to_string());
                 Some(
                     r#"{"ok":true,"status":200,"statusText":"OK","url":"https://x/u","contentType":"text/plain","body":"ok"}"#

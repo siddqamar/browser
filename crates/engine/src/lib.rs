@@ -1620,8 +1620,9 @@ pub enum StyleSource {
 /// returns a JSON *envelope* string the JS side parses into a `Response`. Returns `None` on
 /// transport error (→ `fetch` rejects with `TypeError`). Runs on the JS worker thread; blocking is
 /// fine there.
-fn build_request_fetcher() -> Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> {
-    Box::new(|method: &str, url: &str, body: &str, headers_json: &str| {
+fn build_request_fetcher(
+) -> std::sync::Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> {
+    std::sync::Arc::new(|method: &str, url: &str, body: &str, headers_json: &str| {
         let headers = parse_headers_json(headers_json);
         let body_opt: Option<&[u8]> = if body.is_empty() { None } else { Some(body.as_bytes()) };
         let resp = net::request(method, url, body_opt, &headers).ok()?;
