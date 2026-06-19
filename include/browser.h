@@ -72,6 +72,17 @@ void browser_engine_set_viewport(struct Engine *engine,
                                  float scale);
 
 /**
+ * Set the effective OS appearance (`is_dark != 0` = Dark). Surfaces `prefers-color-scheme` to page
+ * JS (`matchMedia('(prefers-color-scheme: dark)')`, firing `change` on existing MediaQueryLists)
+ * and the CSS `@media (prefers-color-scheme)` cascade. The host should call this on launch and
+ * whenever the user toggles Light/Dark, then re-render.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+void browser_engine_set_color_scheme(struct Engine *engine, bool is_dark);
+
+/**
  * Install (or clear, with a null `cb`) the progressive-load frame callback. While set, the engine
  * invokes `cb(ctx, framebuffer)` SYNCHRONOUSLY from inside `browser_engine_load_url`, on the load
  * thread, each time it paints a partial frame as the page's HTML streams in (and once more for the

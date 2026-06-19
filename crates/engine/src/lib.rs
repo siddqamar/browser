@@ -115,6 +115,10 @@ pub struct Engine {
     /// Vertical scroll offset of the page content, in device pixels (0 = top). Clamped to
     /// the laid-out document height during `render`.
     scroll_y: f32,
+    /// Whether the effective OS appearance is Dark. Pushed by the host (Swift) on launch and on
+    /// every Light/Dark toggle; surfaced to page JS (`matchMedia('(prefers-color-scheme: dark)')`)
+    /// and the CSS cascade (`@media (prefers-color-scheme)`).
+    is_dark: bool,
     /// Cached layout tree so scrolling only re-paints (no re-cascade / re-layout).
     layout_cache: Option<LayoutCache>,
     /// Retained so the FFI layer can hand out a pointer that stays valid until the next
@@ -175,6 +179,7 @@ impl Engine {
             state: LoadState::Empty,
             font: SystemFont::load(),
             scroll_y: 0.0,
+            is_dark: false,
             layout_cache: None,
             framebuffer: None,
             session: None,
@@ -212,6 +217,34 @@ impl Engine {
         // Surface the real viewport + scale to page JS (window.innerWidth/innerHeight,
         // devicePixelRatio) so responsive/HiDPI code sees true values.
         js::set_device_metrics(self.vp_w, self.vp_h, self.scale);
+    }
+
+    /// Set the effective OS appearance (Dark/Light). Pushed by the host on launch and on every
+    /// Light/Dark toggle. Surfaces the flag to:
+    ///   - page JS: `matchMedia('(prefers-color-scheme: dark)').matches` and a `change` event on
+    ///     existing `MediaQueryList`s, and
+    ///   - the CSS cascade: `@media (prefers-color-scheme: dark|light)` rules,
+    /// then invalidates the layout cache so the next `render` re-cascades with the new appearance.
+    pub fn set_color_scheme(&mut self, is_dark: bool) {
+        if self.is_dark == is_dark {
+            return; // no change → don't churn the layout cache / re-dispatch
+        }
+        self.is_dark = is_dark;
+        // Process-global flags read by the JS worker and the cascade respectively.
+        js::set_color_scheme_dark(is_dark);
+        style::set_color_scheme_dark(is_dark);
+        // Re-cascade on the next render so @media (prefers-color-scheme) rules re-apply.
+        self.layout_cache = None;
+        // Fire `change` on live MediaQueryLists in the page, adopting any DOM mutations the
+        // handlers make so they're reflected on the next render.
+        if let Some(session) = &self.session {
+            let (mut snapshot, console) = session.notify_color_scheme_changed();
+            snapshot.prune_invalid();
+            if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+                *doc = Some(snapshot);
+                c.extend(console);
+            }
+        }
     }
 
     /// Fetch `url` (streaming) and remember the outcome, painting INCREMENTALLY as the HTML body
@@ -414,6 +447,8 @@ impl Engine {
         // @container, and vw/vh units evaluate against the true window — and, since this runs on
         // every viewport change, they re-evaluate on resize.
         style::set_viewport_metrics(self.vp_w as f32, self.vp_h as f32, self.scale);
+        // Feed the real OS appearance to the cascade so @media (prefers-color-scheme) re-evaluates.
+        style::set_color_scheme_dark(self.is_dark);
         // Feed pointer/keyboard interaction state to the cascade so `:hover`/`:focus`/… match.
         style::set_interaction_state(self.hovered_node.map(|n| n.0), self.focused_node.map(|n| n.0));
         if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
@@ -4828,6 +4863,66 @@ mod tests {
         // The body's scrollHeight reports the full document content height (> 0).
         let sh = e.console_eval("document.body.scrollHeight > 0");
         assert_eq!(sh, "true", "document.body.scrollHeight should be positive");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn matchmedia_prefers_color_scheme_tracks_os_appearance() {
+        // A page with a script so the engine keeps a live JS Session we can console_eval against.
+        let html = "<html><body><script>window.__ready = true;</script></body></html>";
+        let path = std::env::temp_dir().join("browser_color_scheme_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(800, 600, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+
+        // Dark: the dark query matches, light does not.
+        e.set_color_scheme(true);
+        assert_eq!(
+            e.console_eval("matchMedia('(prefers-color-scheme: dark)').matches"),
+            "true",
+            "dark query should match in Dark mode",
+        );
+        assert_eq!(
+            e.console_eval("matchMedia('(prefers-color-scheme: light)').matches"),
+            "false",
+            "light query should not match in Dark mode",
+        );
+
+        // Light: reversed.
+        e.set_color_scheme(false);
+        assert_eq!(
+            e.console_eval("matchMedia('(prefers-color-scheme: dark)').matches"),
+            "false",
+            "dark query should not match in Light mode",
+        );
+        assert_eq!(
+            e.console_eval("matchMedia('(prefers-color-scheme: light)').matches"),
+            "true",
+            "light query should match in Light mode",
+        );
+
+        // A bare `(prefers-color-scheme)` query matches regardless of appearance.
+        assert_eq!(
+            e.console_eval("matchMedia('(prefers-color-scheme)').matches"),
+            "true",
+            "bare prefers-color-scheme should always match",
+        );
+
+        // `change` fires on an existing MediaQueryList when the appearance flips.
+        let _ = e.console_eval(
+            "window.__pcsChanges = 0; \
+             var __mql = matchMedia('(prefers-color-scheme: dark)'); \
+             __mql.addEventListener('change', function (ev) { window.__pcsChanges++; window.__pcsLast = ev.matches; });",
+        );
+        e.set_color_scheme(true); // light -> dark: should fire once with matches=true
+        assert_eq!(
+            e.console_eval("window.__pcsChanges + ':' + window.__pcsLast"),
+            "1:true",
+            "change should fire with matches=true on flip to Dark",
+        );
 
         let _ = std::fs::remove_file(&path);
     }

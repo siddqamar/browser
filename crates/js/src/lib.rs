@@ -1056,6 +1056,17 @@ fn prim_scroll_y(
     rv.set(v8::Number::new(scope, y as f64).into());
 }
 
+/// `__prefersDark() -> boolean` — whether the effective OS appearance is Dark, read live from the
+/// process-global flag the engine sets (`set_color_scheme_dark`). Drives the JS `matchMedia`
+/// `prefers-color-scheme` feature so it tracks the real macOS Light/Dark setting.
+fn prim_prefers_dark(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    rv.set(v8::Boolean::new(scope, color_scheme_dark()).into());
+}
+
 /// A JS-requested scroll target (document CSS px), read+cleared by the engine after each Session
 /// interaction. `i64::MIN` = no request. Process-global: the active tab is the one being driven.
 static PENDING_SCROLL: AtomicI64 = AtomicI64::new(i64::MIN);
@@ -2049,6 +2060,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__storageSave", prim_storage_save);
     set_fn(scope, global, "__cryptoRandom", prim_crypto_random);
     set_fn(scope, global, "__scrollY", prim_scroll_y);
+    set_fn(scope, global, "__prefersDark", prim_prefers_dark);
     set_fn(scope, global, "__scrollSet", prim_scroll_set);
     set_fn(scope, global, "__scrollIntoView", prim_scroll_into_view);
     set_fn(scope, global, "__appendChild", prim_append_child);
@@ -2129,12 +2141,32 @@ static VP_W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(12
 static VP_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(780);
 static DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Live OS appearance: `true` when the user's effective macOS appearance is Dark. Drives the
+/// `prefers-color-scheme` media feature in both the JS `matchMedia` API (via `__prefersDark()`)
+/// and, in parallel, the CSS `@media (prefers-color-scheme)` cascade (the `style` crate keeps its
+/// own copy, set on the same engine path). Process-global so the engine (any thread) can update it
+/// and the JS worker reads the live value on every media-query evaluation.
+static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set the logical viewport size (px) and device pixel ratio surfaced to page JS.
 pub fn set_device_metrics(width: u32, height: u32, device_pixel_ratio: f32) {
     use std::sync::atomic::Ordering;
     VP_W.store(width.max(1), Ordering::Relaxed);
     VP_H.store(height.max(1), Ordering::Relaxed);
     DPR_BITS.store(device_pixel_ratio.max(0.1).to_bits(), Ordering::Relaxed);
+}
+
+/// Set whether the effective OS appearance is Dark, surfaced to page JS as the
+/// `prefers-color-scheme` media feature (read live by `matchMedia(...).matches` and used to fire
+/// `change` events on existing `MediaQueryList`s when it flips). The engine calls this on launch
+/// and whenever the user toggles Light/Dark.
+pub fn set_color_scheme_dark(is_dark: bool) {
+    COLOR_SCHEME_DARK.store(is_dark, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the live OS-appearance dark flag (used by the `__prefersDark()` JS primitive).
+fn color_scheme_dark() -> bool {
+    COLOR_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn device_metrics() -> (f64, f64, f64) {
@@ -2810,7 +2842,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         return name === "min-aspect-ratio" ? have >= want : (name === "max-aspect-ratio" ? have <= want : Math.abs(have - want) < 0.01);
       }
       case "orientation": return val === (iw >= ih ? "landscape" : "portrait");
-      case "prefers-color-scheme": return val === "light"; // pages render on a light default
+      case "prefers-color-scheme": {
+        // Reflect the real macOS appearance (live via the native __prefersDark() flag). Bare
+        // `(prefers-color-scheme)` with no value matches always; `dark`/`light` match the OS.
+        var dark = false; try { dark = !!__prefersDark(); } catch (e) {}
+        if (val === "") { return true; }
+        return dark ? (val === "dark") : (val === "light");
+      }
       case "prefers-reduced-motion": return val === "" || val === "no-preference";
       case "prefers-contrast": return val === "" || val === "no-preference";
       case "hover": case "any-hover": return val === "" || val === "hover";
@@ -2842,16 +2880,44 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     for (var i = 0; i < ors.length; i++) { if (__mqConj(ors[i].trim())) { return true; } }
     return false;
   }
+  // Live MediaQueryList registry. Every matchMedia() result is kept (weakly via a plain list — the
+  // page count is tiny) so that when the OS appearance flips we can re-evaluate each list and fire
+  // `change` on the ones whose `.matches` actually changed. __mediaChanged() is called by the
+  // engine path (globalThis hook) after it flips the prefers-color-scheme flag.
+  var __mqlRegistry = [];
   globalThis.matchMedia = function (q) {
+    var media = String(q);
+    var listeners = []; // change listeners added via addEventListener('change', ...)/addListener
     var mql = {
-      media: String(q), onchange: null,
-      addListener: fn, removeListener: fn, addEventListener: fn, removeEventListener: fn,
+      media: media, onchange: null,
+      addEventListener: function (type, cb) { if (type === "change" && typeof cb === "function") { listeners.push(cb); } },
+      removeEventListener: function (type, cb) { if (type === "change") { var i = listeners.indexOf(cb); if (i >= 0) { listeners.splice(i, 1); } } },
+      // Legacy aliases (still used by older sites): addListener/removeListener take the callback directly.
+      addListener: function (cb) { if (typeof cb === "function") { listeners.push(cb); } },
+      removeListener: function (cb) { var i = listeners.indexOf(cb); if (i >= 0) { listeners.splice(i, 1); } },
       dispatchEvent: function () { return false; }
     };
-    // `matches` re-evaluates against the current viewport on every read (so it tracks resizes).
+    // `matches` re-evaluates against the current viewport + OS appearance on every read.
     Object.defineProperty(mql, "matches", { get: function () { return __evalMedia(q); }, enumerable: true, configurable: true });
+    // Internal: re-evaluate; if `.matches` changed, fire `change` on onchange + all listeners.
+    def(mql, "__last", __evalMedia(q));
+    def(mql, "__reeval", function () {
+      var now = __evalMedia(q);
+      if (now === mql.__last) { return; }
+      mql.__last = now;
+      var ev = { type: "change", media: media, matches: now, target: mql, currentTarget: mql, bubbles: false, cancelable: false };
+      try { if (typeof mql.onchange === "function") { mql.onchange.call(mql, ev); } } catch (e) {}
+      var snapshot = listeners.slice();
+      for (var i = 0; i < snapshot.length; i++) { try { snapshot[i].call(mql, ev); } catch (e) {} }
+    });
+    __mqlRegistry.push(mql);
     return mql;
   };
+  // Re-evaluate every live MediaQueryList and fire `change` where `.matches` flipped. Called by the
+  // engine after it updates the OS appearance (prefers-color-scheme) so theme toggles restyle pages.
+  def(globalThis, "__mediaChanged", function () {
+    for (var i = 0; i < __mqlRegistry.length; i++) { try { __mqlRegistry[i].__reeval(); } catch (e) {} }
+  });
 
   // --- getComputedStyle --------------------------------------------------------------------
   // Returns a read-only CSSStyleDeclaration-like object backed by the in-Session cascade
@@ -6810,6 +6876,16 @@ impl Session {
         doc_height_css: f32,
     ) {
         let _ = self.tx.send(SessionCmd::SetRects { rects, naturals, scroll_y_css, doc_height_css });
+    }
+
+    /// Notify the page that the OS appearance (prefers-color-scheme) changed: re-evaluates every
+    /// live `MediaQueryList` and fires `change` on those whose `.matches` flipped. The process-global
+    /// flag is already updated via [`set_color_scheme_dark`]; this just dispatches the JS events and
+    /// drains the loop so any DOM mutations the handlers make are reflected.
+    pub fn notify_color_scheme_changed(&self) -> (dom::Document, Vec<String>) {
+        self.eval_interact(
+            "(globalThis.__mediaChanged && globalThis.__mediaChanged())".to_string(),
+        )
     }
 
     /// Evaluate an arbitrary JS source string against the live context, drain the event loop, and

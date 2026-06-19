@@ -966,6 +966,12 @@ static VIEWPORT_W_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 static VIEWPORT_H_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static VIEWPORT_DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Live OS appearance used to evaluate `@media (prefers-color-scheme: dark|light)` during the
+/// cascade. `true` = Dark. The engine sets this via [`set_color_scheme_dark`] on launch and on
+/// every Light/Dark toggle; the cascade re-runs (layout cache invalidated) so dark-mode stylesheet
+/// rules take effect. Mirrors the same flag in the `js` crate (which drives the JS `matchMedia`).
+static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set the logical viewport size (CSS px) and device pixel ratio used by the cascade for media
 /// queries and viewport units. Call before [`cascade`] whenever the viewport changes.
 pub fn set_viewport_metrics(width: f32, height: f32, device_pixel_ratio: f32) {
@@ -973,6 +979,18 @@ pub fn set_viewport_metrics(width: f32, height: f32, device_pixel_ratio: f32) {
     VIEWPORT_W_BITS.store(width.max(1.0).to_bits(), Ordering::Relaxed);
     VIEWPORT_H_BITS.store(height.max(1.0).to_bits(), Ordering::Relaxed);
     VIEWPORT_DPR_BITS.store(device_pixel_ratio.max(0.1).to_bits(), Ordering::Relaxed);
+}
+
+/// Set whether the effective OS appearance is Dark, used to evaluate
+/// `@media (prefers-color-scheme: dark|light)` in the cascade. Call before [`cascade`] (the engine
+/// does this on launch and on every appearance toggle).
+pub fn set_color_scheme_dark(is_dark: bool) {
+    COLOR_SCHEME_DARK.store(is_dark, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the effective OS appearance is currently Dark (drives `prefers-color-scheme`).
+fn color_scheme_dark() -> bool {
+    COLOR_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // Live pointer/keyboard interaction state used to evaluate `:hover`/`:focus`/`:active`/
@@ -1535,7 +1553,15 @@ fn media_component_matches(component: &str) -> bool {
                             return false;
                         }
                     }
-                    // Unrecognized features (prefers-*, hover, …): treat as matching.
+                    // Real OS appearance: `dark` rules apply only in Dark mode, `light` only in
+                    // Light. This is what actually restyles most dark-mode-aware sites.
+                    "prefers-color-scheme" => {
+                        let dark = color_scheme_dark();
+                        if (value == "dark" && !dark) || (value == "light" && dark) {
+                            return false;
+                        }
+                    }
+                    // Unrecognized features (other prefers-*, hover, …): treat as matching.
                     _ => {}
                 }
             }
@@ -5598,6 +5624,27 @@ mod tests {
         let p = elem(&doc, |e| e.tag == "p");
         // 2000px > 1280px assumed width, so the media rule does not apply: stays red.
         assert_eq!(map[&p].color, (255, 0, 0));
+    }
+
+    #[test]
+    fn media_prefers_color_scheme_tracks_os_appearance() {
+        let sheet = css::parse(
+            "p { color: rgb(10,20,30) } \
+             @media (prefers-color-scheme: dark) { p { color: rgb(1,2,3) } } \
+             @media (prefers-color-scheme: light) { p { color: rgb(4,5,6) } }",
+        );
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+
+        // Dark: the `dark` rule applies, the `light` rule is dropped.
+        set_color_scheme_dark(true);
+        let map = cascade(&doc, &[sheet.clone()]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (1, 2, 3), "dark rule should win in Dark mode");
+
+        // Light: the `light` rule applies, the `dark` rule is dropped.
+        set_color_scheme_dark(false);
+        let map = cascade(&doc, &[sheet]);
+        assert_eq!(map[&p].color, (4, 5, 6), "light rule should win in Light mode");
     }
 
     #[test]

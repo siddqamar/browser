@@ -1158,6 +1158,23 @@ extension DevToolsView: NSOutlineViewDataSource, NSOutlineViewDelegate {
     }
 }
 
+// MARK: - Content view (observes OS appearance)
+
+/// The window's content view. Overrides `viewDidChangeEffectiveAppearance` (which AppKit fires
+/// whenever the effective appearance changes — including the user toggling System Settings →
+/// Appearance Light/Dark, or auto day/night) so we can push the new `prefers-color-scheme` into the
+/// engine and restyle pages live.
+final class ContentView: NSView {
+    /// Invoked on every effective-appearance change (Light/Dark toggle). The delegate reads the new
+    /// appearance and pushes it to the engines.
+    var onAppearanceChange: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onAppearanceChange?()
+    }
+}
+
 // MARK: - AppDelegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
@@ -1219,8 +1236,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.minSize = NSSize(width: 380, height: 300)
         window.center() // first-run default; a saved frame is restored last (just before show).
 
-        let content = NSView(frame: contentRect)
+        let content = ContentView(frame: contentRect)
         content.wantsLayer = true
+        content.onAppearanceChange = { [weak self] in self?.applyColorScheme() }
         window.contentView = content
 
         // MARK: Toolbar (translucent visual effect background)
@@ -1477,6 +1495,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Create the first tab (becomes active) and start loading the default URL.
         createTab(initialURL: defaultURL, focusAddressBar: false)
         updateViewport()
+        applyColorScheme() // push the real OS appearance to the engine before the first load
         refresh()
         if let url = activeTab?.urlString, !url.isEmpty {
             load(urlString: url, recordHistory: true)
@@ -1638,6 +1657,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @discardableResult
     private func createTab(initialURL: String?, focusAddressBar: Bool) -> Tab {
         let tab = Tab()
+        // Seed the new engine with the current OS appearance so its first cascade uses the right
+        // prefers-color-scheme (rather than the default light).
+        if let engine = tab.engine { browser_engine_set_color_scheme(engine, isDarkAppearance) }
         if let initialURL = initialURL, !initialURL.isEmpty {
             tab.urlString = initialURL
             tab.title = hostTitle(from: initialURL)
@@ -1783,6 +1805,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let logicalWidth = UInt32(max(1, bitmapView.bounds.width.rounded()))
         let logicalHeight = UInt32(max(1, bitmapView.bounds.height.rounded()))
         browser_engine_set_viewport(engine, logicalWidth, logicalHeight, scale)
+    }
+
+    // MARK: OS appearance (prefers-color-scheme)
+
+    /// Whether the app's effective appearance is Dark. Resolves the appearance against the standard
+    /// Aqua/DarkAqua pair so auto/named appearances collapse to a simple light/dark answer.
+    private var isDarkAppearance: Bool {
+        let appearance = window?.effectiveAppearance ?? NSApp.effectiveAppearance
+        return appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    /// Push the current OS appearance (`prefers-color-scheme`) into every tab's engine and re-render
+    /// the active page so media-query-driven styles (CSS `@media` + JS `matchMedia`) restyle live.
+    /// Called on launch and whenever the effective appearance changes (Light/Dark toggle).
+    func applyColorScheme() {
+        let dark = isDarkAppearance
+        for tab in tabs {
+            if let engine = tab.engine { browser_engine_set_color_scheme(engine, dark) }
+        }
+        refresh()
     }
 
     func windowDidResize(_ notification: Notification) {
