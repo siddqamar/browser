@@ -1697,6 +1697,42 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     def(el, "removeAttribute", function (name) { __removeAttr(id, String(name)); });
     def(el, "hasAttribute", function (name) { return __getAttr(id, String(name)) != null; });
     def(el, "getAttributeNames", function () { return __attrNames(id); });
+    // A LIVE NamedNodeMap: React (and others) do `for (var a = el.attributes; a.length;)
+    // el.removeAttributeNode(a[0])`, capturing the map once and relying on removals shrinking it —
+    // so length/index must re-query the node each access (a static snapshot would infinite-loop).
+    var makeAttr = function (attrName) {
+      return { name: attrName, localName: attrName, nodeName: attrName, nodeType: 2,
+               specified: true, ownerElement: el,
+               get value() { return __getAttr(id, attrName); },
+               set value(v) { __setAttr(id, attrName, v == null ? "" : String(v)); } };
+    };
+    var attrMap = new Proxy({}, {
+      get: function (t, prop) {
+        if (prop === "length") { return __attrNames(id).length; }
+        if (prop === "item") { return function (i) { var n = __attrNames(id)[i]; return n == null ? null : makeAttr(n); }; }
+        if (prop === "getNamedItem") { return function (nm) { nm = String(nm); return __getAttr(id, nm) == null ? null : makeAttr(nm); }; }
+        if (prop === Symbol.iterator) { return function () { return __attrNames(id).map(makeAttr)[Symbol.iterator](); }; }
+        if (typeof prop === "string" && /^\d+$/.test(prop)) { var n = __attrNames(id)[+prop]; return n == null ? undefined : makeAttr(n); }
+        return t[prop];
+      },
+      has: function (t, prop) {
+        if (prop === "length" || prop === "item" || prop === "getNamedItem") { return true; }
+        if (typeof prop === "string" && /^\d+$/.test(prop)) { return +prop < __attrNames(id).length; }
+        return prop in t;
+      }
+    });
+    Object.defineProperty(el, "attributes", { get: function () { return attrMap; }, configurable: true });
+    def(el, "removeAttributeNode", function (attr) {
+      if (attr && attr.name != null) { __removeAttr(id, String(attr.name)); }
+      return attr;
+    });
+    def(el, "getAttributeNode", function (name) {
+      name = String(name); return __getAttr(id, name) == null ? null : makeAttr(name);
+    });
+    def(el, "setAttributeNode", function (attr) {
+      if (attr && attr.name != null) { __setAttr(id, String(attr.name), attr.value == null ? "" : String(attr.value)); }
+      return attr;
+    });
 
     def(el, "appendChild", function (child) {
       if (child && typeof child.__node === "number") { __appendChild(id, child.__node); }
@@ -1959,7 +1995,7 @@ const TIMERS_BOOTSTRAP: &str = r#"
     while (loop.micro.length > 0) {
       var m = loop.micro.shift();
       ranSomething = true;
-      try { m(); } catch (e) { globalThis.__timerErrors.push(String(e)); }
+      try { m(); } catch (e) { globalThis.__timerErrors.push((e&&e.stack||String(e))); }
     }
     if (ranSomething) { return true; }
 
@@ -1988,7 +2024,7 @@ const TIMERS_BOOTSTRAP: &str = r#"
       else { loop.timers.splice(bestIdx, 1); }
     }
     try { timer.fn.apply(undefined, timer.args); }
-    catch (e) { globalThis.__timerErrors.push(String(e)); }
+    catch (e) { globalThis.__timerErrors.push((e&&e.stack||String(e))); }
     return true;
   });
 })();
@@ -2197,7 +2233,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (list) {
         var copy = list.slice();
         for (var i = 0; i < copy.length; i++) {
-          try { copy[i].call(target, ev); } catch (e) { (globalThis.__timerErrors || []).push(String(e)); }
+          try { copy[i].call(target, ev); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); }
         }
       }
       return true;
@@ -2229,7 +2265,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     signal.aborted = true;
     signal.reason = __makeAbortReason(reason);
     var ev = { type: "abort", target: signal, currentTarget: signal, bubbles: false };
-    if (typeof signal.onabort === "function") { try { signal.onabort.call(signal, ev); } catch (e) { (globalThis.__timerErrors || []).push(String(e)); } }
+    if (typeof signal.onabort === "function") { try { signal.onabort.call(signal, ev); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); } }
     if (typeof signal.dispatchEvent === "function") { try { signal.dispatchEvent(ev); } catch (e) {} }
   }
   function AbortSignal() {
@@ -2292,12 +2328,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   function fireOn(target, type) {
     if (target && typeof target.dispatchEvent === "function") {
-      try { target.dispatchEvent(makeEvent(type)); } catch (e) { (globalThis.__timerErrors || []).push(String(e)); }
+      try { target.dispatchEvent(makeEvent(type)); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); }
     }
     // Also invoke an `on<type>` handler if one was assigned (e.g. window.onload = ...).
     var on = target ? target["on" + type] : null;
     if (typeof on === "function") {
-      try { on.call(target, makeEvent(type)); } catch (e) { (globalThis.__timerErrors || []).push(String(e)); }
+      try { on.call(target, makeEvent(type)); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); }
     }
   }
   // Called from Rust's drain phase, in order, to advance readyState and fire lifecycle events.
@@ -3919,13 +3955,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (list) {
         var copy = list.slice();
         for (var i = 0; i < copy.length; i++) {
-          try { copy[i].call(target, ev); } catch (e6) { (globalThis.__timerErrors || []).push(String(e6)); }
+          try { copy[i].call(target, ev); } catch (e6) { (globalThis.__timerErrors || []).push((e6&&e6.stack||String(e6))); }
           if (stoppedImmediate) { break; }
         }
       }
       var on = target["on" + type];
       if (typeof on === "function") {
-        try { on.call(target, ev); } catch (e7) { (globalThis.__timerErrors || []).push(String(e7)); }
+        try { on.call(target, ev); } catch (e7) { (globalThis.__timerErrors || []).push((e7&&e7.stack||String(e7))); }
       }
     }
     return !ev.defaultPrevented;
@@ -3957,12 +3993,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (list) {
       var copy = list.slice();
       for (var i = 0; i < copy.length; i++) {
-        try { copy[i].call(node, ev); } catch (e6) { (globalThis.__timerErrors || []).push(String(e6)); }
+        try { copy[i].call(node, ev); } catch (e6) { (globalThis.__timerErrors || []).push((e6&&e6.stack||String(e6))); }
       }
     }
     var on = node["on" + type];
     if (typeof on === "function") {
-      try { on.call(node, ev); } catch (e7) { (globalThis.__timerErrors || []).push(String(e7)); }
+      try { on.call(node, ev); } catch (e7) { (globalThis.__timerErrors || []).push((e7&&e7.stack||String(e7))); }
     }
     return !ev.defaultPrevented;
   });
