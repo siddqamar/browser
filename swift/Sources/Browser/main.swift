@@ -925,6 +925,19 @@ final class DOMNode {
     let children: [DOMNode]
     weak var parent: DOMNode?
 
+    /// True for the synthetic `</tag>` row shown after an expanded element's children.
+    var isClosing = false
+    private var _closingNode: DOMNode?
+    /// A cached `</tag>` pseudo-node (same id, so selecting it highlights the same element).
+    var closingNode: DOMNode {
+        if let n = _closingNode { return n }
+        let n = DOMNode(id: id, isElement: true, tag: tag, attrs: [], text: "", children: [])
+        n.isClosing = true
+        n.parent = self
+        _closingNode = n
+        return n
+    }
+
     init(id: Int, isElement: Bool, tag: String, attrs: [(String, String)], text: String, children: [DOMNode]) {
         self.id = id
         self.isElement = isElement
@@ -995,16 +1008,18 @@ final class DOMNode {
 extension DevToolsView: NSOutlineViewDataSource, NSOutlineViewDelegate {
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         guard let node = item as? DOMNode else { return domRoot == nil ? 0 : 1 }
-        return node.children.count
+        if node.isClosing || node.children.isEmpty { return 0 }
+        return node.children.count + 1 // +1 for the synthetic </tag> row
     }
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
         guard let node = item as? DOMNode else { return domRoot! }
-        return node.children[index]
+        return index < node.children.count ? node.children[index] : node.closingNode
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
-        (item as? DOMNode).map { !$0.children.isEmpty } ?? false
+        guard let node = item as? DOMNode, !node.isClosing else { return false }
+        return !node.children.isEmpty
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
@@ -1020,7 +1035,9 @@ extension DevToolsView: NSOutlineViewDataSource, NSOutlineViewDelegate {
             cell.lineBreakMode = .byTruncatingTail
             cell.drawsBackground = false
         }
-        if node.isElement {
+        if node.isClosing {
+            cell.attributedStringValue = DevToolsView.closingRow(node)
+        } else if node.isElement {
             cell.attributedStringValue = DevToolsView.elementRow(node)
         } else {
             // Text node: quoted, truncated, muted.
@@ -1070,6 +1087,19 @@ extension DevToolsView: NSOutlineViewDataSource, NSOutlineViewDelegate {
         }
         if node.attrs.count > 6 { add(" …", punct) }
         add(">", punct)
+        return s
+    }
+
+    /// A `</tag>` closing-tag row (shown after an expanded element's children).
+    static func closingRow(_ node: DOMNode) -> NSAttributedString {
+        let tagColor = NSColor(calibratedRed: 0.45, green: 0.75, blue: 1.0, alpha: 1.0)
+        let punct = NSColor(white: 0.55, alpha: 1.0)
+        let font = DevToolsView.mono
+        let s = NSMutableAttributedString()
+        func add(_ str: String, _ color: NSColor) {
+            s.append(NSAttributedString(string: str, attributes: [.font: font, .foregroundColor: color]))
+        }
+        add("</", punct); add(node.tag, tagColor); add(">", punct)
         return s
     }
 
