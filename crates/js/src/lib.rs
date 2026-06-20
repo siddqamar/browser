@@ -1496,7 +1496,170 @@ fn with_computed_style<R>(
     }
     let cache = state.computed_cache.borrow();
     let map = cache.as_ref().map(|(_, m)| m);
-    f(map.and_then(|m| m.get(&id)))
+    if let Some(m) = map {
+        if let Some(cs) = m.get(&id) {
+            return f(Some(cs));
+        }
+        // Not in the main document cascade — it may live in an <iframe> facade document. Cascade that
+        // detached subtree on its own, with the iframe's size as the viewport so the frame's @media
+        // queries get their own context (re-resolved live as the iframe resizes).
+        let doc = state.doc.borrow();
+        if let Some((facade_root, iframe_id)) = find_facade_root(&doc, id) {
+            // A `display: none` iframe isn't rendered, so its document has no boxes — getComputedStyle
+            // returns the empty (no-value) style for its elements.
+            if m.get(&iframe_id).map(|cs| cs.display_none).unwrap_or(false) {
+                return f(None);
+            }
+            let attr_dim = |name: &str| -> Option<f32> {
+                if let dom::NodeData::Element(e) = &doc.get(iframe_id).data {
+                    e.attrs.get(name).and_then(|v| v.trim().parse::<f32>().ok())
+                } else {
+                    None
+                }
+            };
+            // Content width is resolved recursively (a nested iframe's % width is relative to the
+            // outer iframe's content width); height uses the simpler CSS-or-attr-or-default form.
+            let iw = iframe_content_width(state, &doc, m, iframe_id, 0);
+            let ih = m.get(&iframe_id).and_then(|cs| cs.height).or_else(|| attr_dim("height")).unwrap_or(150.0);
+            let sheets = collect_facade_sheets(&doc, facade_root, &state.fetcher);
+            let (sw, sh, sd) = style::viewport_metrics();
+            style::set_viewport_metrics(iw, ih, sd);
+            let mut submap = style::cascade_subtree(&doc, facade_root, &sheets);
+            style::set_viewport_metrics(sw, sh, sd);
+            // Resolve percentage widths against the iframe content width (top-down), so
+            // getComputedStyle reports their used px value (the frame has no real layout pass).
+            resolve_facade_widths(&doc, &mut submap, facade_root, iw);
+            return f(submap.get(&id));
+        }
+    }
+    f(None)
+}
+
+/// Walk up from `id` to the nearest `<iframe>` facade-document root (its body carries a
+/// `data-frame-host` attribute = the host iframe's node id). Returns `(facade_root, iframe_node)`.
+fn find_facade_root(doc: &dom::Document, id: dom::NodeId) -> Option<(dom::NodeId, dom::NodeId)> {
+    let mut cur = Some(id);
+    while let Some(c) = cur {
+        if c.0 < doc.len() {
+            if let dom::NodeData::Element(e) = &doc.get(c).data {
+                if let Some(v) = e.attrs.get("data-frame-host") {
+                    if let Ok(raw) = v.trim().parse::<usize>() {
+                        return Some((c, dom::NodeId(raw)));
+                    }
+                }
+            }
+        }
+        cur = doc.get(c).parent;
+    }
+    None
+}
+
+/// The content width of an `<iframe>` in CSS px: explicit CSS width, else the `width` HTML attribute,
+/// else — for a nested iframe whose width is a percentage — resolved by cascading the *outer* iframe
+/// facade (recursing through outer frames), else the conventional 300px default.
+fn iframe_content_width(
+    state: &HostState,
+    doc: &dom::Document,
+    map: &HashMap<dom::NodeId, style::ComputedStyle>,
+    iframe_id: dom::NodeId,
+    depth: u32,
+) -> f32 {
+    if depth > 8 {
+        return 300.0;
+    }
+    if let Some(w) = map.get(&iframe_id).and_then(|c| c.width) {
+        return w;
+    }
+    if let dom::NodeData::Element(e) = &doc.get(iframe_id).data {
+        if let Some(w) = e.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok()) {
+            return w;
+        }
+    }
+    // Not sized directly: the iframe lives inside an outer iframe's facade (a nested frame). Cascade
+    // that outer facade against the outer iframe's content width, resolve widths, and read this
+    // iframe's used width there.
+    if let Some((outer_root, outer_iframe)) = find_facade_root(doc, iframe_id) {
+        let outer_w = iframe_content_width(state, doc, map, outer_iframe, depth + 1);
+        let sheets = collect_facade_sheets(doc, outer_root, &state.fetcher);
+        let (sw, sh, sd) = style::viewport_metrics();
+        style::set_viewport_metrics(outer_w, 150.0, sd);
+        let mut submap = style::cascade_subtree(doc, outer_root, &sheets);
+        style::set_viewport_metrics(sw, sh, sd);
+        resolve_facade_widths(doc, &mut submap, outer_root, outer_w);
+        if let Some(w) = submap.get(&iframe_id).and_then(|c| c.width) {
+            return w;
+        }
+    }
+    300.0
+}
+
+/// Resolve percentage / auto block widths down a facade subtree so getComputedStyle reports a used
+/// px width (the frame has no layout pass). `avail_width` is the containing block's content width.
+fn resolve_facade_widths(
+    doc: &dom::Document,
+    submap: &mut HashMap<dom::NodeId, style::ComputedStyle>,
+    id: dom::NodeId,
+    avail_width: f32,
+) {
+    let content_w = if let Some(cs) = submap.get_mut(&id) {
+        match cs.width.or_else(|| cs.width_pct.map(|p| (avail_width * p).max(0.0))) {
+            Some(w) => {
+                cs.width = Some(w);
+                (w - cs.padding.left - cs.padding.right - cs.border.left - cs.border.right).max(0.0)
+            }
+            None => (avail_width
+                - cs.margin.left - cs.margin.right
+                - cs.padding.left - cs.padding.right
+                - cs.border.left - cs.border.right)
+                .max(0.0),
+        }
+    } else {
+        avail_width
+    };
+    let children: Vec<dom::NodeId> = doc.get(id).children.clone();
+    for child in children {
+        resolve_facade_widths(doc, submap, child, content_w);
+    }
+}
+
+/// The author CSS inside an iframe facade subtree (its `<style>` text + `<link>` CSS), as one sheet.
+fn collect_facade_sheets(
+    doc: &dom::Document,
+    root: dom::NodeId,
+    fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+) -> Vec<css::Stylesheet> {
+    fn walk(
+        doc: &dom::Document,
+        id: dom::NodeId,
+        out: &mut String,
+        fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+    ) {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("style") {
+                out.push_str(&text_content(doc, id));
+                out.push('\n');
+                return;
+            }
+            if e.tag.eq_ignore_ascii_case("link") {
+                if let Some(href) = e.attrs.get("href") {
+                    if let Some(css) = fetch_link_css(href, fetcher) {
+                        out.push_str(&css);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        for &child in &doc.get(id).children {
+            walk(doc, child, out, fetcher);
+        }
+    }
+    let mut css_src = String::new();
+    walk(doc, root, &mut css_src, fetcher);
+    if css_src.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![css::parse(&css_src)]
+    }
 }
 
 /// Like [`with_computed_style`] but exposes the whole cascade `map` plus the live `Document`, so a
@@ -10678,9 +10841,24 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
               createDocumentFragment: function () { return document.createDocumentFragment(); },
               adoptedStyleSheets: [], styleSheets: { length: 0, item: function () { return null; } },
               defaultView: null,
+              // document.open/write/close populate the frame's body (so the page can build the
+              // iframe document dynamically). write() parses the HTML fragment into the frame body.
+              open: function () { try { while (body.firstChild) { body.removeChild(body.firstChild); } } catch (e) {} return doc; },
+              write: function (html) {
+                try {
+                  var tmp = document.createElement("div");
+                  tmp.innerHTML = String(html == null ? "" : html);
+                  while (tmp.firstChild) { body.appendChild(tmp.firstChild); }
+                } catch (e) {}
+              },
+              writeln: function (html) { doc.write((html == null ? "" : String(html)) + "\n"); },
+              close: function () {},
             };
             // Tag the content body so ownerDocument resolution maps it (and its subtree) to `doc`.
             try { def(body, "__frameDoc", doc); } catch (e) {}
+            // Mark the frame body with the host <iframe>'s node id so getComputedStyle on frame
+            // content can cascade this subtree with the iframe's own size as the media viewport.
+            try { if (typeof this.__node === "number") { body.setAttribute("data-frame-host", String(this.__node)); } } catch (e) {}
             this.__cdoc = doc;
           }
           return this.__cdoc;
@@ -10695,6 +10873,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
               document: d,
               // Run code with `document` bound to the iframe's facade document (direct eval sees it).
               eval: function (code) { var document = d; return eval(code); },
+              // The frame window's getComputedStyle: the global one already cascades frame-document
+              // subtrees with the iframe's own viewport, so just delegate.
+              getComputedStyle: function (el, pseudo) { return getComputedStyle(el, pseudo); },
             };
             d.defaultView = this.__cwin;
           }

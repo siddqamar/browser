@@ -1510,6 +1510,62 @@ fn cascade_locked(
     (out, root_used_scheme_dark())
 }
 
+/// Cascade only the subtree rooted at `root_id` (e.g. an `<iframe>` facade document's body),
+/// returning computed styles for it and its descendants. Author `sheets` apply; `@media` queries
+/// evaluate against the CURRENT viewport (callers set [`set_viewport_metrics`] to the iframe's own
+/// size first, so the iframe gets its own media context). The subtree root inherits initial values.
+pub fn cascade_subtree(
+    doc: &dom::Document,
+    root_id: dom::NodeId,
+    sheets: &[css::Stylesheet],
+) -> HashMap<dom::NodeId, ComputedStyle> {
+    let _cascade_guard = CASCADE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // @property registrations from this document's sheets (last wins on duplicate names).
+    {
+        let mut reg: Vec<css::PropertyRule> = Vec::new();
+        for sheet in sheets {
+            for pr in &sheet.property_rules {
+                reg.retain(|r| r.name != pr.name);
+                reg.push(pr.clone());
+            }
+        }
+        REGISTERED_PROPERTIES.with(|c| *c.borrow_mut() = reg);
+    }
+    // @namespace bindings from this document's sheets.
+    {
+        let mut env = NamespaceEnv::default();
+        for sheet in sheets {
+            for ns in &sheet.namespace_rules {
+                if ns.prefix.is_empty() {
+                    env.default_ns = Some(ns.uri.clone());
+                } else {
+                    env.prefixes.push((ns.prefix.clone(), ns.uri.clone()));
+                }
+            }
+        }
+        NAMESPACE_BINDINGS.with(|c| *c.borrow_mut() = env);
+    }
+    let ua = user_agent_stylesheet();
+    let index = SelectorIndex::build(&ua, sheets);
+    let initial = ComputedStyle::default();
+    let initial_vars: HashMap<String, String> = HashMap::new();
+    let mut out = HashMap::new();
+    cascade_node(doc, root_id, &initial, &initial_vars, false, &index, &mut out);
+    out
+}
+
+/// The current viewport metrics `(width, height, device_pixel_ratio)` in CSS px — what `@media`
+/// queries are evaluated against. Lets callers save/restore around a temporary override (e.g. an
+/// iframe's own size for a subtree cascade).
+pub fn viewport_metrics() -> (f32, f32, f32) {
+    use std::sync::atomic::Ordering;
+    (
+        f32::from_bits(VIEWPORT_W_BITS.load(Ordering::Relaxed)),
+        f32::from_bits(VIEWPORT_H_BITS.load(Ordering::Relaxed)),
+        f32::from_bits(VIEWPORT_DPR_BITS.load(Ordering::Relaxed)),
+    )
+}
+
 /// Resolve the root's *used* color scheme (true = dark) for one cascade. Reads the page's
 /// `color-scheme` opt-in (which determines whether the UA renders a dark canvas + light text) and
 /// combines it with the OS appearance:
