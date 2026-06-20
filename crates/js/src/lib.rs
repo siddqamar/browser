@@ -3325,9 +3325,12 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     if (__nodeType(nodeId) === 11) {
       var moving = __children(nodeId).slice();
       for (var i = 0; i < moving.length; i++) { __insertBefore(parentId, moving[i], refId); }
+      if (globalThis.__ceOnInsert) { for (var k = 0; k < moving.length; k++) { try { globalThis.__ceOnInsert(moving[k]); } catch (e) {} } }
       return nodeId;
     }
     __insertBefore(parentId, nodeId, refId);
+    // Custom Elements: a newly-connected element (and its subtree) may need upgrading + connectedCallback.
+    if (globalThis.__ceOnInsert) { try { globalThis.__ceOnInsert(nodeId); } catch (e) {} }
     return nodeId;
   }
 
@@ -10009,6 +10012,81 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         enumerable: true, configurable: true
       });
     }
+  } catch (e) {}
+
+  // --- Custom Elements (minimal) ---------------------------------------------------------------
+  // `customElements.define(name, ctor)` registers a class, then upgrades matching elements already
+  // in the tree (re-pointing their prototype at the ctor's) and fires `connectedCallback` on the
+  // connected ones. Elements inserted later are upgraded/connected via the insertNode hook. We skip
+  // the spec's constructor-run-with-`this`-as-the-element machinery (we can't replicate it without
+  // engine support) — connectedCallback covers the overwhelming majority of components.
+  try {
+    var __ceReg = {};      // name -> ctor
+    var __ceWhen = {};     // name -> { promise, resolve }
+    function __ceConnected(el) {
+      try { return !!(document.documentElement && document.documentElement.contains(el)); } catch (e) { return false; }
+    }
+    function __ceUpgrade(el) {
+      if (!el || el.__ceUpgraded) { return; }
+      var name = (el.tagName || "").toLowerCase();
+      var ctor = __ceReg[name];
+      if (!ctor) { return; }
+      def(el, "__ceUpgraded", true);
+      try { if (ctor.prototype) { Object.setPrototypeOf(el, ctor.prototype); } } catch (e) {}
+    }
+    function __ceConnect(el) {
+      __ceUpgrade(el);
+      if (!el || !el.__ceUpgraded || el.__ceConnectedFired) { return; }
+      if (!__ceConnected(el)) { return; }
+      def(el, "__ceConnectedFired", true);
+      if (typeof el.connectedCallback === "function") {
+        try { el.connectedCallback(); }
+        catch (e) { try { console.error(e); } catch (e2) {} }
+      }
+    }
+    function __ceWalk(nodeId) {
+      if (nodeId == null || nodeId < 0) { return; }
+      try {
+        var el = (typeof globalThis.__nodeById === "function" && globalThis.__nodeById(nodeId)) ||
+                 (typeof globalThis.__canonNode === "function" ? globalThis.__canonNode(nodeId) : null);
+        if (el && el.tagName) { __ceConnect(el); }
+        var kids = __children(nodeId);
+        for (var i = 0; i < kids.length; i++) { __ceWalk(kids[i]); }
+      } catch (e) {}
+    }
+    // Called from insertNode. Cheap no-op until at least one custom element is defined.
+    def(globalThis, "__ceOnInsert", function (nodeId) {
+      for (var k in __ceReg) { __ceWalk(nodeId); return; }
+    });
+    def(globalThis, "customElements", {
+      define: function (name, ctor) {
+        if (typeof name !== "string" || !/^[a-z][a-z0-9._]*-[a-z0-9._-]*$/.test(name)) {
+          throw new globalThis.DOMException("'" + name + "' is not a valid custom element name", "SyntaxError");
+        }
+        if (typeof ctor !== "function") {
+          throw new globalThis.TypeError("The second argument to customElements.define must be a constructor");
+        }
+        if (__ceReg[name]) {
+          throw new globalThis.DOMException("the name '" + name + "' has already been used with this registry", "NotSupportedError");
+        }
+        __ceReg[name] = ctor;
+        // Upgrade + connect elements already in the document (snapshot first — connectedCallback may mutate).
+        try {
+          var live = document.getElementsByTagName(name);
+          var arr = []; for (var i = 0; i < live.length; i++) { arr.push(live[i]); }
+          for (var j = 0; j < arr.length; j++) { __ceConnect(arr[j]); }
+        } catch (e) {}
+        if (__ceWhen[name]) { try { __ceWhen[name].resolve(ctor); } catch (e) {} }
+      },
+      get: function (name) { return __ceReg[name] || undefined; },
+      getName: function (ctor) { for (var k in __ceReg) { if (__ceReg[k] === ctor) { return k; } } return null; },
+      whenDefined: function (name) {
+        if (__ceReg[name]) { return Promise.resolve(__ceReg[name]); }
+        if (!__ceWhen[name]) { var r; var p = new Promise(function (res) { r = res; }); __ceWhen[name] = { promise: p, resolve: r }; }
+        return __ceWhen[name].promise;
+      },
+      upgrade: function (root) { try { __ceWalk(root && root.__node); } catch (e) {} }
+    });
   } catch (e) {}
 
   // --- Image / Audio / media element constructors ------------------------------------------
