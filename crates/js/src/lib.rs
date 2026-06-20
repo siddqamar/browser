@@ -5220,13 +5220,16 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     fireOn(document, "DOMContentLoaded");
     readyState = "complete";
     fireOn(document, "readystatechange");
-    // Fire `load` on each connected, enabled stylesheet <link> before the window load — pages use
-    // link.onload to know the sheet is ready (their sheets are already available to us).
+    // Fire `load` on each connected, enabled stylesheet <link> with an inline `data:` sheet before
+    // the window load — those are available synchronously. We deliberately do NOT fire for external
+    // hrefs here: we can't tell when a real (possibly slow / render-blocking) sheet has finished
+    // loading, and firing early would run a page's onload check before its CSS is applied.
     try {
       var __lks = document.querySelectorAll("link[rel~=stylesheet]");
       for (var __i = 0; __i < __lks.length; __i++) {
         var __lk = __lks[__i];
-        if (__lk.__loadFired || !__lk.getAttribute || !__lk.getAttribute("href") || __lk.disabled) { continue; }
+        var __href = __lk.getAttribute && __lk.getAttribute("href");
+        if (__lk.__loadFired || !__href || __href.slice(0, 5) !== "data:" || __lk.disabled) { continue; }
         def(__lk, "__loadFired", true);
         try { __lk.dispatchEvent(new Event("load")); } catch (e) {}
       }
