@@ -9522,6 +9522,23 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   ];
   for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
 
+  // CSSStyleDeclaration is a WebIDL iterable<> (over its property names by index). Put the default
+  // iterator on the PROTOTYPE so `Symbol.iterator in CSSStyleDeclaration.prototype` holds (instances
+  // may still carry their own iterator over their live declarations).
+  try {
+    if (globalThis.CSSStyleDeclaration && globalThis.CSSStyleDeclaration.prototype) {
+      Object.defineProperty(globalThis.CSSStyleDeclaration.prototype, Symbol.iterator, {
+        value: function () {
+          var self = this, i = 0;
+          var it = { next: function () { var n = self.length >>> 0; return i < n ? { value: self[i++], done: false } : { value: undefined, done: true }; } };
+          it[Symbol.iterator] = function () { return this; };
+          return it;
+        },
+        writable: true, enumerable: false, configurable: true
+      });
+    }
+  } catch (e) {}
+
   // --- DOMRect factory + real Range + CaretPosition (caret hit-testing support) ---------------
   // A DOMRect instance (prototype-correct, so `r instanceof DOMRect`) holding x/y/width/height plus
   // the derived top/right/bottom/left and a toJSON. Used by Range.getBoundingClientRect and
