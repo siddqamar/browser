@@ -743,9 +743,16 @@ impl Engine {
             .iter()
             .map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv))
             .collect();
+        // CSSOM used margin values (device px -> CSS px), for getComputedStyle's resolved margins.
+        let mut margins: HashMap<usize, [f32; 4]> = HashMap::new();
+        collect_used_margins(&cache.root, &mut margins);
+        let margin_list: Vec<(usize, f32, f32, f32, f32)> = margins
+            .iter()
+            .map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv))
+            .collect();
         let scroll_y_css = self.scroll_y * inv;
         let doc_height_css = cache.content_h * inv;
-        session.set_layout_rects(list, naturals, inset_list, scroll_y_css, doc_height_css);
+        session.set_layout_rects(list, naturals, inset_list, margin_list, scroll_y_css, doc_height_css);
     }
 
     /// Paint the current state into a fresh framebuffer and return a reference to it.
@@ -2344,6 +2351,18 @@ fn collect_used_insets(b: &layout::LayoutBox, out: &mut HashMap<usize, [f32; 4]>
     }
 }
 
+/// Like `collect_used_insets`, but for each box's resolved margins `[top, right, bottom, left]`
+/// (device px). Pushed to the JS Session so `getComputedStyle(el).margin*` reports the used value
+/// (e.g. an `auto` margin resolved to a centering offset).
+fn collect_used_margins(b: &layout::LayoutBox, out: &mut HashMap<usize, [f32; 4]>) {
+    if let (Some(node), Some(margins)) = (b.node, b.used_margins) {
+        out.entry(node.0).or_insert(margins);
+    }
+    for c in &b.children {
+        collect_used_margins(c, out);
+    }
+}
+
 /// Standalone layout pass that produces the per-node rect table (CSS px, document-absolute) for a
 /// `doc` + `styles`, WITHOUT touching `Engine` state. Used to seed the JS session's `layout_rects`
 /// BEFORE its scripts run, so synchronous layout-dependent reads during page load
@@ -2366,6 +2385,7 @@ fn compute_initial_rects(
 ) -> Option<(
     Vec<(usize, f32, f32, f32, f32)>,
     Vec<(usize, f32, f32)>,
+    Vec<(usize, f32, f32, f32, f32)>,
     Vec<(usize, f32, f32, f32, f32)>,
     f32,
     f32,
@@ -2397,7 +2417,11 @@ fn compute_initial_rects(
     collect_used_insets(&root, &mut insets);
     let inset_list: Vec<(usize, f32, f32, f32, f32)> =
         insets.iter().map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)).collect();
-    Some((rect_list, naturals, inset_list, 0.0, content_h * inv))
+    let mut margins: HashMap<usize, [f32; 4]> = HashMap::new();
+    collect_used_margins(&root, &mut margins);
+    let margin_list: Vec<(usize, f32, f32, f32, f32)> =
+        margins.iter().map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)).collect();
+    Some((rect_list, naturals, inset_list, margin_list, 0.0, content_h * inv))
 }
 
 /// Collect every masked box: its node id, border-box rect (device px), and the resolved
@@ -4958,6 +4982,7 @@ fn start_session(
     initial_rects: Option<(
         Vec<(usize, f32, f32, f32, f32)>,
         Vec<(usize, f32, f32)>,
+        Vec<(usize, f32, f32, f32, f32)>,
         Vec<(usize, f32, f32, f32, f32)>,
         f32,
         f32,

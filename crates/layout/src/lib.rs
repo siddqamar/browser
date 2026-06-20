@@ -1410,6 +1410,22 @@ fn place_marker(boxx: &mut LayoutBox, mut mb: Box<LayoutBox>, x: f32, y: f32, me
 /// width the free space goes to the auto margin(s), split evenly to center when both are auto (the
 /// `margin: 0 auto` idiom). Persists the resolved margins (and `used_margins` for getComputedStyle).
 /// `#[inline(never)]` so it doesn't bloat the recursive `layout_block` frame.
+/// Distribute `free` horizontal space to the `auto` left/right margins (CSS 2.2 §10.3.3/§10.3.7):
+/// both auto → split evenly (center); one auto → it takes all of `free`; neither → unchanged.
+/// `margin_auto` is `[top, right, bottom, left]`.
+fn distribute_auto_margins(margin: &mut Edges, margin_auto: [bool; 4], free: f32) {
+    match (margin_auto[3], margin_auto[1]) {
+        (true, true) => {
+            let half = (free * 0.5).max(0.0);
+            margin.left = half;
+            margin.right = (free - half).max(0.0);
+        }
+        (true, false) => margin.left = (free - margin.right).max(0.0),
+        (false, true) => margin.right = (free - margin.left).max(0.0),
+        (false, false) => {}
+    }
+}
+
 #[inline(never)]
 fn resolve_block_margins(
     boxx: &mut LayoutBox,
@@ -1429,16 +1445,7 @@ fn resolve_block_margins(
             - border.right
             - padding.left
             - padding.right;
-        match (margin_auto[3], margin_auto[1]) {
-            (true, true) => {
-                let half = (free * 0.5).max(0.0);
-                margin.left = half;
-                margin.right = (free - half).max(0.0);
-            }
-            (true, false) => margin.left = (free - margin.right).max(0.0),
-            (false, true) => margin.right = (free - margin.left).max(0.0),
-            (false, false) => {}
-        }
+        distribute_auto_margins(&mut margin, margin_auto, free);
         boxx.dimensions.margin = margin;
     }
     boxx.used_margins = Some([margin.top, margin.right, margin.bottom, margin.left]);
@@ -1647,7 +1654,7 @@ fn layout_out_of_flow(
         Some(cs) => cs.clone(),
         None => return,
     };
-    let margin = boxx.dimensions.margin;
+    let mut margin = boxx.dimensions.margin;
     let border = boxx.dimensions.border;
     let padding = boxx.dimensions.padding;
     let horizontal = margin.left + margin.right + border.left + border.right + padding.left
@@ -1673,10 +1680,23 @@ fn layout_out_of_flow(
     // Clamp to min/max-width against the containing block.
     let content_width = clamp_width(boxx, content_width, cb.width, styles);
 
+    // Over-constrained box (left, right AND width all set) with auto margin(s): the leftover inline
+    // space goes to the auto margin(s) (CSS 2.2 §10.3.7) — centering when both are auto. Otherwise
+    // auto margins stay 0 (the style crate already resolved them so).
+    if let (Some(l), Some(r)) = (cs.left, cs.right) {
+        if cs.width.is_some() && (cs.margin_auto[1] || cs.margin_auto[3]) {
+            let free = cb.width - l - r - content_width - border.left - border.right - padding.left
+                - padding.right;
+            distribute_auto_margins(&mut margin, cs.margin_auto, free);
+            boxx.dimensions.margin = margin;
+        }
+    }
+    boxx.used_margins = Some([margin.top, margin.right, margin.bottom, margin.left]);
+
     // Tentative content origin: relative to the containing block's top-left, offset by insets.
     // The insets address the box's *margin* box edge; we then add the box's own left/top edges.
     let border_left_x = if let Some(l) = cs.left {
-        cb.x + l
+        cb.x + l + margin.left
     } else if let Some(r) = cs.right {
         cb.x + cb.width - r - (content_width + horizontal) + margin.left
     } else {

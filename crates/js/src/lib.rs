@@ -177,6 +177,10 @@ struct HostState {
     /// so `getComputedStyle(el).top` etc. report the used value when the element has a box; absent for
     /// box-less / non-positioned elements (those fall back to the computed value).
     used_insets: RefCell<HashMap<usize, (f32, f32, f32, f32)>>,
+    /// CSSOM *used* margin values per box, keyed by node id, pushed by the engine alongside
+    /// `layout_rects`. `(top, right, bottom, left)` in CSS px. Read by `getComputedStyle(el).margin*`
+    /// so resolved `auto` margins (centering / over-constrained boxes) report their used pixel value.
+    used_margins: RefCell<HashMap<usize, (f32, f32, f32, f32)>>,
     /// Decoded intrinsic size of each `<img>`, keyed by node id, pushed by the engine alongside
     /// `layout_rects`. `(natural_width, natural_height)` in CSS px from the decoded bitmap. Read by
     /// the `__naturalSize` primitive backing `img.naturalWidth` / `img.naturalHeight`. Empty until
@@ -240,6 +244,7 @@ impl HostState {
             computed_cache: RefCell::new(None),
             layout_rects: RefCell::new(HashMap::new()),
             used_insets: RefCell::new(HashMap::new()),
+            used_margins: RefCell::new(HashMap::new()),
             image_natural: RefCell::new(HashMap::new()),
             canvas_pixels: RefCell::new(HashMap::new()),
             viewport_scroll_y: Cell::new(0.0),
@@ -1756,7 +1761,31 @@ fn prim_computed_style_prop(
                 "left" => Some(style::EdgeSide::Left),
                 _ => None,
             };
-            match inset_side {
+            // Margin longhands report the CSSOM *used* value: the engine pushes resolved margins
+            // (including `auto` centering / over-constrained boxes) keyed by node id.
+            let margin_idx = match name.as_str() {
+                "margin-top" => Some(0usize),
+                "margin-right" => Some(1),
+                "margin-bottom" => Some(2),
+                "margin-left" => Some(3),
+                _ => None,
+            };
+            if let Some(idx) = margin_idx {
+                // Only an `auto` margin needs the engine's resolved used value; a specified margin's
+                // computed value is always current (and not stale between layouts). Falls back to the
+                // computed value if the engine hasn't pushed a used margin yet.
+                with_computed_style(&state, n, |cs| match cs {
+                    Some(cs) if cs.margin_auto[idx] => state
+                        .used_margins
+                        .borrow()
+                        .get(&n.0)
+                        .map(|&(t, r, b, l)| style::serialize_px([t, r, b, l][idx]))
+                        .unwrap_or_else(|| cs.get_property(&name)),
+                    Some(cs) => cs.get_property(&name),
+                    None => String::new(),
+                })
+            } else {
+                match inset_side {
                 Some(side) => {
                     // The engine pushed this box's used inset values (px) keyed by node id; pick this
                     // side. Used by the resolved-value algorithm for cases that need real layout
@@ -1775,6 +1804,7 @@ fn prim_computed_style_prop(
                 None => with_computed_style(&state, n, |cs| {
                     cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
                 }),
+                }
             }
         }
     };
@@ -13409,6 +13439,9 @@ enum SessionCmd {
         /// `(node_id, top, right, bottom, left)` per positioned box: the CSSOM *used* inset values
         /// in CSS px. Backs `getComputedStyle(el).top` etc. when the element has a box.
         insets: Vec<(usize, f32, f32, f32, f32)>,
+        /// `(node_id, top, right, bottom, left)` per box: the CSSOM *used* margin values in CSS px.
+        /// Backs `getComputedStyle(el).margin*` so resolved `auto` margins report their used value.
+        margins: Vec<(usize, f32, f32, f32, f32)>,
         /// Vertical scroll offset in CSS px (subtracted to make rects viewport-relative).
         scroll_y_css: f32,
         /// Full document content height in CSS px (reported as documentElement/body scrollHeight).
@@ -13472,10 +13505,11 @@ impl Session {
         ws_connector: WsConnector,
         // Layout rects to seed into HostState BEFORE the page's scripts run, so synchronous
         // layout-dependent reads during load see real geometry. `(rects, naturals, insets,
-        // scroll_y_css, doc_height_css)` (CSS px). `None` to seed nothing.
+        // margins, scroll_y_css, doc_height_css)` (CSS px). `None` to seed nothing.
         initial_rects: Option<(
             Vec<(usize, f32, f32, f32, f32)>,
             Vec<(usize, f32, f32)>,
+            Vec<(usize, f32, f32, f32, f32)>,
             Vec<(usize, f32, f32, f32, f32)>,
             f32,
             f32,
@@ -13593,12 +13627,18 @@ impl Session {
         rects: Vec<(usize, f32, f32, f32, f32)>,
         naturals: Vec<(usize, f32, f32)>,
         insets: Vec<(usize, f32, f32, f32, f32)>,
+        margins: Vec<(usize, f32, f32, f32, f32)>,
         scroll_y_css: f32,
         doc_height_css: f32,
     ) {
-        let _ = self
-            .tx
-            .send(SessionCmd::SetRects { rects, naturals, insets, scroll_y_css, doc_height_css });
+        let _ = self.tx.send(SessionCmd::SetRects {
+            rects,
+            naturals,
+            insets,
+            margins,
+            scroll_y_css,
+            doc_height_css,
+        });
     }
 
     /// Push freshly-rasterized canvas/image RGBA pixels to the worker so `getImageData` returns real
@@ -13791,6 +13831,7 @@ fn session_thread_main(
         Vec<(usize, f32, f32, f32, f32)>,
         Vec<(usize, f32, f32)>,
         Vec<(usize, f32, f32, f32, f32)>,
+        Vec<(usize, f32, f32, f32, f32)>,
         f32,
         f32,
     )>,
@@ -13841,7 +13882,7 @@ fn session_thread_main(
         // Seed the engine-computed layout rects BEFORE scripts run, so synchronous
         // getBoundingClientRect / elementFromPoint / caret*FromPoint reads during page load see real
         // geometry (the rect table is otherwise empty until the engine's first post-load push).
-        if let Some((rects, naturals, insets, scroll_y_css, doc_height_css)) = initial_rects {
+        if let Some((rects, naturals, insets, margins, scroll_y_css, doc_height_css)) = initial_rects {
             let state = host_state(scope);
             {
                 let mut map = state.layout_rects.borrow_mut();
@@ -13855,6 +13896,13 @@ fn session_thread_main(
                 ins.clear();
                 for (id, t, r, b, l) in insets {
                     ins.insert(id, (t, r, b, l));
+                }
+            }
+            {
+                let mut mar = state.used_margins.borrow_mut();
+                mar.clear();
+                for (id, t, r, b, l) in margins {
+                    mar.insert(id, (t, r, b, l));
                 }
             }
             {
@@ -13951,7 +13999,7 @@ fn session_thread_main(
                     let _ = reply.send(None);
                 }
             }
-            SessionCmd::SetRects { rects, naturals, insets, scroll_y_css, doc_height_css } => {
+            SessionCmd::SetRects { rects, naturals, insets, margins, scroll_y_css, doc_height_css } => {
                 // Store on HostState (no JS run needed — just update the geometry tables). Re-enter
                 // the persistent context to reach the slot. Fire-and-forget: no reply.
                 let ctx = context.clone();
@@ -13971,6 +14019,12 @@ fn session_thread_main(
                     ins.insert(id, (t, r, b, l));
                 }
                 drop(ins);
+                let mut mar = state.used_margins.borrow_mut();
+                mar.clear();
+                for (id, t, r, b, l) in margins {
+                    mar.insert(id, (t, r, b, l));
+                }
+                drop(mar);
                 let mut nat = state.image_natural.borrow_mut();
                 nat.clear();
                 for (id, w, h) in naturals {
