@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:browser}/swift",
+      "name": "Debug Browser (swift)",
+      "target": "Browser",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug Browser (swift)"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:browser}/swift",
+      "name": "Release Browser (swift)",
+      "target": "Browser",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release Browser (swift)"
+    }
+  ]
+}
