@@ -4859,24 +4859,464 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     return out;
   }
+  // ====== CSS shorthand <-> longhand machinery (CSSOM serialize-a-CSS-declaration-block) ========
+  // The set of longhands the `all` shorthand resets (every property except direction, unicode-bidi
+  // and custom properties). A representative list — covers the properties the CSSOM tests query.
+  var ALL_LONGHANDS = [
+    "color", "background-color", "background-image", "background-position-x", "background-position-y",
+    "background-size", "background-repeat", "background-attachment", "background-origin", "background-clip",
+    "width", "height", "min-width", "min-height", "max-width", "max-height",
+    "margin-top", "margin-right", "margin-bottom", "margin-left",
+    "padding-top", "padding-right", "padding-bottom", "padding-left",
+    "top", "right", "bottom", "left", "position", "display", "float", "clear", "visibility", "opacity",
+    "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+    "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+    "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+    "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
+    "font-family", "font-size", "font-style", "font-weight", "font-variant", "font-stretch", "line-height",
+    "text-align", "text-decoration-line", "text-decoration-style", "text-decoration-color",
+    "text-transform", "letter-spacing", "white-space", "vertical-align",
+    "list-style-type", "list-style-position", "list-style-image",
+    "overflow-x", "overflow-y", "z-index", "cursor", "box-sizing",
+    "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
+    "align-items", "align-content", "align-self", "justify-items", "justify-content", "justify-self",
+    "row-gap", "column-gap", "outline-width", "outline-style", "outline-color"
+  ];
+  // A custom property is `--*`; case-sensitive, value kept raw (whitespace-trimmed).
+  function isCustomProp(name) { return name.length >= 2 && name[0] === "-" && name[1] === "-"; }
+  // Own-property lookup guarded against inherited keys (`"constructor"`, `"__proto__"`, …), so a CSS
+  // property literally named like an Object.prototype member can't accidentally match a table entry.
+  function hasOwn(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
+  function lookup(obj, key) { return hasOwn(obj, key) ? obj[key] : undefined; }
+  // CSS-wide keywords (valid for any property incl. the `all` shorthand).
+  function isCssWideKeyword(v) {
+    v = String(v).trim().toLowerCase();
+    return v === "inherit" || v === "initial" || v === "unset" || v === "revert" || v === "revert-layer";
+  }
+  // Split a value into top-level space-separated tokens (respecting parens + quotes).
+  function splitCssTokens(v) {
+    v = String(v).trim();
+    var out = [], i = 0, n = v.length, depth = 0, q = null, start = -1;
+    while (i < n) {
+      var c = v[i];
+      if (q) { if (c === q) { q = null; } i++; continue; }
+      if (c === '"' || c === "'") { if (start < 0) start = i; q = c; i++; continue; }
+      if (c === "(") { if (start < 0) start = i; depth++; i++; continue; }
+      if (c === ")") { depth--; i++; continue; }
+      if (depth === 0 && (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f")) {
+        if (start >= 0) { out.push(v.slice(start, i)); start = -1; }
+        i++; continue;
+      }
+      if (start < 0) start = i; i++;
+    }
+    if (start >= 0) out.push(v.slice(start));
+    return out;
+  }
+  // Expand 1-4 box values into [top, right, bottom, left].
+  function expandBox(v) {
+    var t = splitCssTokens(v);
+    if (t.length === 1) return [t[0], t[0], t[0], t[0]];
+    if (t.length === 2) return [t[0], t[1], t[0], t[1]];
+    if (t.length === 3) return [t[0], t[1], t[2], t[1]];
+    if (t.length === 4) return [t[0], t[1], t[2], t[3]];
+    return null;
+  }
+  // Serialize [top, right, bottom, left] to the shortest 1-4 box form.
+  function serializeBox(top, right, bottom, left) {
+    if (top == null || right == null || bottom == null || left == null) return "";
+    if (top === bottom && right === left && top === right) return top;          // 1 value
+    if (top === bottom && right === left) return top + " " + right;             // 2 values
+    if (right === left) return top + " " + right + " " + bottom;               // 3 values
+    return top + " " + right + " " + bottom + " " + left;                       // 4 values
+  }
+  // The box shorthands: shorthand -> [topLong, rightLong, bottomLong, leftLong].
+  var BOX_SHORTHANDS = {
+    "margin": ["margin-top", "margin-right", "margin-bottom", "margin-left"],
+    "padding": ["padding-top", "padding-right", "padding-bottom", "padding-left"],
+    "inset": ["top", "right", "bottom", "left"],
+    "border-width": ["border-top-width", "border-right-width", "border-bottom-width", "border-left-width"],
+    "border-style": ["border-top-style", "border-right-style", "border-bottom-style", "border-left-style"],
+    "border-color": ["border-top-color", "border-right-color", "border-bottom-color", "border-left-color"],
+    "border-radius": null, // handled specially
+    "scroll-margin": ["scroll-margin-top", "scroll-margin-right", "scroll-margin-bottom", "scroll-margin-left"],
+    "scroll-padding": ["scroll-padding-top", "scroll-padding-right", "scroll-padding-bottom", "scroll-padding-left"]
+  };
+  // Per-side `border-top`/`-right`/`-bottom`/`-left`: each -> [width, style, color] longhands.
+  var BORDER_SIDE = {
+    "border-top": ["border-top-width", "border-top-style", "border-top-color"],
+    "border-right": ["border-right-width", "border-right-style", "border-right-color"],
+    "border-bottom": ["border-bottom-width", "border-bottom-style", "border-bottom-color"],
+    "border-left": ["border-left-width", "border-left-style", "border-left-color"],
+    "outline": ["outline-color", "outline-style", "outline-width"],
+    "column-rule": ["column-rule-width", "column-rule-style", "column-rule-color"]
+  };
+  // Classify a single border/outline component token as width|style|color.
+  var BORDER_STYLE_KW = { none:1, hidden:1, dotted:1, dashed:1, solid:1, double:1, groove:1, ridge:1, inset:1, outset:1 };
+  function classifyBorderToken(tok) {
+    var t = tok.toLowerCase();
+    if (BORDER_STYLE_KW[t]) return "style";
+    if (t === "thin" || t === "medium" || t === "thick" || /^[-+.\d]/.test(t) || /^calc\(/.test(t)) return "width";
+    return "color";
+  }
+  // Parse `border`/`border-top`/`outline` value -> {width,style,color} (missing -> undefined).
+  function parseBorderLike(v) {
+    var toks = splitCssTokens(v), r = {};
+    for (var i = 0; i < toks.length; i++) {
+      var k = classifyBorderToken(toks[i]);
+      if (r[k] === undefined) r[k] = toks[i];
+    }
+    return r;
+  }
+  // The longhands of the `border` shorthand (all 12 sides + image), in canonical order.
+  var BORDER_ALL_LONGHANDS = [
+    "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+    "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+    "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+    "border-image-source", "border-image-slice", "border-image-width", "border-image-outset", "border-image-repeat"
+  ];
+  var BORDER_IMAGE_LONGHANDS = ["border-image-source", "border-image-slice", "border-image-width", "border-image-outset", "border-image-repeat"];
+  var BORDER_IMAGE_INITIAL = {
+    "border-image-source": "none", "border-image-slice": "100%", "border-image-width": "1",
+    "border-image-outset": "0", "border-image-repeat": "stretch"
+  };
+  // overflow / overscroll-behavior / gap: 1-2 value shorthand of x/y (or row/column).
+  var XY_SHORTHANDS = {
+    "overflow": ["overflow-x", "overflow-y"],
+    "overscroll-behavior": ["overscroll-behavior-x", "overscroll-behavior-y"],
+    "gap": ["row-gap", "column-gap"]
+  };
+  // list-style: type/position/image.
+  function parseListStyle(v) {
+    var toks = splitCssTokens(v), r = { "list-style-type": undefined, "list-style-position": undefined, "list-style-image": undefined };
+    var POS = { inside: 1, outside: 1 };
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i], tl = t.toLowerCase();
+      if (/^url\(/i.test(t)) { r["list-style-image"] = t; }
+      else if (POS[tl]) { r["list-style-position"] = tl; }
+      else if (tl === "none") { if (r["list-style-type"] === undefined) r["list-style-type"] = "none"; else r["list-style-image"] = "none"; }
+      else { r["list-style-type"] = t; }
+    }
+    return r;
+  }
+  // Map a shorthand name to its full set of longhand property names.
+  function shorthandLonghands(name) {
+    if (name === "all") return null; // special
+    if (hasOwn(BOX_SHORTHANDS, name)) {
+      if (name === "border-radius") return ["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"];
+      return BOX_SHORTHANDS[name];
+    }
+    if (hasOwn(BORDER_SIDE, name)) return BORDER_SIDE[name];
+    if (hasOwn(XY_SHORTHANDS, name)) return XY_SHORTHANDS[name];
+    if (name === "border") return BORDER_ALL_LONGHANDS;
+    if (name === "border-image") return BORDER_IMAGE_LONGHANDS;
+    if (name === "list-style") return ["list-style-position", "list-style-image", "list-style-type"];
+    if (name === "text-decoration") return ["text-decoration-line", "text-decoration-style", "text-decoration-color"];
+    if (name === "flex-flow") return ["flex-direction", "flex-wrap"];
+    if (name === "place-content") return ["align-content", "justify-content"];
+    if (name === "place-items") return ["align-items", "justify-items"];
+    if (name === "place-self") return ["align-self", "justify-self"];
+    if (name === "columns") return ["column-width", "column-count"];
+    return null;
+  }
+  // Shorthands we don't value-serialize but whose longhand set we know, so the CSS-wide-keyword
+  // case (e.g. reading `font` after `all: revert`) can be serialized. Used by getVal only.
+  var KEYWORD_ONLY_SHORTHANDS = {
+    "font": ["font-style", "font-variant", "font-weight", "font-stretch", "font-size", "line-height", "font-family"],
+    "background": ["background-image", "background-position-x", "background-position-y", "background-size", "background-repeat", "background-origin", "background-clip", "background-attachment", "background-color"]
+  };
+  function isShorthand(name) { return name === "all" || shorthandLonghands(name) != null; }
+  // Expand a shorthand declaration into [[longhand, value], ...]. Returns null if not a shorthand we
+  // expand (caller stores the property as-is). CSS-wide keywords expand to every longhand.
+  function expandShorthand(name, value) {
+    value = String(value).trim();
+    var lhs = shorthandLonghands(name);
+    if (lhs == null) return null;
+    var out = [];
+    if (isCssWideKeyword(value)) {
+      var v = value.toLowerCase();
+      for (var i = 0; i < lhs.length; i++) out.push([lhs[i], v]);
+      return out;
+    }
+    if (BOX_SHORTHANDS[name] && name !== "border-radius") {
+      var b = expandBox(value); if (!b) return null;
+      return [[lhs[0], b[0]], [lhs[1], b[1]], [lhs[2], b[2]], [lhs[3], b[3]]];
+    }
+    if (name === "border-radius") {
+      var parts = value.split("/"); var h = expandBox(parts[0].trim());
+      if (!h) return null;
+      var vv = parts.length > 1 ? expandBox(parts[1].trim()) : h;
+      if (!vv) return null;
+      return [
+        [lhs[0], h[0] === vv[0] ? h[0] : h[0] + " " + vv[0]],
+        [lhs[1], h[1] === vv[1] ? h[1] : h[1] + " " + vv[1]],
+        [lhs[2], h[2] === vv[2] ? h[2] : h[2] + " " + vv[2]],
+        [lhs[3], h[3] === vv[3] ? h[3] : h[3] + " " + vv[3]]
+      ];
+    }
+    if (XY_SHORTHANDS[name]) {
+      var t = splitCssTokens(value);
+      if (t.length === 1) return [[lhs[0], t[0]], [lhs[1], t[0]]];
+      if (t.length === 2) return [[lhs[0], t[0]], [lhs[1], t[1]]];
+      return null;
+    }
+    if (BORDER_SIDE[name]) {
+      var p = parseBorderLike(value);
+      var map = name === "outline"
+        ? { width: "outline-width", style: "outline-style", color: "outline-color" }
+        : name === "column-rule"
+          ? { width: "column-rule-width", style: "column-rule-style", color: "column-rule-color" }
+          : { width: name + "-width", style: name + "-style", color: name + "-color" };
+      var res = [];
+      res.push([map.width, p.width !== undefined ? p.width : "medium"]);
+      res.push([map.style, p.style !== undefined ? p.style : "none"]);
+      res.push([map.color, p.color !== undefined ? p.color : "currentcolor"]);
+      return res;
+    }
+    if (name === "border") {
+      var p2 = parseBorderLike(value);
+      var w = p2.width !== undefined ? p2.width : "medium";
+      var st = p2.style !== undefined ? p2.style : "none";
+      var co = p2.color !== undefined ? p2.color : "currentcolor";
+      var r = [], sides = ["top", "right", "bottom", "left"];
+      for (var s = 0; s < 4; s++) r.push(["border-" + sides[s] + "-width", w]);
+      for (var s2 = 0; s2 < 4; s2++) r.push(["border-" + sides[s2] + "-style", st]);
+      for (var s3 = 0; s3 < 4; s3++) r.push(["border-" + sides[s3] + "-color", co]);
+      for (var bi = 0; bi < BORDER_IMAGE_LONGHANDS.length; bi++) r.push([BORDER_IMAGE_LONGHANDS[bi], BORDER_IMAGE_INITIAL[BORDER_IMAGE_LONGHANDS[bi]]]);
+      return r;
+    }
+    if (name === "border-image") {
+      if (value.toLowerCase() === "none") {
+        var bir = [];
+        for (var bz = 0; bz < BORDER_IMAGE_LONGHANDS.length; bz++) bir.push([BORDER_IMAGE_LONGHANDS[bz], BORDER_IMAGE_INITIAL[BORDER_IMAGE_LONGHANDS[bz]]]);
+        return bir;
+      }
+      return null;
+    }
+    if (name === "list-style") {
+      var ls = parseListStyle(value), out2 = [];
+      out2.push(["list-style-type", ls["list-style-type"] !== undefined ? ls["list-style-type"] : "disc"]);
+      out2.push(["list-style-position", ls["list-style-position"] !== undefined ? ls["list-style-position"] : "outside"]);
+      out2.push(["list-style-image", ls["list-style-image"] !== undefined ? ls["list-style-image"] : "none"]);
+      return out2;
+    }
+    return null;
+  }
+  // Serialize a shorthand from the current longhand values (`getLong(name)`). Returns "" if it
+  // cannot be represented (a longhand missing or values inconsistent).
+  function serializeShorthand(name, getLong) {
+    function g(n) { return getLong(n); }
+    var lhs = shorthandLonghands(name);
+    if (lhs == null) return "";
+    if (name === "border") lhs = BORDER_ALL_LONGHANDS;
+    var allSet = true, common = null, sameKw = true;
+    for (var i = 0; i < lhs.length; i++) {
+      var v = g(lhs[i]);
+      if (v === "" || v == null) allSet = false;
+      if (common === null) common = v; else if (common !== v) sameKw = false;
+    }
+    if (allSet && sameKw && isCssWideKeyword(common)) return common.toLowerCase();
+    for (var j = 0; j < lhs.length; j++) { if (isCssWideKeyword(g(lhs[j]))) { if (!(allSet && sameKw)) return ""; } }
+    if (!allSet) return "";
+
+    if (BOX_SHORTHANDS[name] && name !== "border-radius") {
+      return serializeBox(g(lhs[0]), g(lhs[1]), g(lhs[2]), g(lhs[3]));
+    }
+    if (name === "border-radius") {
+      var H = [g(lhs[0]), g(lhs[1]), g(lhs[2]), g(lhs[3])];
+      var hs = [], vs = [], split = false;
+      for (var k = 0; k < 4; k++) { var pr = splitCssTokens(H[k]); hs.push(pr[0]); if (pr.length > 1) { vs.push(pr[1]); split = true; } else vs.push(pr[0]); }
+      var hser = serializeBox(hs[0], hs[1], hs[2], hs[3]);
+      if (!split) return hser;
+      return hser + " / " + serializeBox(vs[0], vs[1], vs[2], vs[3]);
+    }
+    if (XY_SHORTHANDS[name]) {
+      var x = g(lhs[0]), y = g(lhs[1]);
+      return x === y ? x : x + " " + y;
+    }
+    if (BORDER_SIDE[name]) {
+      var wv, sv, cv, initW = "medium", initS = "none", initC = "currentcolor";
+      if (name === "outline") { cv = g(lhs[0]); sv = g(lhs[1]); wv = g(lhs[2]); }
+      else { wv = g(lhs[0]); sv = g(lhs[1]); cv = g(lhs[2]); }
+      var parts = [];
+      if (name === "outline") {
+        if (cv !== initC) parts.push(cv);
+        if (sv !== initS) parts.push(sv);
+        if (wv !== initW) parts.push(wv);
+      } else {
+        if (wv !== initW) parts.push(wv);
+        if (sv !== initS) parts.push(sv);
+        if (cv !== initC) parts.push(cv);
+      }
+      return parts.length ? parts.join(" ") : "medium";
+    }
+    if (name === "border") {
+      function side(prefix) { return [g("border-top-" + prefix), g("border-right-" + prefix), g("border-bottom-" + prefix), g("border-left-" + prefix)]; }
+      var W = side("width"), S = side("style"), C = side("color");
+      function allEq(a) { return a[0] === a[1] && a[1] === a[2] && a[2] === a[3]; }
+      if (!allEq(W) || !allEq(S) || !allEq(C)) return "";
+      for (var bi = 0; bi < BORDER_IMAGE_LONGHANDS.length; bi++) {
+        if (g(BORDER_IMAGE_LONGHANDS[bi]) !== BORDER_IMAGE_INITIAL[BORDER_IMAGE_LONGHANDS[bi]]) return "";
+      }
+      var bp = [];
+      if (W[0] !== "medium") bp.push(W[0]);
+      if (S[0] !== "none") bp.push(S[0]);
+      if (C[0] !== "currentcolor") bp.push(C[0]);
+      return bp.length ? bp.join(" ") : "medium";
+    }
+    if (name === "border-image") {
+      for (var bm = 0; bm < BORDER_IMAGE_LONGHANDS.length; bm++) {
+        if (g(BORDER_IMAGE_LONGHANDS[bm]) !== BORDER_IMAGE_INITIAL[BORDER_IMAGE_LONGHANDS[bm]]) return "";
+      }
+      return "none";
+    }
+    if (name === "list-style") {
+      var ty = g("list-style-type"), po = g("list-style-position"), im = g("list-style-image");
+      var lp = [];
+      if (po !== "outside") lp.push(po);
+      if (ty !== "disc") lp.push(ty);
+      if (im !== "none") lp.push(im);
+      return lp.length === 0 ? "disc" : lp.join(" ");
+    }
+    return "";
+  }
+
+  // Strip a trailing `!important` from a value. Returns [value, importantBool].
+  function splitImportant(val) {
+    var m = /^([\s\S]*?)\s*!\s*important\s*$/i.exec(val);
+    if (m) return [m[1].trim(), true];
+    return [val, false];
+  }
+  // Parse a declaration block into expanded longhand triples [name, value, important], in source
+  // order, expanding shorthands and `all` as we go.
   function parseStyleDecls(text) {
     var out = [];
     text = String(text || "");
-    var parts = text.split(";");
+    var parts = splitTopLevelSemis(text);
     for (var i = 0; i < parts.length; i++) {
       var seg = parts[i];
       var c = seg.indexOf(":");
       if (c < 0) { continue; }
-      var name = seg.slice(0, c).trim().toLowerCase();
-      var val = seg.slice(c + 1).trim();
-      if (name) { out.push([name, normalizeCssValue(val)]); }
+      var rawName = seg.slice(0, c).trim();
+      var name = isCustomProp(rawName) ? rawName : rawName.toLowerCase();
+      if (!name) continue;
+      var rawVal = seg.slice(c + 1).trim();
+      var imp = splitImportant(rawVal);
+      pushDecl(out, name, imp[0], imp[1]);
     }
     return out;
   }
-  function serializeStyleDecls(decls) {
+  // Split a declaration block on top-level `;` (not inside parens/strings).
+  function splitTopLevelSemis(text) {
+    var out = [], i = 0, n = text.length, depth = 0, q = null, start = 0;
+    while (i < n) {
+      var c = text[i];
+      if (q) { if (c === q) q = null; i++; continue; }
+      if (c === '"' || c === "'") { q = c; i++; continue; }
+      if (c === "(") { depth++; i++; continue; }
+      if (c === ")") { if (depth > 0) depth--; i++; continue; }
+      if (c === ";" && depth === 0) { out.push(text.slice(start, i)); start = i + 1; }
+      i++;
+    }
+    if (start < n) out.push(text.slice(start));
+    return out;
+  }
+  // Append a declaration to the expanded longhand list, expanding shorthands and `all`.
+  function pushDecl(out, name, val, important) {
+    if (isCustomProp(name)) { setDecl(out, name, val, important); return; }
+    if (name === "all") {
+      if (isCssWideKeyword(val)) {
+        var kw = val.toLowerCase();
+        // Remove any prior all-longhands so they re-append at this (the `all`) source position;
+        // keeps custom properties declared before `all` ahead of it on serialization.
+        for (var rr = 0; rr < ALL_LONGHANDS.length; rr++) removeDecl(out, ALL_LONGHANDS[rr]);
+        for (var a = 0; a < ALL_LONGHANDS.length; a++) out.push([ALL_LONGHANDS[a], kw, !!important]);
+      }
+      return;
+    }
+    var expanded = expandShorthand(name, val);
+    if (expanded) {
+      for (var e = 0; e < expanded.length; e++) setDecl(out, expanded[e][0], normalizeCssValue(expanded[e][1]), important);
+      return;
+    }
+    setDecl(out, name, normalizeCssValue(val), important);
+  }
+  function findDecl(out, name) { for (var i = 0; i < out.length; i++) { if (out[i][0] === name) return i; } return -1; }
+  function setDecl(out, name, val, important) {
+    important = !!important;
+    var i = findDecl(out, name);
+    if (val == null || val === "") { if (i >= 0) out.splice(i, 1); return; }
+    if (i >= 0) {
+      // Re-declaring with a different importance moves the declaration to the end (so an important
+      // override of a shorthand's longhand serializes after the non-important remainder).
+      if (out[i][2] !== important) { out.splice(i, 1); out.push([name, val, important]); }
+      else { out[i][1] = val; out[i][2] = important; }
+    } else out.push([name, val, important]);
+  }
+  function removeDecl(out, name) { var i = findDecl(out, name); if (i >= 0) out.splice(i, 1); }
+  // Shorthands to try when serializing a declaration block, in priority order.
+  var SERIALIZE_SHORTHANDS = [
+    "border", "border-width", "border-style", "border-color",
+    "border-top", "border-right", "border-bottom", "border-left", "border-image",
+    "margin", "padding", "inset", "border-radius",
+    "overflow", "overscroll-behavior", "gap", "outline", "list-style", "text-decoration",
+    "flex-flow", "place-content", "place-items", "place-self", "columns"
+  ];
+  // Serialize expanded longhand triples WITHOUT shorthand grouping — the engine-readable form
+  // stored in the `style` attribute (the Rust cascade understands longhands, not every shorthand).
+  function serializeStyleDeclsFlat(decls) {
     var s = "";
-    for (var i = 0; i < decls.length; i++) { s += (s ? " " : "") + decls[i][0] + ": " + decls[i][1] + ";"; }
+    for (var i = 0; i < decls.length; i++) {
+      s += (s ? " " : "") + decls[i][0] + ": " + decls[i][1] + (decls[i][2] ? " !important" : "") + ";";
+    }
     return s;
+  }
+  // Serialize a list of expanded longhand triples to a declaration block, grouping consecutive
+  // longhands into shorthands where possible (CSSOM §serialize-a-css-declaration-block).
+  function serializeStyleDecls(decls) {
+    var byName = Object.create(null);
+    for (var i = 0; i < decls.length; i++) { byName[decls[i][0]] = { v: decls[i][1], imp: decls[i][2] }; }
+    var serialized = Object.create(null);
+    var pieces = [];
+    function emit(prop, value, important) { pieces.push(prop + ": " + value + (important ? " !important" : "") + ";"); }
+    // If EVERY `all`-affected longhand is present, equal, a CSS-wide keyword, and same importance,
+    // collapse them into a single `all: <kw>` (at the position of the first such longhand).
+    var allKw = null, allImp = null, allOk = true;
+    for (var ai = 0; ai < ALL_LONGHANDS.length; ai++) {
+      var rec0 = byName[ALL_LONGHANDS[ai]];
+      if (!rec0 || !isCssWideKeyword(rec0.v)) { allOk = false; break; }
+      if (allKw === null) { allKw = rec0.v; allImp = rec0.imp; }
+      else if (rec0.v !== allKw || rec0.imp !== allImp) { allOk = false; break; }
+    }
+    var collapseAll = allOk && allKw !== null, allEmitted = false;
+    for (var d = 0; d < decls.length; d++) {
+      var name = decls[d][0];
+      if (serialized[name]) continue;
+      if (collapseAll && ALL_LONGHANDS.indexOf(name) >= 0) {
+        if (!allEmitted) { emit("all", allKw.toLowerCase(), allImp); allEmitted = true; }
+        serialized[name] = 1; continue;
+      }
+      if (isCustomProp(name)) { emit(name, decls[d][1], decls[d][2]); serialized[name] = 1; continue; }
+      var used = false;
+      for (var s = 0; s < SERIALIZE_SHORTHANDS.length; s++) {
+        var sh = SERIALIZE_SHORTHANDS[s];
+        var lhs = sh === "border" ? BORDER_ALL_LONGHANDS : shorthandLonghands(sh);
+        if (!lhs) continue;
+        if (lhs.indexOf(name) < 0) continue;
+        var ok = true, imp = decls[d][2];
+        for (var k = 0; k < lhs.length; k++) {
+          var rec = byName[lhs[k]];
+          if (!rec || serialized[lhs[k]] || rec.imp !== imp) { ok = false; break; }
+        }
+        if (!ok) continue;
+        var ser = serializeShorthand(sh, function (n) { var r = byName[n]; return r ? r.v : ""; });
+        if (ser === "") continue;
+        emit(sh, ser, imp);
+        for (var k2 = 0; k2 < lhs.length; k2++) serialized[lhs[k2]] = 1;
+        used = true; break;
+      }
+      if (!used) { emit(name, decls[d][1], decls[d][2]); serialized[name] = 1; }
+    }
+    return pieces.join(" ");
   }
   // camelCase JS property -> kebab-case CSS property (e.g. backgroundColor -> background-color).
   function camelToKebab(p) {
@@ -4892,31 +5332,91 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return p.replace(/-([a-z])/g, function (_, c) { return c.toUpperCase(); });
   }
   function styleAttr(node) { var v = document.__getAttr(node, "style"); return v == null ? "" : v; }
-  function makeStyle(node) {
-    function read() { return parseStyleDecls(styleAttr(node)); }
-    function find(decls, name) { for (var i = 0; i < decls.length; i++) { if (decls[i][0] === name) { return i; } } return -1; }
-    function getVal(name) { var d = read(); var i = find(d, name); return i >= 0 ? d[i][1] : ""; }
-    function setVal(name, val) {
-      var d = read(); var i = find(d, name);
-      if (val == null || val === "") {
-        if (i >= 0) { d.splice(i, 1); }
-      } else {
-        val = normalizeCssValue(String(val));
-        if (i >= 0) { d[i][1] = val; } else { d.push([name, val]); }
+  // Normalize a CSS property name for the CSSStyleDeclaration API (lowercase; custom props as-is).
+  function normPropName(p) { p = camelToKebab(String(p)); return isCustomProp(p) ? p : p.toLowerCase(); }
+  // Build a CSSStyleDeclaration over a backing store. `get()` returns the current declaration block
+  // text; `set(text)` writes it back. Used for both inline styles (style attr) and rule blocks.
+  function makeStyleDecl(get, set) {
+    function read() { return parseStyleDecls(get()); }
+    // The backing store holds the EXPANDED longhand form (engine-readable). Shorthand grouping is
+    // applied only when serializing for the CSSOM `cssText` getter / `item`/`length` enumeration.
+    function write(d) { set(serializeStyleDeclsFlat(d)); }
+    // The serialized value of property `name` per CSSOM (shorthand serialization, custom verbatim).
+    function getVal(name) {
+      var d = read();
+      if (isCustomProp(name)) { var ci = findDecl(d, name); return ci >= 0 ? d[ci][1] : ""; }
+      if (name === "all") {
+        var common = null, ok = true;
+        for (var a = 0; a < ALL_LONGHANDS.length; a++) {
+          var idx = findDecl(d, ALL_LONGHANDS[a]);
+          if (idx < 0) { ok = false; break; }
+          var v = d[idx][1];
+          if (common === null) common = v; else if (common !== v) { ok = false; break; }
+        }
+        return (ok && common !== null && isCssWideKeyword(common)) ? common.toLowerCase() : "";
       }
-      document.__setAttr(node, "style", serializeStyleDecls(d));
+      if (isShorthand(name)) {
+        var sv = serializeShorthand(name, function (n) { var i = findDecl(d, n); return i >= 0 ? d[i][1] : ""; });
+        if (sv !== "") return sv;
+        // If the shorthand was stored literally (we don't model its value), return the literal.
+        var li = findDecl(d, name);
+        return li >= 0 ? d[li][1] : "";
+      }
+      if (hasOwn(KEYWORD_ONLY_SHORTHANDS, name)) {
+        var lhsK = KEYWORD_ONLY_SHORTHANDS[name], commonK = null, okK = true;
+        for (var kk = 0; kk < lhsK.length; kk++) { var ik = findDecl(d, lhsK[kk]); if (ik < 0) { okK = false; break; } if (commonK === null) commonK = d[ik][1]; else if (commonK !== d[ik][1]) { okK = false; break; } }
+        if (okK && commonK !== null && isCssWideKeyword(commonK)) return commonK.toLowerCase();
+      }
+      var i = findDecl(d, name);
+      return i >= 0 ? d[i][1] : "";
+    }
+    function getPriority(name) {
+      var d = read();
+      if (name === "all" || isShorthand(name)) {
+        var lhs = name === "all" ? ALL_LONGHANDS : (name === "border" ? BORDER_ALL_LONGHANDS : shorthandLonghands(name));
+        if (!lhs) return "";
+        for (var k = 0; k < lhs.length; k++) { var i = findDecl(d, lhs[k]); if (i < 0 || !d[i][2]) return ""; }
+        return "important";
+      }
+      var idx = findDecl(d, name);
+      return idx >= 0 && d[idx][2] ? "important" : "";
+    }
+    function setVal(name, val, important) {
+      var d = read();
+      if (val == null || String(val).trim() === "") { // empty value removes (per spec)
+        if (name === "all") { for (var a = 0; a < ALL_LONGHANDS.length; a++) removeDecl(d, ALL_LONGHANDS[a]); }
+        else if (isShorthand(name)) { var lhs0 = name === "border" ? BORDER_ALL_LONGHANDS : shorthandLonghands(name); for (var q = 0; q < lhs0.length; q++) removeDecl(d, lhs0[q]); }
+        else removeDecl(d, name);
+        write(d); return;
+      }
+      pushDecl(d, name, String(val).trim(), !!important);
+      write(d);
+    }
+    function removeVal(name) {
+      var old = getVal(name);
+      var d = read();
+      if (name === "all") { for (var a = 0; a < ALL_LONGHANDS.length; a++) removeDecl(d, ALL_LONGHANDS[a]); }
+      else if (isShorthand(name)) { var lhs = name === "border" ? BORDER_ALL_LONGHANDS : shorthandLonghands(name); for (var q = 0; q < lhs.length; q++) removeDecl(d, lhs[q]); }
+      else removeDecl(d, name);
+      write(d);
+      return old;
     }
     var base = {
-      getPropertyValue: function (p) { return getVal(String(p).toLowerCase()); },
-      getPropertyPriority: function () { return ""; },
-      setProperty: function (p, v) { setVal(String(p).toLowerCase(), v); },
-      removeProperty: function (p) { p = String(p).toLowerCase(); var old = getVal(p); setVal(p, ""); return old; },
-      item: function (i) { var d = read(); return i >= 0 && i < d.length ? d[i][0] : ""; }
+      getPropertyValue: function (p) { return getVal(normPropName(p)); },
+      getPropertyPriority: function (p) { return getPriority(normPropName(p)); },
+      setProperty: function (p, v, prio) {
+        var name = normPropName(p);
+        var important = prio != null && String(prio).toLowerCase() === "important";
+        setVal(name, v, important);
+      },
+      removeProperty: function (p) { return removeVal(normPropName(p)); },
+      item: function (i) { var d = read(); i = i >>> 0; return i < d.length ? d[i][0] : ""; }
     };
     Object.defineProperty(base, "length", { get: function () { return read().length; }, enumerable: false, configurable: true });
     Object.defineProperty(base, "cssText", {
-      get: function () { return styleAttr(node); },
-      set: function (v) { document.__setAttr(node, "style", serializeStyleDecls(parseStyleDecls(v))); },
+      // Group longhands back into shorthands on read (CSSOM serialization); store flat on write.
+      get: function () { return serializeStyleDecls(read()); },
+      set: function (v) { write(parseStyleDecls(v)); },
       enumerable: true, configurable: true
     });
     try {
@@ -4924,15 +5424,23 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         get: function (t, p) {
           if (typeof p !== "string") { return t[p]; }
           if (p in t) { return t[p]; }
-          return getVal(camelToKebab(p));
+          if (/^[0-9]+$/.test(p)) { return t.item(Number(p)); }
+          return getVal(normPropName(p));
         },
         set: function (t, p, v) {
           if (typeof p !== "string") { t[p] = v; return true; }
           if (p === "cssText") { t.cssText = v; return true; }
-          setVal(camelToKebab(p), v); return true;
+          if (p in t) { t[p] = v; return true; }
+          setVal(normPropName(p), v, false); return true;
         }
       });
     } catch (e) { return base; }
+  }
+  function makeStyle(node) {
+    return makeStyleDecl(
+      function () { return styleAttr(node); },
+      function (text) { document.__setAttr(node, "style", text); }
+    );
   }
   // A snapshot ES iterator over `arr`, mapping each (index, value) via `pick`.
   function makeIter(arr, pick) {
@@ -7683,6 +8191,36 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "TimeRanges", "ValidityState", "HTMLFormControlsCollection", "RadioNodeList",
   ];
   for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
+  // A constructable `new CSSStyleSheet()` backed by an in-memory rule buffer (no document). Enough
+  // for CSSOM tests that build a sheet, insertRule, and read `cssRules[i].style`.
+  try {
+    var CSSStyleSheetCtor = function CSSStyleSheet(opts) {
+      var fakeEl = { textContent: "" };
+      var sheet = makeStyleSheet(fakeEl);
+      sheet.insertRule = function (rule, index) {
+        var rs = parseCssRules(fakeEl.textContent);
+        index = index == null ? 0 : (index >>> 0);
+        if (index > rs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
+        rs.splice(index, 0, String(rule));
+        fakeEl.textContent = rs.join("\n");
+        return index;
+      };
+      sheet.deleteRule = function (index) {
+        var rs = parseCssRules(fakeEl.textContent);
+        index = index >>> 0;
+        if (index >= rs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
+        rs.splice(index, 1);
+        fakeEl.textContent = rs.join("\n");
+      };
+      sheet.replaceSync = function (text) { fakeEl.textContent = String(text); };
+      sheet.replace = function (text) { fakeEl.textContent = String(text); return Promise.resolve(sheet); };
+      try { Object.setPrototypeOf(sheet, CSSStyleSheetCtor.prototype); } catch (e) {}
+      return sheet;
+    };
+    var oldProto = (globalThis.CSSStyleSheet && globalThis.CSSStyleSheet.prototype) || {};
+    CSSStyleSheetCtor.prototype = oldProto;
+    try { def(globalThis, "CSSStyleSheet", CSSStyleSheetCtor); } catch (e) {}
+  } catch (e) {}
 
   // --- CSSOM interface hierarchy + CSSRule type constants ------------------------------------
   // StyleSheet <- CSSStyleSheet; CSSRule <- {CSSStyleRule, CSSGroupingRule <- {CSSMediaRule,
@@ -11939,6 +12477,88 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn inline_style_shorthand_margin_expands_and_serializes() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = document.createElement('div').style; s.margin = '1px 2px'; \
+                 [s.marginTop, s.marginRight, s.marginBottom, s.marginLeft, s.getPropertyValue('margin')].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1px|2px|1px|2px|1px 2px"));
+    }
+
+    #[test]
+    fn inline_style_all_shorthand_sets_longhands() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = document.createElement('div').style; s.cssText = 'all: inherit'; \
+                 [s.getPropertyValue('width'), s.getPropertyValue('color'), s.getPropertyValue('all')].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("inherit|inherit|inherit"));
+    }
+
+    #[test]
+    fn inline_style_custom_property_roundtrips() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = document.createElement('div').style; s.setProperty('--x', '5px'); \
+                 [s.getPropertyValue('--x'), s.cssText].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("5px|--x: 5px;"));
+    }
+
+    #[test]
+    fn computed_style_reflects_inline_custom_property() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var d = document.createElement('div'); document.body.appendChild(d); \
+                 d.style.setProperty('--my', '42px'); \
+                 getComputedStyle(d).getPropertyValue('--my')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("42px"));
+    }
+
+    #[test]
+    fn inline_style_removeproperty_shorthand_removes_longhands() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = document.createElement('div').style; s.margin = '1px 2px 3px 4px'; \
+                 s.removeProperty('margin'); \
+                 [s.getPropertyValue('margin-top'), s.length].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("|0"));
     }
 
     #[test]

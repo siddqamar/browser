@@ -351,6 +351,11 @@ pub struct ComputedStyle {
     /// page opts into a dark UA canvas/text (see [`ColorScheme::resolves_dark`] and
     /// [`root_used_scheme_dark`]).
     pub color_scheme: ColorScheme,
+
+    /// This element's resolved custom properties (`--name` -> value), case-sensitive. Populated
+    /// from the cascade's `var` environment so `getComputedStyle(el).getPropertyValue("--x")`
+    /// can read them. Not enumerated by [`property_names`](Self::property_names).
+    pub custom_props: HashMap<String, String>,
 }
 
 /// Parsed CSS `color-scheme` value. The property lists the schemes a page supports; the browser
@@ -660,6 +665,7 @@ impl Default for ComputedStyle {
             before: None,
             after: None,
             color_scheme: ColorScheme::Normal,
+            custom_props: HashMap::new(),
         }
     }
 }
@@ -704,8 +710,13 @@ impl ComputedStyle {
     /// Both common longhands and the few cheaply-assembled shorthands (`margin`, `padding`,
     /// `border-width`, `inset`, `gap`) are mapped.
     pub fn get_property(&self, name: &str) -> String {
+        // Custom properties are case-sensitive and read straight from the resolved environment.
+        let trimmed = name.trim();
+        if trimmed.starts_with("--") {
+            return self.custom_props.get(trimmed).cloned().unwrap_or_default();
+        }
         // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
-        let name = name.trim().to_ascii_lowercase();
+        let name = trimmed.to_ascii_lowercase();
         match name.as_str() {
             // --- display / box model mode ---
             "display" => match self.display {
@@ -1565,6 +1576,7 @@ fn compute_element_style<'a>(
 ) -> (ComputedStyle, HashMap<String, String>) {
     // Start from inherited values; non-inherited properties get reset below.
     let mut style = ComputedStyle {
+        custom_props: HashMap::new(),
         color: parent.color,
         background_color: None, // not inherited
         font_size: parent.font_size,
@@ -1851,6 +1863,10 @@ fn compute_element_style<'a>(
     // resolves to Some, so we keep the result only in that case.
     style.before = cascade_pseudo(&style, el, &before_matches, &vars);
     style.after = cascade_pseudo(&style, el, &after_matches, &vars);
+
+    // Expose the resolved custom-property environment for CSSOM reads. Custom props inherit, so
+    // this includes ancestor-declared vars (the *computed* value, per spec).
+    style.custom_props = vars.clone();
 
     (style, vars)
 }
@@ -2964,6 +2980,12 @@ fn apply_declaration(
                 style.z_index = None;
             } else if let Ok(n) = v.parse::<i32>() {
                 style.z_index = Some(n);
+            } else if let Ok(n) = v.parse::<i64>() {
+                // Out-of-range integers clamp to the representable range (still a valid <integer>).
+                style.z_index = Some(n.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+            } else if v.parse::<i128>().is_ok() {
+                // Very large integers (beyond i64) still parse as <integer>; clamp by sign.
+                style.z_index = Some(if v.starts_with('-') { i32::MIN } else { i32::MAX });
             }
         }
 

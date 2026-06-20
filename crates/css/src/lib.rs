@@ -662,7 +662,13 @@ pub fn parse_declarations(s: &str) -> Vec<(String, String)> {
         }
         // Split on the FIRST top-level colon (values may contain `:` inside `url(...)` etc.).
         if let Some(idx) = find_top_level(chunk, ':') {
-            let prop = chunk[..idx].trim().to_ascii_lowercase();
+            let raw = chunk[..idx].trim();
+            // Custom properties (`--name`) are case-sensitive; everything else is lowercased.
+            let prop = if raw.starts_with("--") {
+                raw.to_string()
+            } else {
+                raw.to_ascii_lowercase()
+            };
             let val = chunk[idx + 1..].trim().to_string();
             if !prop.is_empty() && !val.is_empty() {
                 out.push((prop, val));
