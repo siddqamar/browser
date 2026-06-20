@@ -1,5 +1,7 @@
 # WPT conformance — biggest wins
 
+> **Broad run (dom + html/dom + css/cssom + domparsing): 13.5% → 88.9%** (61,801/69,530). HTML IDL attribute reflection (html/dom 8%→96%, all reflection-*.html 100%) was the decisive win. Per-area now: html/dom 96%, dom 53%, css/cssom 47%, domparsing 10%.
+
 Baseline 501/5295 (9.5%) → after implicit-body + classList: **1918/5254 (36.5%)**, 466 files ran,
 34 harness-errors. Prioritized by subtests unlocked.
 
