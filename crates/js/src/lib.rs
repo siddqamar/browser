@@ -7474,7 +7474,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       }
       var body = css.slice(bodyStart, i);
       if (i < n && css[i] === "}") { i++; }
-      out.push(structFromPrelude(prelude, body));
+      var __srule = structFromPrelude(prelude, body);
+      // Drop a style rule whose selector uses a functional pseudo-element without its required
+      // argument (`::part`, `::slotted`, `::highlight`) — it's invalid, so the rule isn't parsed.
+      if (__srule && !(__srule.kind === "style" && /::(?:part|slotted|highlight)\b(?!\s*\()/i.test(__srule.prelude))) {
+        out.push(__srule);
+      }
     }
     return out;
   }
