@@ -336,6 +336,10 @@ pub struct ComputedStyle {
     /// A `background-image` gradient (linear/radial), if any. `None` = no gradient. Painted as the
     /// box's background fill (over any solid `background-color`). Not inherited.
     pub background_gradient: Option<Gradient>,
+    /// A `background-image: url(...)` source, resolved to an absolute URL against the correct base
+    /// (the stylesheet base for a rule, the document base for an inline style). `None` = no image
+    /// url. Reported by `getComputedStyle` as the CSSOM resolved value. Not inherited.
+    pub background_image_url: Option<String>,
     /// `box-shadow` layers (outer + inset), painted back-to-front. Empty = none. Not inherited.
     pub box_shadows: Vec<BoxShadow>,
     /// A composed 2D affine `transform` `[a b c d e f]` (maps (x,y)→(a*x+c*y+e, b*x+d*y+f)),
@@ -677,6 +681,7 @@ impl Default for ComputedStyle {
             opacity: 1.0,
             border_radius: 0.0,
             background_gradient: None,
+            background_image_url: None,
             box_shadows: Vec::new(),
             transform: None,
             transform_origin: (0.5, 0.5),
@@ -786,6 +791,13 @@ impl ComputedStyle {
             "background-color" => match self.background_color {
                 Some(c) => rgb_str(c),
                 None => "rgba(0, 0, 0, 0)".to_string(), // CSS transparent
+            },
+            "background-image" => match &self.background_image_url {
+                Some(u) => format!("url(\"{u}\")"),
+                // No gradient serializer yet — keep the prior empty string for gradients so this
+                // doesn't regress gradient reads; report the initial `none` only when truly unset.
+                None if self.background_gradient.is_some() => String::new(),
+                None => "none".to_string(),
             },
             "border-top-color" | "border-right-color" | "border-bottom-color"
             | "border-left-color" | "border-color"
@@ -1697,6 +1709,18 @@ thread_local! {
     /// namespace constraints are ignored and matching behaves exactly as before.
     static NAMESPACE_BINDINGS: std::cell::RefCell<NamespaceEnv> =
         const { std::cell::RefCell::new(NamespaceEnv { default_ns: None, prefixes: Vec::new() }) };
+
+    /// The document's base URL, used to resolve relative `url(...)` references in **inline** styles
+    /// (a `style="…"` attribute has no stylesheet, so its base is the document base — `<base href>`).
+    /// Set via [`set_document_base_url`] before a cascade; stylesheet rules carry their own base.
+    static DOCUMENT_BASE_URL: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set the document base URL used to resolve relative `url(...)` in inline styles. Call before
+/// [`cascade`] (mirrors [`set_viewport_metrics`]). `None` clears it (relative urls stay relative).
+pub fn set_document_base_url(base: Option<&str>) {
+    DOCUMENT_BASE_URL.with(|b| *b.borrow_mut() = base.map(str::to_string));
 }
 
 /// The resolved `@namespace` environment for one cascade.
@@ -1910,6 +1934,7 @@ fn compute_element_style<'a>(
         opacity: 1.0,
         border_radius: 0.0,
         background_gradient: None,
+        background_image_url: None,
         box_shadows: Vec::new(),
         transform: None,
         transform_origin: (0.5, 0.5),
@@ -2031,13 +2056,20 @@ fn compute_element_style<'a>(
         .get("style")
         .map(|s| css::parse_declarations(s))
         .unwrap_or_default();
+    // Inline `style=""` url()s resolve against the document base (a `style` attribute has no
+    // stylesheet). Held in a local so the borrow lives across the apply loop below.
+    let inline_base = DOCUMENT_BASE_URL.with(|b| b.borrow().clone());
     if !inline_decls.is_empty() {
         // Inline is the sole top-level entry; the sort tiebreaks on `order` only within the
         // same origin/specificity, so the exact value is immaterial. Use MAX to keep the
         // "applied last" intent explicit.
-        // Inline `style=""` url()s resolve against the document base; the cascade doesn't carry it,
-        // so leave `base: None` and let the engine resolve against the document URL as a fallback.
-        matches.push(MatchEntry { origin: 3, specificity: 0, order: usize::MAX, decls: &inline_decls, base: None });
+        matches.push(MatchEntry {
+            origin: 3,
+            specificity: 0,
+            order: usize::MAX,
+            decls: &inline_decls,
+            base: inline_base.as_deref(),
+        });
     }
 
     // Sort by (origin, specificity, order) ascending so the winner is applied last.
@@ -3149,7 +3181,15 @@ fn apply_declaration(
         "background-image" => {
             if let Some(g) = parse_gradient(val, current_color, inherited_color) {
                 style.background_gradient = Some(g);
+                style.background_image_url = None;
             } else if val.trim().eq_ignore_ascii_case("none") {
+                style.background_gradient = None;
+                style.background_image_url = None;
+            } else if let Some(u) = extract_css_url(val) {
+                // Resolve against this declaration's base — the stylesheet base for a rule, or the
+                // document base for an inline style (set on the MatchEntry) — so getComputedStyle
+                // reports the absolute (resolved) url per CSSOM.
+                style.background_image_url = Some(resolve_css_url(&u, base));
                 style.background_gradient = None;
             }
         }
@@ -3891,6 +3931,27 @@ fn parse_angle_deg(tok: &str) -> Option<f32> {
 /// valid absolute URL) are returned unchanged — the engine then falls back to resolving against the
 /// document URL. This is what makes `url('../icons/x.svg')` in an external sheet load from the
 /// sheet's directory, not the document's.
+/// Extract the first `url(...)` source from a CSS value (surrounding quotes stripped). `None` when
+/// there's no `url(...)` or the source is empty.
+fn extract_css_url(val: &str) -> Option<String> {
+    let lower = val.to_ascii_lowercase();
+    let start = lower.find("url(")?;
+    let rest = &val[start + 4..];
+    let close = rest.find(')')?;
+    let mut raw = rest[..close].trim().to_string();
+    if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        raw = raw[1..raw.len() - 1].to_string();
+    }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
 fn resolve_css_url(url: &str, base: Option<&str>) -> String {
     let trimmed = url.trim();
     // `data:` URLs are already self-contained; never rewrite them.

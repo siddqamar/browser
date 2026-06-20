@@ -198,6 +198,9 @@ struct HostState {
     /// Full document content height (CSS px) at the last push. Reported as
     /// `documentElement.scrollHeight` / `body.scrollHeight` so pages that size off the page height work.
     doc_height: Cell<f32>,
+    /// The page URL (the document's address). Set once at bootstrap. Combined with any `<base href>`
+    /// it yields the document base URL, used to resolve relative `url(...)` in inline styles.
+    page_url: RefCell<String>,
 }
 
 impl HostState {
@@ -249,6 +252,7 @@ impl HostState {
             canvas_pixels: RefCell::new(HashMap::new()),
             viewport_scroll_y: Cell::new(0.0),
             doc_height: Cell::new(0.0),
+            page_url: RefCell::new(String::new()),
         })
     }
 
@@ -1234,32 +1238,82 @@ fn prim_get_attr(
 /// Walk the document for `<style>` elements, concatenate their text content, and parse it into a
 /// single author stylesheet. Returns an empty `Vec` when there are no `<style>` blocks (the cascade
 /// then runs with just the UA sheet + inline `style=""` attributes).
+/// Join `href` onto `base` (both treated as URLs); returns `base` if either fails to parse.
+fn join_url(base: &str, href: &str) -> String {
+    match url::Url::parse(base).and_then(|b| b.join(href.trim())) {
+        Ok(u) => u.into(),
+        Err(_) => base.to_string(),
+    }
+}
+
+/// The document's base URL: the first `<base href>` resolved against the page URL, else the page URL.
+fn document_base_url(doc: &dom::Document, page_url: &str) -> String {
+    fn find(doc: &dom::Document, id: dom::NodeId) -> Option<String> {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("base") {
+                if let Some(h) = e.attrs.get("href") {
+                    if !h.trim().is_empty() {
+                        return Some(h.trim().to_string());
+                    }
+                }
+            }
+        }
+        for &c in &doc.get(id).children {
+            if let Some(h) = find(doc, c) {
+                return Some(h);
+            }
+        }
+        None
+    }
+    match find(doc, doc.root()) {
+        Some(href) if !page_url.is_empty() => join_url(page_url, &href),
+        _ => page_url.to_string(),
+    }
+}
+
 fn collect_author_sheets(
     doc: &dom::Document,
     fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+    page_url: &str,
 ) -> Vec<css::Stylesheet> {
-    /// One author stylesheet in document order, with the bits needed to apply the preferred-set rule.
-    /// `seq` is the node id, which (arena nodes are allocated in creation order) tracks the order the
-    /// sheet was added — what determines the preferred set, independent of final tree order.
+    // Resolve the document base URL (honoring `<base href>`) and publish it so the cascade resolves
+    // relative `url(...)` in inline `style=""` attributes (which have no stylesheet of their own).
+    let doc_base = document_base_url(doc, page_url);
+    style::set_document_base_url(if doc_base.is_empty() { None } else { Some(&doc_base) });
+
+    /// One author stylesheet in document order. `seq` is the node id (arena nodes are allocated in
+    /// creation order), which determines the preferred set independent of final tree order. `base` is
+    /// the URL relative `url(...)`s in this sheet resolve against (the sheet's own URL).
     struct SheetEntry {
         title: Option<String>,
         alternate: bool,
         css: String,
         seq: usize,
+        base: String,
     }
     fn walk(
         doc: &dom::Document,
         id: dom::NodeId,
         out: &mut Vec<SheetEntry>,
         fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+        doc_base: &str,
     ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("style") {
+                // An adopted-stylesheet mirror carries its constructed sheet's base via
+                // `data-base-url`; a normal <style>'s rules resolve against the document base.
+                let base = e
+                    .attrs
+                    .get("data-base-url")
+                    .filter(|b| !b.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| doc_base.to_string());
                 out.push(SheetEntry {
                     title: e.attrs.get("title").cloned(),
                     alternate: false,
                     css: text_content(doc, id),
                     seq: id.0,
+                    base,
                 });
                 return; // don't descend into a <style>'s text as if it were markup
             }
@@ -1280,11 +1334,13 @@ fn collect_author_sheets(
                 if is_stylesheet && !disabled {
                     if let Some(href) = e.attrs.get("href") {
                         if let Some(css) = fetch_link_css(href, fetcher) {
+                            // The link sheet's rules resolve against the link's own (absolute) URL.
                             out.push(SheetEntry {
                                 title: e.attrs.get("title").cloned(),
                                 alternate: is_alternate,
                                 css,
                                 seq: id.0,
+                                base: join_url(doc_base, href),
                             });
                         }
                     }
@@ -1293,11 +1349,11 @@ fn collect_author_sheets(
             }
         }
         for &child in &doc.get(id).children {
-            walk(doc, child, out, fetcher);
+            walk(doc, child, out, fetcher, doc_base);
         }
     }
     let mut entries: Vec<SheetEntry> = Vec::new();
-    walk(doc, doc.root(), &mut entries, fetcher);
+    walk(doc, doc.root(), &mut entries, fetcher, &doc_base);
 
     // The "preferred style sheet set" name: the title of the first non-alternate sheet with a
     // non-empty title. Sheets with no/empty title are persistent (always apply); a non-empty title
@@ -1309,23 +1365,24 @@ fn collect_author_sheets(
         .min_by_key(|e| e.seq)
         .and_then(|e| e.title.as_deref());
 
-    let mut css_src = String::new();
+    // Parse each applicable sheet against its own base, in document order (the cascade applies sheets
+    // in order, so per-sheet parsing preserves the previous concatenated order while keeping bases).
+    let mut sheets: Vec<css::Stylesheet> = Vec::new();
     for e in &entries {
         let applies = e.alternate
             || match e.title.as_deref() {
                 None | Some("") => true,
                 Some(t) => Some(t) == preferred,
             };
-        if applies {
-            css_src.push_str(&e.css);
-            css_src.push('\n');
+        if applies && !e.css.trim().is_empty() {
+            if e.base.is_empty() {
+                sheets.push(css::parse(&e.css));
+            } else {
+                sheets.push(css::parse_with_base(&e.css, &e.base));
+            }
         }
     }
-    if css_src.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![css::parse(&css_src)]
-    }
+    sheets
 }
 
 /// Fetch the CSS text behind a stylesheet `<link href>`. `data:` URLs are decoded directly (the
@@ -1377,7 +1434,7 @@ fn with_computed_style<R>(
         let fresh = matches!(&*cache, Some((v, _)) if *v == version);
         if !fresh {
             let doc = state.doc.borrow();
-            let sheets = collect_author_sheets(&doc, &state.fetcher);
+            let sheets = collect_author_sheets(&doc, &state.fetcher, &state.page_url.borrow());
             let map = style::cascade(&doc, &sheets);
             *cache = Some((version, map));
         }
@@ -1400,7 +1457,7 @@ fn with_cascade_map<R>(
         let fresh = matches!(&*cache, Some((v, _)) if *v == version);
         if !fresh {
             let doc = state.doc.borrow();
-            let sheets = collect_author_sheets(&doc, &state.fetcher);
+            let sheets = collect_author_sheets(&doc, &state.fetcher, &state.page_url.borrow());
             let map = style::cascade(&doc, &sheets);
             *cache = Some((version, map));
         }
@@ -1428,7 +1485,7 @@ fn with_pseudo_style<R>(
         let fresh = matches!(&*cache, Some((v, _)) if *v == version);
         if !fresh {
             let doc = state.doc.borrow();
-            let sheets = collect_author_sheets(&doc, &state.fetcher);
+            let sheets = collect_author_sheets(&doc, &state.fetcher, &state.page_url.borrow());
             let map = style::cascade(&doc, &sheets);
             *cache = Some((version, map));
         }
@@ -1438,7 +1495,7 @@ fn with_pseudo_style<R>(
     let doc = state.doc.borrow();
     let element_style = map.get(&id);
     let pseudo = element_style.and_then(|es| {
-        let sheets = collect_author_sheets(&doc, &state.fetcher);
+        let sheets = collect_author_sheets(&doc, &state.fetcher, &state.page_url.borrow());
         style::compute_pseudo_style(&doc, &sheets, id, es, pseudo_key)
     });
     f(pseudo.as_ref())
@@ -3307,6 +3364,7 @@ fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
     let key = v8::String::new(scope, "__pageURL").unwrap();
     let val = js_str(scope, url);
     global.set(scope, key.into(), val);
+    *host_state(scope).page_url.borrow_mut() = url.to_string();
     // Inject the live viewport metrics so the bootstrap can set window.innerWidth/innerHeight and
     // devicePixelRatio from the real values rather than hardcoded defaults.
     let (vw, vh, dpr) = device_metrics();
@@ -10272,6 +10330,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var m = ensureMirror();
       if (!m) { return; }
       try { m.textContent = serialize(); } catch (e) {}
+      // Carry a constructed sheet's explicit baseURL so the cascade resolves its relative url()s
+      // against that base (not the document base). Best-effort: the first enabled sheet that has one.
+      try {
+        var base = null;
+        for (var i = 0; i < backing.length; i++) {
+          if (backing[i] && !backing[i].disabled && backing[i].__baseURL) { base = backing[i].__baseURL; break; }
+        }
+        if (base) { m.setAttribute("data-base-url", base); } else { m.removeAttribute("data-base-url"); }
+      } catch (e) {}
     }
     host.__refreshAdopted = refresh;
     // Track host on each sheet so mutating it (markDirty) refreshes our mirror.
