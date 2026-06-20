@@ -197,8 +197,8 @@ fn request_streaming_inner(
 
     let is_get = method_uc == "GET";
 
-    // Opt-in on-disk cache (set NET_CACHE_DIR): serve a previously-cached body so repeated runs
-    // don't re-hit the network. GET only (keyed by URL); non-GET bypasses the cache entirely.
+    // On-disk cache (per-user OS cache dir by default; see `cache_dir`): serve a previously-cached
+    // body so repeated loads don't re-hit the network. GET only (keyed by URL); non-GET bypasses it.
     let cache = if is_get { cache_path(url) } else { None };
     if let Some(p) = &cache {
         if let Ok(body) = std::fs::read(p) {
@@ -321,14 +321,32 @@ fn request_streaming_inner(
     Ok(ResponseMeta { status, content_type, final_url: url.to_string() })
 }
 
-/// Disk-cache file path for `url` under `NET_CACHE_DIR` (a stable hash of the URL), or `None`
-/// when the cache is disabled.
+/// Root directory of the on-disk HTTP cache. Like other browsers, this defaults to a per-user OS
+/// cache location (macOS: `~/Library/Caches/dev.imlunahey.browser/net`) — never the working
+/// directory. `NET_CACHE_DIR` overrides it; setting it empty / `off` / `0` disables the cache.
+fn cache_dir() -> Option<std::path::PathBuf> {
+    match std::env::var("NET_CACHE_DIR") {
+        Ok(v) if v.is_empty() || v == "off" || v == "0" => return None,
+        Ok(v) => return Some(std::path::PathBuf::from(v)),
+        Err(_) => {}
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::Path::new(&home).join("Library/Caches/dev.imlunahey.browser/net"))
+}
+
+/// Disk-cache file path for `url` (a stable hash of the URL under [`cache_dir`]), or `None` when the
+/// cache is disabled or the URL shouldn't be cached.
 fn cache_path(url: &str) -> Option<std::path::PathBuf> {
-    let dir = std::env::var_os("NET_CACHE_DIR")?;
+    // Never disk-cache local dev servers (e.g. the WPT runner): they serve mutable content at stable
+    // URLs, so a cache hit would mask edits.
+    if url.contains("://localhost") || url.contains("://127.0.0.1") || url.contains("://[::1]") {
+        return None;
+    }
+    let dir = cache_dir()?;
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut h);
-    Some(std::path::Path::new(&dir).join(format!("{:016x}", h.finish())))
+    Some(dir.join(format!("{:016x}", h.finish())))
 }
 
 /// Guess a content type from a URL's file extension (used for cached responses).
