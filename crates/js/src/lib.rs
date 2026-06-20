@@ -6198,6 +6198,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       set: function (v) { writeAlways(parseStyleDecls(v)); },
       enumerable: true, configurable: true
     });
+    // Make `el.style instanceof CSSStyleDeclaration` hold: the Proxy (no getPrototypeOf trap) reports
+    // its target's prototype, so give the target the interface prototype.
+    try { if (globalThis.CSSStyleDeclaration && globalThis.CSSStyleDeclaration.prototype) { Object.setPrototypeOf(base, globalThis.CSSStyleDeclaration.prototype); } } catch (e) {}
     try {
       return new Proxy(base, {
         get: function (t, p) {
