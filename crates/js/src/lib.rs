@@ -4460,14 +4460,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       function getNames() { if (names === null) { try { names = __computedStyleNames(id, pseudo) || []; } catch (e) { names = []; } } return names; }
       function get(prop) { try { return __computedStyleProp(id, String(prop).toLowerCase(), pseudo); } catch (e) { return ""; } }
 
+      // Computed styles are read-only: mutators throw NoModificationAllowedError (per CSSOM).
+      function readOnlyThrow() { throw new globalThis.DOMException("Cannot modify the computed (resolved) style.", "NoModificationAllowedError"); }
       var decl = {
         getPropertyValue: function (name) { return get(name); },
         getPropertyPriority: function () { return ""; },
-        // Computed styles are read-only: mutators are no-ops.
-        setProperty: fn,
-        removeProperty: function () { return ""; },
-        item: function (i) { var n = getNames(); i = i >>> 0; return i < n.length ? n[i] : ""; }
+        setProperty: function () { readOnlyThrow(); },
+        removeProperty: function () { readOnlyThrow(); },
+        item: function (i) { var n = getNames(); i = i >>> 0; return i < n.length ? n[i] : ""; },
+        parentRule: null
       };
+      // Iterable over property names (the indexed getter values).
+      try { decl[Symbol.iterator] = function () { return makeIter(getNames(), function (i, v) { return v; }); }; } catch (e) {}
+      // cssText on a computed (resolved) style declaration is the empty string; setting it throws.
+      Object.defineProperty(decl, "cssText", { get: function () { return ""; }, set: function () { readOnlyThrow(); }, enumerable: true, configurable: true });
       Object.defineProperty(decl, "length", {
         get: function () { return getNames().length; }, enumerable: true, configurable: true
       });
@@ -4843,14 +4849,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var body = dq != null ? dq : (sq != null ? sq : (uq != null ? uq : ""));
       return 'url("' + body + '")';
     });
+    // `counter(name, decimal)` / `counters(name, sep, decimal)`: the default `decimal` style is
+    // omitted on serialization.
+    val = val.replace(/counter\(\s*([^,)]+?)\s*,\s*decimal\s*\)/gi, function (_m, nm) { return "counter(" + nm.trim() + ")"; });
     var out = "";
     var i = 0, n = val.length;
     while (i < n) {
       var ch = val[i];
-      // Skip quoted strings verbatim.
+      // Skip quoted strings verbatim (property-specific quote canonicalization happens in pushDecl).
       if (ch === '"' || ch === "'") {
         var q = ch; out += ch; i++;
-        while (i < n && val[i] !== q) { out += val[i]; i++; }
+        while (i < n && val[i] !== q) { if (val[i] === "\\" && i + 1 < n) { out += val[i] + val[i + 1]; i += 2; continue; } out += val[i]; i++; }
         if (i < n) { out += val[i]; i++; }
         continue;
       }
@@ -4870,6 +4879,49 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       out += ch; i++;
     }
     return out;
+  }
+  // Re-quote every top-level CSS string in `val` to double-quote form (CSSOM "serialize a string").
+  // Used for properties whose <string> values are always quoted on serialization (content, quotes).
+  function requoteStrings(val) {
+    val = String(val);
+    var out = "", i = 0, n = val.length;
+    while (i < n) {
+      var ch = val[i];
+      if (ch === '"' || ch === "'") {
+        var q = ch; i++; var body = "";
+        while (i < n) {
+          var cc = val[i];
+          if (cc === "\\") { if (i + 1 < n) { body += cc + val[i + 1]; i += 2; } else { i++; } continue; }
+          if (cc === q) { i++; break; }
+          body += cc; i++;
+        }
+        out += '"' + body.replace(/"/g, '\\"') + '"';
+        continue;
+      }
+      out += ch; i++;
+    }
+    return out;
+  }
+  // Serialize a font-family list: drop quotes around any family name that is a sequence of valid CSS
+  // identifiers (so `'Lucida Grande'` -> `Lucida Grande`); keep quotes otherwise.
+  function normalizeFontFamily(val) {
+    var parts = splitTopLevel(String(val), ",");
+    var out = [];
+    for (var p = 0; p < parts.length; p++) {
+      var fam = parts[p].trim();
+      if (fam === "") continue;
+      var first = fam.charAt(0);
+      if (first === '"' || first === "'") {
+        // Quoted: unquote if the body is a space-separated list of valid idents; else keep (dq).
+        var body = fam.slice(1, -1);
+        var words = body.split(/\s+/);
+        var allIdent = words.length > 0 && words.every(function (w) { return /^-?[A-Za-z_][A-Za-z0-9_-]*$/.test(w); });
+        out.push(allIdent ? words.join(" ") : '"' + body.replace(/"/g, '\\"') + '"');
+      } else {
+        out.push(fam.replace(/\s+/g, " "));
+      }
+    }
+    return out.join(", ");
   }
   // ====== CSS shorthand <-> longhand machinery (CSSOM serialize-a-CSS-declaration-block) ========
   // The set of longhands the `all` shorthand resets (every property except direction, unicode-bidi
@@ -5024,6 +5076,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (name === "list-style") return ["list-style-position", "list-style-image", "list-style-type"];
     if (name === "text-decoration") return ["text-decoration-line", "text-decoration-style", "text-decoration-color"];
     if (name === "flex-flow") return ["flex-direction", "flex-wrap"];
+    // flex expands in the order grow, basis, shrink (matches browser declaration-block order).
+    if (name === "flex") return ["flex-grow", "flex-basis", "flex-shrink"];
     if (name === "place-content") return ["align-content", "justify-content"];
     if (name === "place-items") return ["align-items", "justify-items"];
     if (name === "place-self") return ["align-self", "justify-self"];
@@ -5111,7 +5165,39 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       out2.push(["list-style-image", ls["list-style-image"] !== undefined ? ls["list-style-image"] : "none"]);
       return out2;
     }
+    if (name === "flex") {
+      var fl = parseFlex(value);
+      if (!fl) return null;
+      return [["flex-grow", fl.grow], ["flex-basis", fl.basis], ["flex-shrink", fl.shrink]];
+    }
     return null;
+  }
+  // Parse the `flex` shorthand into {grow, shrink, basis}. Returns null if it can't be modeled.
+  function parseFlex(value) {
+    var v = String(value).trim(), vl = v.toLowerCase();
+    if (vl === "none") return { grow: "0", shrink: "0", basis: "auto" };
+    if (vl === "auto") return { grow: "1", shrink: "1", basis: "auto" };
+    var toks = splitCssTokens(v);
+    function isNum(t) { return /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(t); }
+    var grow = null, shrink = null, basis = null;
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (isNum(t)) {
+        if (grow === null) grow = t;
+        else if (shrink === null) shrink = t;
+        else return null;
+      } else {
+        if (basis !== null) return null;
+        basis = t;
+      }
+    }
+    if (grow === null && basis === null) return null;
+    // Defaults per CSS Flexbox: grow 1, shrink 1, basis 0% — but a single number sets basis to 0px
+    // (the "one value, flexible" case) which browsers serialize as `0px`.
+    if (grow === null) grow = "1";
+    if (shrink === null) shrink = "1";
+    if (basis === null) basis = "0px";
+    return { grow: normalizeNumberToken(grow), shrink: normalizeNumberToken(shrink), basis: basis };
   }
   // Serialize a shorthand from the current longhand values (`getLong(name)`). Returns "" if it
   // cannot be represented (a longhand missing or values inconsistent).
@@ -5189,6 +5275,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (im !== "none") lp.push(im);
       return lp.length === 0 ? "disc" : lp.join(" ");
     }
+    if (name === "flex") {
+      var fg = g("flex-grow"), fsk = g("flex-shrink"), fb = g("flex-basis");
+      // A CSS-wide keyword in any longhand can't combine (handled by the early-return above).
+      // Canonical: `grow shrink basis`.
+      return fg + " " + fsk + " " + fb;
+    }
     return "";
   }
 
@@ -5200,16 +5292,63 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   // Parse a declaration block into expanded longhand triples [name, value, important], in source
   // order, expanding shorthands and `all` as we go.
+  // Decode CSS identifier escapes in `s` to their literal characters: `\xx` hex (1-6 hex digits,
+  // optional single trailing whitespace) -> the code point; `\c` for any other char -> that char.
+  function unescapeCssIdent(s) {
+    s = String(s);
+    var out = "", i = 0, n = s.length;
+    while (i < n) {
+      var c = s[i];
+      if (c === "\\" && i + 1 < n) {
+        var nx = s[i + 1];
+        if (/[0-9a-fA-F]/.test(nx)) {
+          var hex = ""; i++;
+          while (i < n && hex.length < 6 && /[0-9a-fA-F]/.test(s[i])) { hex += s[i]; i++; }
+          if (i < n && /\s/.test(s[i])) { i++; } // consume one trailing whitespace
+          var cp = parseInt(hex, 16);
+          out += (cp === 0 || cp > 0x10FFFF) ? "�" : String.fromCodePoint(cp);
+          continue;
+        }
+        out += nx; i += 2; continue;
+      }
+      out += c; i++;
+    }
+    return out;
+  }
+  // Serialize a string as a CSS identifier (CSSOM "serialize an identifier"): escape characters that
+  // aren't valid unescaped in an ident. Digits at the start (and a leading `-` then digit) are hex-
+  // escaped; non-ident chars get a `\` (or hex escape for control chars).
+  function escapeCssIdent(s) {
+    s = String(s);
+    var chars = Array.from(s), out = "";
+    function hexEsc(cp) { return "\\" + cp.toString(16) + " "; }
+    for (var i = 0; i < chars.length; i++) {
+      var ch = chars[i], cp = ch.codePointAt(0);
+      if (cp === 0) { out += "�"; continue; }
+      if ((cp >= 0x1 && cp <= 0x1f) || cp === 0x7f) { out += hexEsc(cp); continue; }
+      // A digit at the very start, or a digit right after a leading `-`, must be hex-escaped.
+      if ((cp >= 0x30 && cp <= 0x39) && (i === 0 || (i === 1 && chars[0] === "-"))) { out += hexEsc(cp); continue; }
+      if (i === 0 && cp === 0x2d && chars.length === 1) { out += "\\-"; continue; } // lone "-"
+      if (cp >= 0x80 || cp === 0x2d || cp === 0x5f || (cp >= 0x30 && cp <= 0x39) ||
+          (cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a)) { out += ch; continue; }
+      out += "\\" + ch; // any other char: backslash-escape it literally
+    }
+    return out;
+  }
   function parseStyleDecls(text) {
     var out = [];
     text = String(text || "");
     var parts = splitTopLevelSemis(text);
     for (var i = 0; i < parts.length; i++) {
       var seg = parts[i];
-      var c = seg.indexOf(":");
+      var c = indexOfTopLevelColon(seg);
       if (c < 0) { continue; }
       var rawName = seg.slice(0, c).trim();
-      var name = isCustomProp(rawName) ? rawName : rawName.toLowerCase();
+      // Custom property names are case-sensitive; decode CSS escapes (`--a\;b` -> `--a;b`). Standard
+      // property names are ASCII-lowercased.
+      var name;
+      if (isCustomProp(rawName)) { name = unescapeCssIdent(rawName); }
+      else { name = unescapeCssIdent(rawName).toLowerCase(); }
       if (!name) continue;
       var rawVal = seg.slice(c + 1).trim();
       var imp = splitImportant(rawVal);
@@ -5217,11 +5356,28 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     return out;
   }
-  // Split a declaration block on top-level `;` (not inside parens/strings).
+  // Index of the first top-level `:` (not inside parens/strings, not backslash-escaped). Used to
+  // split a declaration `name : value` so an escaped colon in a custom-prop name isn't the splitter.
+  function indexOfTopLevelColon(seg) {
+    var i = 0, n = seg.length, depth = 0, q = null;
+    while (i < n) {
+      var c = seg[i];
+      if (c === "\\" && i + 1 < n) { i += 2; continue; }
+      if (q) { if (c === q) q = null; i++; continue; }
+      if (c === '"' || c === "'") { q = c; i++; continue; }
+      if (c === "(") { depth++; i++; continue; }
+      if (c === ")") { if (depth > 0) depth--; i++; continue; }
+      if (c === ":" && depth === 0) { return i; }
+      i++;
+    }
+    return -1;
+  }
+  // Split a declaration block on top-level `;` (not inside parens/strings, not backslash-escaped).
   function splitTopLevelSemis(text) {
     var out = [], i = 0, n = text.length, depth = 0, q = null, start = 0;
     while (i < n) {
       var c = text[i];
+      if (c === "\\" && i + 1 < n) { i += 2; continue; }
       if (q) { if (c === q) q = null; i++; continue; }
       if (c === '"' || c === "'") { q = c; i++; continue; }
       if (c === "(") { depth++; i++; continue; }
@@ -5250,7 +5406,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       for (var e = 0; e < expanded.length; e++) setDecl(out, expanded[e][0], normalizeCssValue(expanded[e][1]), important);
       return;
     }
-    setDecl(out, name, normalizeCssValue(val), important);
+    var nv = normalizeCssValue(val);
+    // The `font` shorthand serializes size/line-height with spaces around the slash: `10px / 1`.
+    if (name === "font" && !isCssWideKeyword(nv)) { nv = nv.replace(/\s*\/\s*/g, " / "); }
+    // flex-basis serializes a zero length as `0px` (a <length-percentage>, not a flat number).
+    if (name === "flex-basis" && nv === "0") { nv = "0px"; }
+    // Property-specific <string> canonicalization.
+    if (!isCssWideKeyword(nv)) {
+      if (name === "content" || name === "quotes") { nv = requoteStrings(nv); }
+      else if (name === "font-family") { nv = normalizeFontFamily(nv); }
+    }
+    setDecl(out, name, nv, important);
   }
   function findDecl(out, name) { for (var i = 0; i < out.length; i++) { if (out[i][0] === name) return i; } return -1; }
   function setDecl(out, name, val, important) {
@@ -5271,14 +5437,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "border-top", "border-right", "border-bottom", "border-left", "border-image",
     "margin", "padding", "inset", "border-radius",
     "overflow", "overscroll-behavior", "gap", "outline", "list-style", "text-decoration",
-    "flex-flow", "place-content", "place-items", "place-self", "columns"
+    "flex", "flex-flow", "place-content", "place-items", "place-self", "columns"
   ];
   // Serialize expanded longhand triples WITHOUT shorthand grouping — the engine-readable form
   // stored in the `style` attribute (the Rust cascade understands longhands, not every shorthand).
   function serializeStyleDeclsFlat(decls) {
     var s = "";
     for (var i = 0; i < decls.length; i++) {
-      s += (s ? " " : "") + decls[i][0] + ": " + decls[i][1] + (decls[i][2] ? " !important" : "") + ";";
+      var nm = isCustomProp(decls[i][0]) ? escapeCssIdent(decls[i][0]) : decls[i][0];
+      s += (s ? " " : "") + nm + ": " + decls[i][1] + (decls[i][2] ? " !important" : "") + ";";
     }
     return s;
   }
@@ -5307,7 +5474,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         if (!allEmitted) { emit("all", allKw.toLowerCase(), allImp); allEmitted = true; }
         serialized[name] = 1; continue;
       }
-      if (isCustomProp(name)) { emit(name, decls[d][1], decls[d][2]); serialized[name] = 1; continue; }
+      if (isCustomProp(name)) { emit(escapeCssIdent(name), decls[d][1], decls[d][2]); serialized[name] = 1; continue; }
       var used = false;
       for (var s = 0; s < SERIALIZE_SHORTHANDS.length; s++) {
         var sh = SERIALIZE_SHORTHANDS[s];
@@ -5345,7 +5512,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   function styleAttr(node) { var v = document.__getAttr(node, "style"); return v == null ? "" : v; }
   // Normalize a CSS property name for the CSSStyleDeclaration API (lowercase; custom props as-is).
-  function normPropName(p) { p = camelToKebab(String(p)); return isCustomProp(p) ? p : p.toLowerCase(); }
+  function normPropName(p) { p = String(p); if (isCustomProp(p)) { return p; } /* custom props are case-sensitive, kept verbatim */ p = camelToKebab(p); return p.toLowerCase(); }
   // Build a CSSStyleDeclaration over a backing store. `get()` returns the current declaration block
   // text; `set(text)` writes it back. Used for both inline styles (style attr) and rule blocks.
   function makeStyleDecl(get, set) {
@@ -5368,6 +5535,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         return (ok && common !== null && isCssWideKeyword(common)) ? common.toLowerCase() : "";
       }
       if (isShorthand(name)) {
+        // A shorthand only serializes if all its longhands are present with a uniform priority.
+        var shLhs = name === "border" ? BORDER_ALL_LONGHANDS : shorthandLonghands(name);
+        if (shLhs) {
+          var impCommon = null, impOk = true, allPresent = true;
+          for (var si = 0; si < shLhs.length; si++) {
+            var sidx = findDecl(d, shLhs[si]);
+            if (sidx < 0) { allPresent = false; break; }
+            if (impCommon === null) impCommon = d[sidx][2]; else if (impCommon !== d[sidx][2]) { impOk = false; break; }
+          }
+          if (allPresent && !impOk) return ""; // mixed importance -> shorthand can't be formed
+        }
         var sv = serializeShorthand(name, function (n) { var i = findDecl(d, n); return i >= 0 ? d[i][1] : ""; });
         if (sv !== "") return sv;
         // If the shorthand was stored literally (we don't model its value), return the literal.
@@ -5424,6 +5602,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       removeProperty: function (p) { return removeVal(normPropName(p)); },
       item: function (i) { var d = read(); i = i >>> 0; return i < d.length ? d[i][0] : ""; }
     };
+    // CSSStyleDeclaration is iterable over its property names (the indexed-property getter values).
+    try { base[Symbol.iterator] = function () { var d = read(); return makeIter(d, function (i, v) { return v[0]; }); }; } catch (e) {}
     Object.defineProperty(base, "length", { get: function () { return read().length; }, enumerable: false, configurable: true });
     Object.defineProperty(base, "cssText", {
       // Group longhands back into shorthands on read (CSSOM serialization); store flat on write.
@@ -5709,6 +5889,35 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var c = chars[i];
     return c === "." || c === HASH || c === "[" || c === ":";
   }
+  // Parse + canonicalize a CSS <an+b> value (the argument of :nth-child() etc.). Returns the
+  // serialized form (e.g. "2n+1", "n", "-n+5", "10") or null if syntactically invalid.
+  function serializeAnPlusB(arg) {
+    var s = String(arg).trim().toLowerCase().replace(/\s+/g, " ");
+    if (s === "") { return null; }
+    if (s === "even") { return "2n"; }
+    if (s === "odd") { return "2n+1"; }
+    var a, b;
+    // Pure integer (no `n`): A=0, B=integer.
+    var mInt = /^([-+]?\d+)$/.exec(s.replace(/\s+/g, ""));
+    if (mInt) { return String(parseInt(mInt[1], 10)); }
+    // Forms with `n`: optional sign+coeff, `n`, optional ` ± b`.
+    var compact = s.replace(/\s+/g, "");
+    var m = /^([-+]?\d*)n([-+]\d+)?$/.exec(compact);
+    if (!m) { return null; }
+    var acoef = m[1];
+    if (acoef === "" || acoef === "+") { a = 1; }
+    else if (acoef === "-") { a = -1; }
+    else { a = parseInt(acoef, 10); }
+    b = m[2] != null ? parseInt(m[2], 10) : 0;
+    // Serialize.
+    var aPart;
+    if (a === 1) { aPart = "n"; }
+    else if (a === -1) { aPart = "-n"; }
+    else { aPart = a + "n"; }
+    if (a === 0) { return String(b); } // (shouldn't reach: handled by mInt)
+    if (b === 0) { return aPart; }
+    return aPart + (b > 0 ? "+" + b : "-" + (-b));
+  }
   function normalizeComplexSelector(sel, nsCtx) {
     nsCtx = nsCtx || { hasDefault: false, prefixes: {} };
     sel = sel.trim();
@@ -5822,6 +6031,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             var inner = arg.split(",").map(function (s) { return normalizeComplexSelector(s, nsCtx); });
             if (inner.indexOf(null) >= 0 || inner.length === 0) { return err(); }
             out += ":" + lower + "(" + inner.join(", ") + ")";
+          } else if (lower === "nth-child" || lower === "nth-last-child" || lower === "nth-of-type" || lower === "nth-last-of-type") {
+            // Canonicalize the An+B microsyntax (CSSOM "serialize an <an+b> value").
+            var anb = serializeAnPlusB(arg);
+            if (anb === null) { return err(); }
+            out += ":" + lower + "(" + anb + ")";
           } else {
             out += ":" + lower + (arg ? "(" + arg.trim() + ")" : "");
           }
@@ -5849,17 +6063,23 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var m = /^((?:[^|=~^$*\s]*|\*)\|)?([^|=~^$*\s]+)\s*([~|^$*]?=)?\s*([\s\S]*)$/.exec(attr);
     if (!m) { return null; }
     var rawPre = m[1], local = m[2], op = m[3] || "", val = (m[4] || "").trim();
+    // Decode CSS escapes in the local name, then re-serialize it as a canonical identifier
+    // (so `\30zonk` -> `\30 zonk`, `ns\:foo` -> `ns\:foo`).
+    var localDecoded = unescapeCssIdent(local);
+    // Any non-empty decoded name is a valid attribute name (escapeCssIdent makes leading digits etc.
+    // legal via escapes). Only reject if it's empty.
+    var localSer = localDecoded.length ? escapeCssIdent(localDecoded) : null;
     var name;
     if (rawPre != null) {
       var pre = rawPre.slice(0, -1); // drop the trailing `|`
-      if (!isIdent(local)) { return null; }
-      if (pre === "*") { name = "*|" + local; }       // `[*|lang]` keeps the `*|`
-      else if (pre === "") { name = local; }           // `[|lang]` -> `[lang]`
-      else if (isIdent(pre)) { name = pre + "|" + local; }
+      if (localSer === null) { return null; }
+      if (pre === "*") { name = "*|" + localSer; }       // `[*|lang]` keeps the `*|`
+      else if (pre === "") { name = localSer; }           // `[|lang]` -> `[lang]`
+      else if (isIdent(pre)) { name = pre + "|" + localSer; }
       else { return null; }
     } else {
-      if (!isIdent(local)) { return null; }
-      name = local;
+      if (localSer === null) { return null; }
+      name = localSer;
     }
     if (!op) { return name; }
     // Value: quote if it's an unquoted identifier; keep quoted values, switching to double quotes.
@@ -6101,8 +6321,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     function items() { var t = serializeMediaList(holder.text); return t === "" ? [] : splitTopLevel(t, ",").map(function (x) { return x.trim(); }); }
     var ml = {
       item: function (i) { var it = items(); return i >= 0 && i < it.length ? it[i] : null; },
-      appendMedium: function (m) { var it = items(); m = serializeMediaQuery(String(m)); if (it.indexOf(m) < 0) { it.push(m); } holder.text = it.join(", "); if (onChange) { onChange(); } },
-      deleteMedium: function (m) { var it = items(); m = serializeMediaQuery(String(m)); var k = it.indexOf(m); if (k < 0) { throw new globalThis.DOMException("Not found", "NotFoundError"); } it.splice(k, 1); holder.text = it.join(", "); if (onChange) { onChange(); } },
+      appendMedium: function (m) { if (arguments.length < 1) { throw new TypeError("appendMedium requires 1 argument"); } var it = items(); m = serializeMediaQuery(String(m)); if (it.indexOf(m) < 0) { it.push(m); } holder.text = it.join(", "); if (onChange) { onChange(); } },
+      deleteMedium: function (m) { if (arguments.length < 1) { throw new TypeError("deleteMedium requires 1 argument"); } var it = items(); m = serializeMediaQuery(String(m)); var k = it.indexOf(m); if (k < 0) { throw new globalThis.DOMException("Not found", "NotFoundError"); } it.splice(k, 1); holder.text = it.join(", "); if (onChange) { onChange(); } },
       toString: function () { return serializeMediaList(holder.text); }
     };
     Object.defineProperty(ml, "length", { get: function () { return items().length; }, enumerable: true, configurable: true });
@@ -6158,6 +6378,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // --- Stable CSSRule object construction ------------------------------------------------------
   // Build a CSSRule object for `struct` owned by `sheet` (a CSSStyleSheet) with `parentRule`.
   function makeCssRule(struct, sheet, parentRule) {
+    var rule = makeCssRuleInner(struct, sheet, parentRule);
+    // A rule detached from its sheet (deleteRule) reports parentStyleSheet/parentRule === null.
+    // Defined on the rule's INTERMEDIATE prototype (not the instance) so assert_idl_attribute (which
+    // requires these to be inherited, not own properties) still passes.
+    try {
+      var proto = Object.getPrototypeOf(rule);
+      if (proto && proto !== Object.prototype) {
+        Object.defineProperty(proto, "parentStyleSheet", { get: function () { return struct.__detached ? null : (sheet || null); }, enumerable: true, configurable: true });
+        Object.defineProperty(proto, "parentRule", { get: function () { return struct.__detached ? null : (parentRule || null); }, enumerable: true, configurable: true });
+      }
+    } catch (e) {}
+    return rule;
+  }
+  function makeCssRuleInner(struct, sheet, parentRule) {
     var kind = struct.kind;
     if (kind === "style") { return makeStyleRule(struct, sheet, parentRule); }
     if (kind === "@media") { return makeMediaRule(struct, sheet, parentRule); }
@@ -6187,11 +6421,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(proto, "parentRule", { get: function () { return parentRule || null; }, enumerable: true, configurable: true });
     return Object.create(proto);
   }
+  // A rule's `.style` CSSStyleDeclaration, backed by the rule's declaration body text. Uses the
+  // shared `makeStyleDecl` machinery (shorthand expand/serialize, custom props) so rule blocks
+  // serialize identically to inline styles. `struct.body` holds the current (flat) declaration text.
+  function makeRuleStyleDecl(struct, sheet) {
+    if (struct.body == null) { struct.body = ""; }
+    return makeStyleDecl(
+      function () { return struct.body; },
+      function (text) { struct.body = text; markDirty(sheet); }
+    );
+  }
   function makeStyleRule(struct, sheet, parentRule) {
     var rule = newRule("CSSStyleRule", 1, sheet, parentRule);
-    var decls = struct.decls || (struct.decls = parseDeclList(struct.body));
-    function reserialize() { struct.body = serializeDeclList(decls); }
-    var styleObj = makeRuleStyle(decls, function () { reserialize(); markDirty(sheet); });
+    var styleObj = makeRuleStyleDecl(struct, sheet);
     function selText() { var nrm = normalizeSelectorList(struct.prelude, sheetNsContext(sheet)); return nrm == null ? struct.prelude.trim() : nrm; }
     defOn(rule, "selectorText", {
       get: selText,
@@ -6205,7 +6447,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     });
     defOn(rule, "cssText", { get: function () {
       var sel = selText();
-      var body = serializeDeclList(decls);
+      var body = styleObj.cssText;
       return sel + " { " + (body ? body + " " : "") + "}";
     }, enumerable: true });
     return rule;
@@ -6213,15 +6455,32 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   function makePageRule(struct, sheet, parentRule) {
     // @page exposes a `.style` (CSSStyleDeclaration) like a style rule. Type 6.
     var rule = newRule("CSSPageRule", 6, sheet, parentRule);
-    var decls = struct.decls || (struct.decls = parseDeclList(struct.body));
-    var styleObj = makeRuleStyle(decls, function () { struct.body = serializeDeclList(decls); markDirty(sheet); });
-    defOn(rule, "selectorText", { get: function () { return struct.prelude.trim(); }, enumerable: true });
+    var styleObj = makeRuleStyleDecl(struct, sheet);
+    // The page selector (`:left`, `:first`, named page, etc.) — normalized (pseudo lowercased).
+    function pageSel() { return normalizePageSelector(struct.prelude); }
+    defOn(rule, "selectorText", {
+      get: pageSel,
+      set: function (v) { var nrm = normalizePageSelector(v == null ? "" : String(v)); if (nrm != null) { struct.prelude = nrm; markDirty(sheet); } },
+      enumerable: true
+    });
     defOn(rule, "style", { get: function () { return styleObj; }, set: function (v) { styleObj.cssText = v == null ? "" : String(v); }, enumerable: true });
     defOn(rule, "cssText", { get: function () {
-      var body = serializeDeclList(decls); var sel = struct.prelude.trim();
+      var body = styleObj.cssText; var sel = pageSel();
       return "@page" + (sel ? " " + sel : "") + " { " + (body ? body + " " : "") + "}";
     }, enumerable: true });
     return rule;
+  }
+  // Normalize an @page selector. Empty stays empty. Pseudo-page classes (`:left`/`:right`/`:first`/
+  // `:blank`) lowercase; a named page keeps its case; combinations like `named:left` are preserved.
+  function normalizePageSelector(sel) {
+    sel = String(sel == null ? "" : sel).trim();
+    if (sel === "") { return ""; }
+    // Validate: optional ident, then zero or more `:pseudo` (left|right|first|blank).
+    var m = /^([A-Za-z_-][\w-]*)?((?::(?:left|right|first|blank))*)$/i.exec(sel);
+    if (!m) { return null; }
+    var name = m[1] || "";
+    var pseudos = (m[2] || "").toLowerCase();
+    return name + pseudos;
   }
   function makeMediaRule(struct, sheet, parentRule) {
     var rule = newRule("CSSMediaRule", 4, sheet, parentRule);
@@ -6531,6 +6790,27 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (parentRule && (st.kind === "@import" || st.kind === "@namespace" || st.kind === "@charset")) {
         throw new globalThis.DOMException("Cannot insert this rule into a grouping rule", "HierarchyRequestError");
       }
+      // Top-level ordering constraints (CSSOM "insert a CSS rule" step 6): @import rules precede all
+      // other rules; @namespace rules precede everything except @import. Violating the position throws
+      // HierarchyRequestError. (@charset can never be inserted.)
+      if (!parentRule) {
+        if (st.kind === "@charset") {
+          throw new globalThis.DOMException("Cannot insert @charset", "HierarchyRequestError");
+        }
+        if (st.kind === "@import") {
+          // Every rule before `index` must be @import/@charset.
+          for (var ii = 0; ii < index; ii++) { var k = structs[ii].kind; if (k !== "@import" && k !== "@charset") { throw new globalThis.DOMException("@import must precede all other rules", "HierarchyRequestError"); } }
+          // The rule at `index` (if any) must not be a non-@import/@namespace rule that @import would jump over backwards — handled by the above since @import goes before namespaces too.
+        } else if (st.kind === "@namespace") {
+          // @namespace may only exist when the sheet has only @import/@namespace rules, and must be
+          // positioned after @imports and before regular rules.
+          for (var ij = 0; ij < structs.length; ij++) { var kj = structs[ij].kind; if (kj !== "@import" && kj !== "@namespace" && kj !== "@charset") { throw new globalThis.DOMException("@namespace not allowed here", "InvalidStateError"); } }
+          for (var ik = 0; ik < index; ik++) { var kk = structs[ik].kind; if (kk !== "@import" && kk !== "@namespace" && kk !== "@charset") { throw new globalThis.DOMException("@namespace mispositioned", "HierarchyRequestError"); } }
+        } else {
+          // A regular rule must come after all @import and @namespace rules: no such rule at index >= index.
+          for (var il = index; il < structs.length; il++) { var kl = structs[il].kind; if (kl === "@import" || kl === "@namespace" || kl === "@charset") { throw new globalThis.DOMException("Cannot insert rule before @import/@namespace", "HierarchyRequestError"); } }
+        }
+      }
       structs.splice(index, 0, st);
       rebuild(); markDirty(sheet);
       return index;
@@ -6538,6 +6818,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     list.__delete = function (index) {
       index = index >>> 0;
       if (index >= structs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
+      structs[index].__detached = true; // detach the removed rule (parentStyleSheet/Rule -> null)
       structs.splice(index, 1);
       rebuild(); markDirty(sheet);
     };
@@ -6620,6 +6901,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var initial = styleEl.textContent || "";
     var ss = makeStyleSheetCore(parseRuleStructs(initial), styleEl);
     ss.__lastText = initial;
+    // The sheet's `media` reflects the owner <style>/<link> element's `media` content attribute.
+    // The MediaList writes back to that attribute, so `sheet.media.appendMedium(...)` updates it.
+    var mediaHolder = { get text() { var m = styleEl.getAttribute && styleEl.getAttribute("media"); return m == null ? "" : m; }, set text(v) { if (styleEl.setAttribute) { styleEl.setAttribute("media", v); } } };
+    ss.__media = makeMediaList(mediaHolder, null);
     ss.__sync = function () {
       if (ss.__rendering) { return; }
       var cur = styleEl.textContent || "";
@@ -7290,7 +7575,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       } catch (e) {}
     }
     if (typeof node === "number") {
-      def(el, "style", makeStyle(node));
+      // `style` lives on the prototype chain (ElementCSSInlineStyle mixin) so it passes
+      // assert_idl_attribute (own-property check). We stash the per-node CSSStyleDeclaration as a
+      // hidden own property; the prototype accessor returns it ([SameObject], [PutForwards=cssText]).
+      def(el, "__styleObj", makeStyle(node));
       // classList is [SameObject, PutForwards=value]: a per-element cached DOMTokenList whose
       // getter always returns the same object, and assigning `el.classList = x` forwards to
       // `el.classList.value = x` (so it never replaces the object and never throws in strict mode).
@@ -7605,10 +7893,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       })(listAccessors[ci]);
     }
 
-    // <style> (and stylesheet <link>) expose a live CSSStyleSheet via `.sheet`.
-    if (typeof el.tagName === "string" && (el.tagName.toLowerCase() === "style" || el.tagName.toLowerCase() === "link") && !("sheet" in el)) {
-      var __sheet = null;
-      Object.defineProperty(el, "sheet", { get: function () { if (!__sheet) { __sheet = makeStyleSheet(this); } return __sheet; }, configurable: true, enumerable: false });
+    // <style> (and stylesheet <link>) expose a live CSSStyleSheet via `.sheet`. The accessor lives on
+    // the LinkStyle mixin prototype (HTMLStyleElement/HTMLLinkElement) so assert_idl_attribute passes
+    // (must not be an own property); enrichElement just marks the element as sheet-bearing.
+    if (typeof el.tagName === "string" && (el.tagName.toLowerCase() === "style" || el.tagName.toLowerCase() === "link") && !el.__sheetHost) {
+      def(el, "__sheetHost", true);
     }
 
     // getBoundingClientRect / getClientRects: read the engine-pushed rect for this node
@@ -8355,6 +8644,37 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // HTMLMediaElement should sit under HTMLElement; audio/video under it. Keep flat-under-HTMLElement
   // for simplicity except a couple that pages explicitly chain.
   for (var hi = 0; hi < htmlSubclasses.length; hi++) { defClass(htmlSubclasses[hi], HTMLElementCtor); }
+
+  // ElementCSSInlineStyle: `style` on the prototype chain (so assert_idl_attribute passes — it must
+  // NOT be an own property). Returns the per-element cached CSSStyleDeclaration stashed by
+  // enrichElement; [PutForwards=cssText] forwards string assignment to `.style.cssText`.
+  try {
+    if (ElementCtor && ElementCtor.prototype) {
+      Object.defineProperty(ElementCtor.prototype, "style", {
+        get: function () { return this.__styleObj || null; },
+        set: function (v) { var s = this.__styleObj; if (s) { s.cssText = v == null ? "" : String(v); } },
+        enumerable: true, configurable: true
+      });
+    }
+  } catch (e) {}
+  // LinkStyle mixin: `sheet` on HTMLStyleElement/HTMLLinkElement prototypes (must not be own, so
+  // assert_idl_attribute passes). Lazily creates and caches the CSSStyleSheet on the element.
+  try {
+    var __sheetProtoNames = ["HTMLStyleElement", "HTMLLinkElement"];
+    for (var spi = 0; spi < __sheetProtoNames.length; spi++) {
+      var __sp = globalThis[__sheetProtoNames[spi]];
+      if (__sp && __sp.prototype) {
+        Object.defineProperty(__sp.prototype, "sheet", {
+          get: function () {
+            if (!this.__sheetHost) { return null; }
+            if (!this.__sheetObj) { def(this, "__sheetObj", makeStyleSheet(this)); }
+            return this.__sheetObj;
+          },
+          enumerable: false, configurable: true
+        });
+      }
+    }
+  } catch (e) {}
 
   // Document / Window and the other DOM interface constructors pages reference as globals
   // (e.g. `x instanceof Document`, `Node.prototype`, `HTMLCollection`). Defined so references and
@@ -12665,9 +12985,11 @@ mod tests {
         let (_doc, out) = run_with_dom(
             doc,
             vec![
+                // A computed (resolved) CSSStyleDeclaration is read-only: length/item work, but
+                // setProperty throws NoModificationAllowedError (per CSSOM).
                 "var s = getComputedStyle(document.querySelectorAll('div')[0]); \
-                 (s.length > 0) && (typeof s.item(0) === 'string') && (s.item(0).length > 0) \
-                 && (s.setProperty('color','blue'), s.removeProperty('color'), true)"
+                 var threw = false; try { s.setProperty('color','blue'); } catch (e) { threw = (e.name === 'NoModificationAllowedError'); } \
+                 (s.length > 0) && (typeof s.item(0) === 'string') && (s.item(0).length > 0) && threw"
                     .to_string(),
             ],
             "https://example.com/",
@@ -12706,6 +13028,111 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("inherit|inherit|inherit"));
+    }
+
+    #[test]
+    fn inline_style_flex_shorthand_serializes() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                // flex: 0 -> grow 0, shrink 1, basis 0px; cssText collapses to the flex shorthand.
+                "var s = document.createElement('div').style; s.cssText = 'flex: 0'; s.cssText"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("flex: 0 1 0px;"));
+    }
+
+    #[test]
+    fn inline_style_overflow_collapses_to_shorthand() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = document.createElement('div').style; \
+                 s.cssText = 'overflow-x: initial; overflow-y: initial'; s.cssText"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("overflow: initial;"));
+    }
+
+    #[test]
+    fn inline_style_escaped_custom_property_roundtrips() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                // `--a\;b` (escaped semicolon) is one custom property; the name unescapes for the
+                // indexed getter and re-escapes on cssText serialization.
+                "var e = document.createElement('span'); e.style = '--a\\\\;b: value'; \
+                 [e.style.length, e.style[0], e.style.getPropertyValue('--a;b'), e.style.cssText].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|--a;b|value|--a\\;b: value;"));
+    }
+
+    #[test]
+    fn media_list_append_and_delete_medium() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var sheet = new CSSStyleSheet(); var m = sheet.media; \
+                 m.appendMedium('screen'); m.appendMedium('print'); var a = m.mediaText; \
+                 m.deleteMedium('screen'); [a, m.mediaText, m.length, m.item(0)].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("screen, print|print|1|print"));
+    }
+
+    #[test]
+    fn nth_child_selector_serializes_canonically() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var ss = new CSSStyleSheet(); ss.insertRule(':nth-child(  3n - 0){color:red}'); \
+                 var a = ss.cssRules[0].selectorText; \
+                 ss.insertRule(':nth-child(even){color:red}', 1); \
+                 [a, ss.cssRules[1].selectorText].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some(":nth-child(3n)|:nth-child(2n)"));
+    }
+
+    #[test]
+    fn page_rule_selector_text_and_style() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var ss = new CSSStyleSheet(); ss.insertRule('@page :left { margin: 1px; }'); \
+                 var r = ss.cssRules[0]; \
+                 [r.type, r.selectorText, r.style.getPropertyValue('margin-top'), r.cssText].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("6|:left|1px|@page :left { margin: 1px; }")
+        );
     }
 
     #[test]
