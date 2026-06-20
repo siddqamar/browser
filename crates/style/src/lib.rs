@@ -773,7 +773,13 @@ impl ComputedStyle {
                 None => "rgba(0, 0, 0, 0)".to_string(), // CSS transparent
             },
             "border-top-color" | "border-right-color" | "border-bottom-color"
-            | "border-left-color" | "border-color" => rgb_str(self.border_color),
+            | "border-left-color" | "border-color"
+            // Logical border colors resolve (in the default horizontal-tb / ltr writing mode) to the
+            // same physical border color.
+            | "border-block-start-color" | "border-block-end-color"
+            | "border-inline-start-color" | "border-inline-end-color" => rgb_str(self.border_color),
+            // caret-color (auto) and outline-color (currentColor) resolve to the used color value.
+            "caret-color" | "outline-color" => rgb_str(self.color),
             "color-scheme" => match self.color_scheme {
                 ColorScheme::Normal => "normal",
                 ColorScheme::Light => "light",
@@ -959,6 +965,53 @@ impl ComputedStyle {
             // --- grid ---
             "grid-template-columns" => tracks_str(&self.grid_template_columns),
             "grid-template-rows" => tracks_str(&self.grid_template_rows),
+
+            // --- border / font shorthands (resolved value; not enumerated by property_names) ---
+            // Each per-side `border-*` shorthand resolves to `<width> <style> <color>`.
+            "border-top" => format!("{} none {}", px(self.border.top), rgb_str(self.border_color)),
+            "border-right" => format!("{} none {}", px(self.border.right), rgb_str(self.border_color)),
+            "border-bottom" => format!("{} none {}", px(self.border.bottom), rgb_str(self.border_color)),
+            "border-left" => format!("{} none {}", px(self.border.left), rgb_str(self.border_color)),
+            "border" => format!("{} none {}", px(self.border.top), rgb_str(self.border_color)),
+            "box-shadow" => {
+                if self.box_shadows.is_empty() {
+                    "none".to_string()
+                } else {
+                    self.box_shadows
+                        .iter()
+                        .map(|s| {
+                            // Computed form: `<color> <dx> <dy> <blur> [<spread>] [inset]`. The color
+                            // is serialized first (matches resolved-value serialization).
+                            let color = if s.color.a == 255 {
+                                format!("rgb({}, {}, {})", s.color.r, s.color.g, s.color.b)
+                            } else {
+                                format!(
+                                    "rgba({}, {}, {}, {})",
+                                    s.color.r,
+                                    s.color.g,
+                                    s.color.b,
+                                    num(s.color.a as f32 / 255.0)
+                                )
+                            };
+                            let mut out = format!("{} {} {} {}", color, px(s.dx), px(s.dy), px(s.blur));
+                            if s.spread != 0.0 {
+                                out.push_str(&format!(" {}", px(s.spread)));
+                            }
+                            if s.inset {
+                                out.push_str(" inset");
+                            }
+                            out
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            }
+            "font" => format!(
+                "{} {} / {} sans-serif",
+                if self.italic { "italic" } else { "normal" },
+                px(self.font_size),
+                match self.line_height { Some(v) => px(v), None => "normal".to_string() },
+            ),
 
             // Anything else this struct does not model: report empty so feature detection sees
             // "unsupported/untracked" (which is the correct, honest answer for those callers).
