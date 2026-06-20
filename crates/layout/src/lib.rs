@@ -1163,6 +1163,19 @@ fn build_box(
                     children.push(b);
                 }
             }
+            // Block-in-inline: an inline element that contains block-level children is blockified so
+            // those blocks get a real box (CSS splits the inline around the blocks; we approximate by
+            // making the inline parent a block container). Without this, e.g. a block inside a <span>
+            // — or the block shadow content of an inline custom-element host — never lays out.
+            let content = if matches!(content, BoxContent::Inline)
+                && children
+                    .iter()
+                    .any(|c| matches!(c.content, BoxContent::Block))
+            {
+                BoxContent::Block
+            } else {
+                content
+            };
             // Assemble this element's box after recursion unwinds.
             let mut bx = LayoutBox::new(content, paint_style_of(cs), Some(id));
             bx.dimensions.margin = edges_of(cs.margin);
