@@ -6152,6 +6152,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (kind === "@import") { return makeImportRule(struct, sheet, parentRule); }
     if (kind === "@font-feature-values") { return makeFontFeatureValuesRule(struct, sheet, parentRule); }
     if (kind === "@font-face") { return makeFontFaceRule(struct, sheet, parentRule); }
+    if (kind === "@counter-style") { return makeCounterStyleRule(struct, sheet, parentRule); }
     if (kind === "@namespace") { return makeNamespaceRule(struct, sheet, parentRule); }
     if (kind === "@supports") { return makeSupportsRule(struct, sheet, parentRule); }
     if (kind === "@container") { return makeContainerRule(struct, sheet, parentRule); }
@@ -6316,6 +6317,28 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     defOn(rule, "cssText", { get: function () {
       var body = serializeDeclList(decls);
       return "@font-face { " + (body ? body + " " : "") + "}";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeCounterStyleRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSCounterStyleRule", 11, sheet, parentRule);
+    var decls = struct.decls || (struct.decls = parseDeclList(struct.body));
+    // `name` reflects the prelude; each descriptor is a camelCase IDL attribute over the block.
+    defOn(rule, "name", { get: function () { return struct.prelude.trim(); },
+      set: function (v) { struct.prelude = String(v).trim(); markDirty(sheet); }, enumerable: true });
+    [["system", "system"], ["symbols", "symbols"], ["additiveSymbols", "additive-symbols"],
+     ["negative", "negative"], ["prefix", "prefix"], ["suffix", "suffix"], ["range", "range"],
+     ["pad", "pad"], ["speakAs", "speak-as"], ["fallback", "fallback"]].forEach(function (pair) {
+      defOn(rule, pair[0], {
+        get: function () { var i = findDecl(decls, pair[1]); return i >= 0 ? decls[i][1] : ""; },
+        set: function (v) { setDecl(decls, pair[1], String(v), false); struct.body = serializeDeclList(decls); markDirty(sheet); },
+        enumerable: true
+      });
+    });
+    // Single-line serialization (no newlines), per CSSOM.
+    defOn(rule, "cssText", { get: function () {
+      var body = serializeDeclList(decls);
+      return "@counter-style " + struct.prelude.trim() + " { " + (body ? body + " " : "") + "}";
     }, enumerable: true });
     return rule;
   }
@@ -8270,6 +8293,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   defClass("CSSContainerRule", globalThis.CSSConditionRule);
   defClass("CSSImportRule", CSSRuleCtor);
   defClass("CSSFontFaceRule", CSSRuleCtor);
+  defClass("CSSCounterStyleRule", CSSRuleCtor);
   defClass("CSSPageRule", CSSGroupingCtor);
   defClass("CSSKeyframesRule", CSSRuleCtor);
   defClass("CSSKeyframeRule", CSSRuleCtor);
