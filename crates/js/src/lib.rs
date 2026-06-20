@@ -4974,9 +4974,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   function fireOn(target, type) {
     if (target && typeof target.dispatchEvent === "function") {
+      // dispatchEvent already invokes both addEventListener listeners AND the `on<type>` handler
+      // (e.g. window.onload), so we must NOT call the handler again here — that double-fires `load`,
+      // which makes pages that build state in onload (e.g. testharness `test()`s) run twice.
       try { target.dispatchEvent(makeEvent(type)); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); }
+      return;
     }
-    // Also invoke an `on<type>` handler if one was assigned (e.g. window.onload = ...).
+    // Fallback for a target without a real dispatchEvent: invoke the `on<type>` handler directly.
     var on = target ? target["on" + type] : null;
     if (typeof on === "function") {
       try { on.call(target, makeEvent(type)); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); }
@@ -14652,9 +14656,9 @@ mod tests {
     }
 
     #[test]
-    fn adopted_stylesheets_accepts_constructed_rejects_regular() {
-        // Setting document.adoptedStyleSheets to a constructed sheet works; a non-constructed
-        // (live <style>) sheet throws NotAllowedError.
+    fn adopted_stylesheets_accepts_constructed_and_document_sheets() {
+        // Setting document.adoptedStyleSheets to a constructed sheet works; a same-document
+        // non-constructed (live <style>) sheet is also accepted (csswg-drafts #10013, tentative).
         let (mut doc, body) = doc_with_body("");
         let style = doc.append_element(body, "style");
         doc.append_child(
@@ -14677,7 +14681,7 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("1|true|NotAllowedError"));
+        assert_eq!(out[0].value.as_deref(), Some("1|true|no-throw"));
     }
 
     #[test]
