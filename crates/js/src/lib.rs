@@ -9917,6 +9917,29 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   try { installAdoptedStyleSheets(globalThis.document, globalThis.document); } catch (e) {}
 
+  // Minimal Shadow DOM: `el.attachShadow({mode})` returns a shadow root. We back it with a real
+  // element appended under the host so its content (incl. <style>) is laid out + cascaded — not
+  // truly style-scoped, but enough for getComputedStyle on shadow content + adoptedStyleSheets
+  // (which already skips disabled sheets). Far better than throwing (web components need this).
+  try {
+    if (globalThis.Element && globalThis.Element.prototype) {
+      def(globalThis.Element.prototype, "attachShadow", function (init) {
+        if (this.__shadow) { return this.__shadow; }
+        var root = document.createElement("div");
+        try { __appendChild(this.__node, root.__node); } catch (e) {}
+        root.host = this;
+        root.mode = (init && init.mode) || "open";
+        try { installAdoptedStyleSheets(root, document); } catch (e) {}
+        this.__shadow = root;
+        return root;
+      });
+      Object.defineProperty(globalThis.Element.prototype, "shadowRoot", {
+        get: function () { var s = this.__shadow; return (s && s.mode === "open") ? s : null; },
+        enumerable: true, configurable: true
+      });
+    }
+  } catch (e) {}
+
   // --- Image / Audio / media element constructors ------------------------------------------
   if (typeof globalThis.Image !== "function") {
     def(globalThis, "Image", function (w, h) {
