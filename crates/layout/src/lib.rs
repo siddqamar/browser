@@ -514,6 +514,26 @@ fn is_non_rendered_tag(tag: &str) -> bool {
     )
 }
 
+/// The default value of a `<textarea>`: its descendant text content, with a single leading newline
+/// stripped (per the HTML textarea parsing rule). Used when no live `value` has been set.
+fn textarea_text_content(doc: &dom::Document, id: dom::NodeId) -> String {
+    fn gather(doc: &dom::Document, id: dom::NodeId, s: &mut String) {
+        for &child in &doc.get(id).children {
+            if child.0 >= doc.len() {
+                continue;
+            }
+            match &doc.get(child).data {
+                dom::NodeData::Text(t) => s.push_str(t),
+                dom::NodeData::Element(_) => gather(doc, child, s),
+                _ => {}
+            }
+        }
+    }
+    let mut s = String::new();
+    gather(doc, id, &mut s);
+    s.strip_prefix("\r\n").or_else(|| s.strip_prefix('\n')).map(str::to_string).unwrap_or(s)
+}
+
 /// The text a form control (`<input>` / `<textarea>`) should render inside its box, or `None`
 /// if `el` isn't such a control. Returns `Some(String)` (possibly empty → a styled-but-empty box):
 ///   * `<textarea>`: its live `value` attribute (or empty);
@@ -522,10 +542,12 @@ fn is_non_rendered_tag(tag: &str) -> bool {
 ///   * `<input type=submit|button|reset>`: its `value` as the button label (defaulting to a
 ///     conventional label when absent);
 ///   * other input types (checkbox/radio/hidden/file/image/color/range/date…): `None` (no text).
-fn input_display_text(el: &dom::ElementData) -> Option<String> {
+fn input_display_text(el: &dom::ElementData, textarea_default: &str) -> Option<String> {
     let attr = |name: &str| el.attrs.get(name).map(|s| s.as_str());
     if el.tag.eq_ignore_ascii_case("textarea") {
-        return Some(attr("value").unwrap_or("").to_string());
+        // A textarea's value is its current `value` (set via JS) or, failing that, its text content
+        // (the default value) — it has no `value` content attribute, so the text node is the source.
+        return Some(attr("value").map(str::to_string).unwrap_or_else(|| textarea_default.to_string()));
     }
     if !el.tag.eq_ignore_ascii_case("input") {
         return None;
@@ -999,7 +1021,12 @@ fn build_replaced_or_control(
     }
 
     // Text-like control: render its value/placeholder (and, when focused, a caret bar).
-    if let Some(label) = input_display_text(el) {
+    let textarea_default = if el.tag.eq_ignore_ascii_case("textarea") {
+        textarea_text_content(doc, id)
+    } else {
+        String::new()
+    };
+    if let Some(label) = input_display_text(el, &textarea_default) {
         let caret = focused == Some(id) && is_caret_field(el);
         // The value/placeholder text. When focused on a caret field, the "label" includes the
         // placeholder only when there's no real value; browsers hide the placeholder while editing,
