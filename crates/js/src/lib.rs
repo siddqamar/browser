@@ -7839,6 +7839,42 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   if (typeof document.contains !== "function") {
     def(document, "contains", function (node) { try { return document.documentElement ? (document.documentElement === node || document.documentElement.contains(node)) : false; } catch (e) { return false; } });
   }
+
+  // Document is a Node: its children are the doctype + the root element. Wire the Node mutation
+  // methods on `document` itself. Only globals (`__insertNode`/`__removeChild`/`__parent`/
+  // `__children`/`__documentElementId`) are in scope here, so the node-id helpers are inlined. The
+  // document node id is the parent of <html>.
+  (function () {
+    function reqNode(x, m) {
+      var n = (x && typeof x.__node === "number") ? x.__node : -1;
+      if (n < 0) { throw new TypeError("Failed to execute '" + m + "' on 'Node': parameter is not of type 'Node'."); }
+      return n;
+    }
+    function notFound(msg) { throw new (globalThis.DOMException)(msg, "NotFoundError"); }
+    function docNode() { var de = __documentElementId(); return de >= 0 ? __parent(de) : -1; }
+    def(document, "appendChild", function (child) {
+      var id = docNode(); var c = reqNode(child, "appendChild"); __insertNode(id, c, -1); return child;
+    });
+    def(document, "insertBefore", function (newNode, refNode) {
+      var id = docNode(); var c = reqNode(newNode, "insertBefore");
+      var r = (refNode == null) ? -1 : ((refNode && typeof refNode.__node === "number") ? refNode.__node : -1);
+      if (refNode != null && r < 0) { notFound("The reference child is not a child of this node."); }
+      __insertNode(id, c, r); return newNode;
+    });
+    def(document, "removeChild", function (child) {
+      var id = docNode(); var c = reqNode(child, "removeChild");
+      if (__parent(c) !== id) { notFound("The node to be removed is not a child of this node."); }
+      __removeChild(id, c); return child;
+    });
+    def(document, "replaceChild", function (newNode, oldNode) {
+      var id = docNode(); var n = reqNode(newNode, "replaceChild"), o = reqNode(oldNode, "replaceChild");
+      if (__parent(o) !== id) { notFound("The node to be replaced is not a child of this node."); }
+      var sibs = __children(id); var idx = sibs.indexOf(o);
+      var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
+      if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
+      __removeChild(id, o); __insertNode(id, n, ref); return oldNode;
+    });
+  })();
   // Legacy event factory. Maps a (case-insensitive) interface name to an uninitialized event of
   // the right interface (prototype chain intact); unknown names throw NotSupportedError. The real
   // implementation lives in globalThis.__createEvent (defined alongside the Event constructors).
