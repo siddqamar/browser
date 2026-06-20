@@ -10260,6 +10260,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         else { var dir = b.pathname.replace(/[^/]*$/, ""); resolved = b.origin + dir + resolved; }
       }
       var p = parseURL(resolved);
+      // Per the URL standard, `new URL(...)` throws a TypeError for an invalid URL. We validate the
+      // common failure the spec rejects: a non-numeric / out-of-range port (e.g. `https://test:test/`).
+      if (p.port && (!/^[0-9]+$/.test(p.port) || Number(p.port) > 65535)) {
+        throw new TypeError("Failed to construct 'URL': Invalid URL");
+      }
       this.href = p.href; this.protocol = p.protocol; this.host = p.host; this.hostname = p.hostname;
       this.port = p.port; this.pathname = p.pathname; this.search = p.search; this.hash = p.hash; this.origin = p.origin;
       this.username = ""; this.password = "";
