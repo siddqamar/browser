@@ -284,6 +284,9 @@ pub struct ComputedStyle {
     pub width_pct: Option<f32>,
     /// `height` as a fraction; resolved against the containing block's (definite) content height.
     pub height_pct: Option<f32>,
+    /// Whether `aspect-ratio` specifies a ratio (not just `auto`). Used for the CSSOM resolved value
+    /// of `min-width`/`min-height: auto`, which stays `auto` when a box has a preferred aspect ratio.
+    pub aspect_ratio_set: bool,
     /// `min-width` constraint (`None` = 0/unset). Resolved against the containing block in layout.
     pub min_width: Option<SizeConstraint>,
     /// `max-width` constraint (`None`/`none` = no maximum).
@@ -678,6 +681,7 @@ impl Default for ComputedStyle {
             z_index: None,
             width: None,
             width_pct: None,
+            aspect_ratio_set: false,
             height_pct: None,
             height: None,
             min_width: None,
@@ -2095,6 +2099,7 @@ fn compute_element_style<'a>(
         // Box properties are not inherited: each element starts from initial values.
         width: None,
         width_pct: None,
+        aspect_ratio_set: false,
         height_pct: None,
         height: None,
         min_width: None,
@@ -3753,6 +3758,12 @@ fn apply_declaration(
             style.height = parse_length(val);
             style.height_pct =
                 if style.height.is_none() { parse_percent(val).map(|p| p / 100.0) } else { None };
+        }
+        "aspect-ratio" => {
+            // A ratio is present unless the value is just `auto` (or a global keyword). Detecting a
+            // digit suffices: `1/1`, `0/1`, `auto 1/1` all have one; `auto` doesn't.
+            let v = val.trim().to_ascii_lowercase();
+            style.aspect_ratio_set = v != "auto" && v.bytes().any(|b| b.is_ascii_digit());
         }
 
         // --- Sizing constraints (min/max) ---

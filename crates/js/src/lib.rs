@@ -2056,7 +2056,43 @@ fn prim_computed_style_prop(
                 "height" => Some(false),
                 _ => None,
             };
-            if let Some(is_width) = size_is_width {
+            // min-width / min-height: auto resolves to 0px, except a box with a preferred aspect
+            // ratio or a flex/grid item keeps `auto`; a box-less element (no layout box) is 0px.
+            if matches!(name.as_str(), "min-width" | "min-height") {
+                with_cascade_map(&state, |doc, map| {
+                    let cs = match map.get(&n) {
+                        Some(c) => c,
+                        None => return String::new(),
+                    };
+                    let computed = cs.get_property(&name);
+                    if computed != "auto" {
+                        return computed;
+                    }
+                    // A box-less element (display:none, or inside one) generates no box → 0px.
+                    if cs.display_none || ancestor_display_none(doc, map, n) {
+                        return "0px".to_string();
+                    }
+                    let parent_flex_grid = doc
+                        .get(n)
+                        .parent
+                        .and_then(|p| map.get(&p))
+                        .map(|p| {
+                            matches!(
+                                p.display,
+                                style::Display::Flex
+                                    | style::Display::InlineFlex
+                                    | style::Display::Grid
+                                    | style::Display::InlineGrid
+                            )
+                        })
+                        .unwrap_or(false);
+                    if cs.aspect_ratio_set || parent_flex_grid {
+                        "auto".to_string()
+                    } else {
+                        "0px".to_string()
+                    }
+                })
+            } else if let Some(is_width) = size_is_width {
                 with_computed_style(&state, n, |cs| {
                     let cs = match cs {
                         Some(c) => c,
