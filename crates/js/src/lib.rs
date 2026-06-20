@@ -7264,8 +7264,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           else if (pre === "*") { serPre = nsCtx.hasDefault ? "*|" : ""; }
           else if (isIdent(pre)) {
             var puri = nsCtx.prefixes[pre];
+            // An undeclared namespace prefix makes the selector invalid (parse error).
+            if (puri == null) { return err(); }
             // Declared named prefix whose URI equals the default namespace URI -> serialize bare.
-            serPre = (puri != null && nsCtx.hasDefault && puri === nsCtx.defaultUri) ? "" : (puri != null ? pre + "|" : "");
+            serPre = (nsCtx.hasDefault && puri === nsCtx.defaultUri) ? "" : pre + "|";
           }
           else { return err(); }
           if (local === "*") {
@@ -8114,6 +8116,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var st = newStructs[0];
       if (newStructs.length !== 1 || (st.kind === "style" && String(text).indexOf("{") < 0)) {
         throw new globalThis.DOMException("Failed to parse the rule", "SyntaxError");
+      }
+      // A style rule with an invalid selector (e.g. an undeclared namespace prefix) doesn't parse.
+      if (st.kind === "style" && normalizeSelectorList(st.prelude, sheetNsContext(sheet)) == null) {
+        throw new globalThis.DOMException("Failed to parse the rule selector", "SyntaxError");
       }
       // A grouping rule (CSSMediaRule/Supports/Container, parentRule set) cannot contain @import /
       // @namespace / @charset — those are stylesheet-level only.
