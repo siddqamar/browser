@@ -75,7 +75,10 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(s: &'a str) -> Self {
-        Parser { b: s.as_bytes(), i: 0 }
+        Parser {
+            b: s.as_bytes(),
+            i: 0,
+        }
     }
     fn ws(&mut self) {
         while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
@@ -179,7 +182,8 @@ impl<'a> Parser<'a> {
                         b'u' => {
                             let hex = self.b.get(self.i..self.i + 4)?;
                             self.i += 4;
-                            let code = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                            let code =
+                                u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
                             s.push(char::from_u32(code).unwrap_or('\u{fffd}'));
                         }
                         _ => s.push(e as char),
@@ -207,7 +211,10 @@ impl<'a> Parser<'a> {
     fn number(&mut self) -> Option<Json> {
         let start = self.i;
         while self.i < self.b.len()
-            && matches!(self.b[self.i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+            && matches!(
+                self.b[self.i],
+                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'
+            )
         {
             self.i += 1;
         }
@@ -279,8 +286,16 @@ pub fn parse_canvas_lists(json: &str) -> Vec<CanvasList> {
         // Cap the bitmap so a runaway width/height can't allocate gigabytes.
         let width = width.min(8192);
         let height = height.min(8192);
-        let commands = cv.get("commands").map(|c| c.as_arr().to_vec()).unwrap_or_default();
-        out.push(CanvasList { id: id as usize, width, height, commands });
+        let commands = cv
+            .get("commands")
+            .map(|c| c.as_arr().to_vec())
+            .unwrap_or_default();
+        out.push(CanvasList {
+            id: id as usize,
+            width,
+            height,
+            commands,
+        });
     }
     out
 }
@@ -301,7 +316,12 @@ struct Canvas {
 
 impl Canvas {
     fn new(w: u32, h: u32) -> Self {
-        Canvas { w, h, px: vec![0u8; (w as usize) * (h as usize) * 4], clip: None }
+        Canvas {
+            w,
+            h,
+            px: vec![0u8; (w as usize) * (h as usize) * 4],
+            clip: None,
+        }
     }
     /// True if (x,y) is inside the active clip rect (or no clip is set).
     #[inline]
@@ -375,8 +395,22 @@ fn read_clip(cmd: &Json) -> Option<(i32, i32, i32, i32)> {
 /// A resolved paint source for a command: either a flat color or a gradient.
 enum Paint {
     Flat(Color),
-    Linear { x0: f32, y0: f32, x1: f32, y1: f32, stops: Vec<(f32, Color)> },
-    Radial { x0: f32, y0: f32, r0: f32, x1: f32, y1: f32, r1: f32, stops: Vec<(f32, Color)> },
+    Linear {
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        stops: Vec<(f32, Color)>,
+    },
+    Radial {
+        x0: f32,
+        y0: f32,
+        r0: f32,
+        x1: f32,
+        y1: f32,
+        r1: f32,
+        stops: Vec<(f32, Color)>,
+    },
 }
 
 impl Paint {
@@ -414,26 +448,58 @@ impl Paint {
                 },
             };
         }
-        let c = parse_css_color(cmd.get("color").map(|c| c.as_str()).unwrap_or("#000"))
-            .unwrap_or(Color { r: 0, g: 0, b: 0, a: 255 });
+        let c = parse_css_color(cmd.get("color").map(|c| c.as_str()).unwrap_or("#000")).unwrap_or(
+            Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+        );
         Paint::Flat(apply_alpha(c, alpha))
     }
     /// Color at a device-space point.
     fn at(&self, px: f32, py: f32) -> Color {
         match self {
             Paint::Flat(c) => *c,
-            Paint::Linear { x0, y0, x1, y1, stops } => {
+            Paint::Linear {
+                x0,
+                y0,
+                x1,
+                y1,
+                stops,
+            } => {
                 let dx = x1 - x0;
                 let dy = y1 - y0;
                 let len2 = dx * dx + dy * dy;
-                let t = if len2 <= 1e-6 { 0.0 } else { ((px - x0) * dx + (py - y0) * dy) / len2 };
+                let t = if len2 <= 1e-6 {
+                    0.0
+                } else {
+                    ((px - x0) * dx + (py - y0) * dy) / len2
+                };
                 sample_stops(stops, t)
             }
-            Paint::Radial { x0, y0, r0, x1, y1, r1, stops } => {
+            Paint::Radial {
+                x0,
+                y0,
+                r0,
+                x1,
+                y1,
+                r1,
+                stops,
+            } => {
                 // Approximate: parameterize by distance from the END circle's center between r0..r1.
                 let d = ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
                 let denom = r1 - r0;
-                let t = if denom.abs() <= 1e-6 { if d <= *r1 { 1.0 } else { 0.0 } } else { (d - r0) / denom };
+                let t = if denom.abs() <= 1e-6 {
+                    if d <= *r1 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (d - r0) / denom
+                };
                 let _ = (x0, y0);
                 sample_stops(stops, t)
             }
@@ -443,7 +509,12 @@ impl Paint {
 
 fn sample_stops(stops: &[(f32, Color)], t: f32) -> Color {
     if stops.is_empty() {
-        return Color { r: 0, g: 0, b: 0, a: 0 };
+        return Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
     }
     let t = t.clamp(0.0, 1.0);
     if t <= stops[0].0 {
@@ -456,7 +527,11 @@ fn sample_stops(stops: &[(f32, Color)], t: f32) -> Color {
         let (o0, c0) = w[0];
         let (o1, c1) = w[1];
         if t >= o0 && t <= o1 {
-            let f = if (o1 - o0).abs() <= 1e-6 { 0.0 } else { (t - o0) / (o1 - o0) };
+            let f = if (o1 - o0).abs() <= 1e-6 {
+                0.0
+            } else {
+                (t - o0) / (o1 - o0)
+            };
             return lerp_color(c0, c1, f);
         }
     }
@@ -464,12 +539,26 @@ fn sample_stops(stops: &[(f32, Color)], t: f32) -> Color {
 }
 
 fn lerp_color(a: Color, b: Color, f: f32) -> Color {
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round().clamp(0.0, 255.0) as u8;
-    Color { r: l(a.r, b.r), g: l(a.g, b.g), b: l(a.b, b.b), a: l(a.a, b.a) }
+    let l = |x: u8, y: u8| {
+        (x as f32 + (y as f32 - x as f32) * f)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color {
+        r: l(a.r, b.r),
+        g: l(a.g, b.g),
+        b: l(a.b, b.b),
+        a: l(a.a, b.a),
+    }
 }
 
 fn apply_alpha(c: Color, alpha: f32) -> Color {
-    Color { a: ((c.a as f32) * alpha.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8, ..c }
+    Color {
+        a: ((c.a as f32) * alpha.clamp(0.0, 1.0))
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        ..c
+    }
 }
 
 /// Public re-export of the canvas CSS color parser so the SVG module can reuse it (named/hex/
@@ -483,7 +572,12 @@ pub fn parse_css_color_pub(s: &str) -> Option<Color> {
 fn parse_css_color(s: &str) -> Option<Color> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("transparent") {
-        return Some(Color { r: 0, g: 0, b: 0, a: 0 });
+        return Some(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
     }
     if let Some(hex) = s.strip_prefix('#') {
         return parse_hex(hex);
@@ -536,14 +630,19 @@ fn parse_hex(hex: &str) -> Option<Color> {
 
 fn parse_rgb(s: &str) -> Option<Color> {
     let inner = s.split_once('(')?.1.trim_end_matches(')');
-    let parts: Vec<&str> = inner.split([',', '/', ' ']).filter(|p| !p.trim().is_empty()).collect();
+    let parts: Vec<&str> = inner
+        .split([',', '/', ' '])
+        .filter(|p| !p.trim().is_empty())
+        .collect();
     if parts.len() < 3 {
         return None;
     }
     let chan = |p: &str| -> u8 {
         let p = p.trim();
         if let Some(pct) = p.strip_suffix('%') {
-            (pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0 * 255.0).round().clamp(0.0, 255.0) as u8
+            (pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0 * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
         } else {
             p.parse::<f32>().unwrap_or(0.0).round().clamp(0.0, 255.0) as u8
         }
@@ -551,31 +650,61 @@ fn parse_rgb(s: &str) -> Option<Color> {
     let a = if parts.len() >= 4 {
         let p = parts[3].trim();
         if let Some(pct) = p.strip_suffix('%') {
-            (pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0 * 255.0).round().clamp(0.0, 255.0) as u8
+            (pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0 * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
         } else {
-            (p.parse::<f32>().unwrap_or(1.0) * 255.0).round().clamp(0.0, 255.0) as u8
+            (p.parse::<f32>().unwrap_or(1.0) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
         }
     } else {
         255
     };
-    Some(Color { r: chan(parts[0]), g: chan(parts[1]), b: chan(parts[2]), a })
+    Some(Color {
+        r: chan(parts[0]),
+        g: chan(parts[1]),
+        b: chan(parts[2]),
+        a,
+    })
 }
 
 fn parse_hsl(s: &str) -> Option<Color> {
     let inner = s.split_once('(')?.1.trim_end_matches(')');
-    let parts: Vec<&str> = inner.split([',', '/', ' ']).filter(|p| !p.trim().is_empty()).collect();
+    let parts: Vec<&str> = inner
+        .split([',', '/', ' '])
+        .filter(|p| !p.trim().is_empty())
+        .collect();
     if parts.len() < 3 {
         return None;
     }
-    let h = parts[0].trim().trim_end_matches("deg").parse::<f32>().unwrap_or(0.0);
-    let sl = parts[1].trim().trim_end_matches('%').parse::<f32>().unwrap_or(0.0) / 100.0;
-    let l = parts[2].trim().trim_end_matches('%').parse::<f32>().unwrap_or(0.0) / 100.0;
+    let h = parts[0]
+        .trim()
+        .trim_end_matches("deg")
+        .parse::<f32>()
+        .unwrap_or(0.0);
+    let sl = parts[1]
+        .trim()
+        .trim_end_matches('%')
+        .parse::<f32>()
+        .unwrap_or(0.0)
+        / 100.0;
+    let l = parts[2]
+        .trim()
+        .trim_end_matches('%')
+        .parse::<f32>()
+        .unwrap_or(0.0)
+        / 100.0;
     let a = if parts.len() >= 4 {
         let p = parts[3].trim();
         if let Some(pct) = p.strip_suffix('%') {
-            (pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0 * 255.0).round().clamp(0.0, 255.0) as u8
+            (pct.trim().parse::<f32>().unwrap_or(100.0) / 100.0 * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
         } else {
-            (p.parse::<f32>().unwrap_or(1.0) * 255.0).round().clamp(0.0, 255.0) as u8
+            (p.parse::<f32>().unwrap_or(1.0) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
         }
     } else {
         255
@@ -586,7 +715,11 @@ fn parse_hsl(s: &str) -> Option<Color> {
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     let h = ((h % 360.0) + 360.0) % 360.0 / 360.0;
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let hue = |mut t: f32| -> f32 {
         if t < 0.0 {
@@ -651,7 +784,12 @@ fn named_color(name: &str) -> Option<Color> {
         "steelblue" => rgb(70, 130, 180),
         "tomato" => rgb(255, 99, 71),
         "coral" => rgb(255, 127, 80),
-        "transparent" => Some(Color { r: 0, g: 0, b: 0, a: 0 }),
+        "transparent" => Some(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        }),
         _ => None,
     }
 }
@@ -706,7 +844,9 @@ pub fn rasterize_canvas(
             }
             "text" => {
                 let paint = Paint::from_cmd(cmd, alpha);
-                if let (Some(font), Json::Str(text)) = (font, cmd.get("text").unwrap_or(&Json::Null)) {
+                if let (Some(font), Json::Str(text)) =
+                    (font, cmd.get("text").unwrap_or(&Json::Null))
+                {
                     draw_text(&mut cnv, font, cmd, text, &paint);
                 }
             }
@@ -719,13 +859,22 @@ pub fn rasterize_canvas(
             _ => {}
         }
     }
-    DecodedImage { rgba: cnv.px, w: cv.width, h: cv.height }
+    DecodedImage {
+        rgba: cnv.px,
+        w: cv.width,
+        h: cv.height,
+    }
 }
 
 /// Read a stroke command's `dash` field (device-px on/off lengths).
 fn read_dash(cmd: &Json) -> Vec<f32> {
     cmd.get("dash")
-        .map(|d| d.as_arr().iter().map(|v| (v.num() as f32).max(0.0)).collect())
+        .map(|d| {
+            d.as_arr()
+                .iter()
+                .map(|v| (v.num() as f32).max(0.0))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -790,7 +939,12 @@ fn draw_image(
             if sa <= 0.0 {
                 continue;
             }
-            let c = Color { r: px[si], g: px[si + 1], b: px[si + 2], a: sa.round().clamp(0.0, 255.0) as u8 };
+            let c = Color {
+                r: px[si],
+                g: px[si + 1],
+                b: px[si + 2],
+                a: sa.round().clamp(0.0, 255.0) as u8,
+            };
             cnv.blend(x, y, c);
         }
     }
@@ -849,7 +1003,7 @@ fn put_image_data(cnv: &mut Canvas, cmd: &Json) {
 #[cfg(test)]
 fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -857,8 +1011,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -923,7 +1085,7 @@ fn stroke_polyline_dashed(
         d -= dash[seg];
         seg = (seg + 1) % dash.len();
     }
-    let mut on = seg % 2 == 0; // even indices are "on" dashes
+    let mut on = seg.is_multiple_of(2); // even indices are "on" dashes
     for w in pts.windows(2) {
         let (ax, ay) = w[0];
         let (bx, by) = w[1];
@@ -1157,7 +1319,10 @@ fn draw_text(cnv: &mut Canvas, font: &SystemFont, cmd: &Json, text: &str, paint:
         _ => {} // left / start
     }
     // Vertical baseline adjust for the common non-alphabetic values (approximate).
-    let baseline = cmd.get("baseline").map(|b| b.as_str()).unwrap_or("alphabetic");
+    let baseline = cmd
+        .get("baseline")
+        .map(|b| b.as_str())
+        .unwrap_or("alphabetic");
     let y = match baseline {
         "top" | "hanging" => y + size * 0.8,
         "middle" => y + size * 0.3,
@@ -1176,7 +1341,10 @@ fn draw_text(cnv: &mut Canvas, font: &SystemFont, cmd: &Json, text: &str, paint:
                     let dx = pen as i32 + g.left + col as i32;
                     let dy = y as i32 + g.top + row as i32;
                     let c = paint.at(dx as f32 + 0.5, dy as f32 + 0.5);
-                    let cc = Color { a: ((c.a as u16 * cov as u16) / 255) as u8, ..c };
+                    let cc = Color {
+                        a: ((c.a as u16 * cov as u16) / 255) as u8,
+                        ..c
+                    };
                     cnv.blend(dx, dy, cc);
                 }
             }
@@ -1193,10 +1361,37 @@ mod tests {
 
     #[test]
     fn parses_hex_and_named() {
-        assert_eq!(parse_css_color("#ff0000"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
-        assert_eq!(parse_css_color("#f00"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
-        assert_eq!(parse_css_color("red"), Some(Color { r: 255, g: 0, b: 0, a: 255 }));
-        assert_eq!(parse_css_color("rgba(0,128,255,0.5)").map(|c| (c.r, c.g, c.b)), Some((0, 128, 255)));
+        assert_eq!(
+            parse_css_color("#ff0000"),
+            Some(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
+        );
+        assert_eq!(
+            parse_css_color("#f00"),
+            Some(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
+        );
+        assert_eq!(
+            parse_css_color("red"),
+            Some(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
+        );
+        assert_eq!(
+            parse_css_color("rgba(0,128,255,0.5)").map(|c| (c.r, c.g, c.b)),
+            Some((0, 128, 255))
+        );
     }
 
     #[test]
@@ -1212,7 +1407,12 @@ mod tests {
     /// Pixel at (x,y) of a freshly-rasterized canvas.
     fn px(img: &DecodedImage, x: u32, y: u32) -> (u8, u8, u8, u8) {
         let i = ((y * img.w + x) * 4) as usize;
-        (img.rgba[i], img.rgba[i + 1], img.rgba[i + 2], img.rgba[i + 3])
+        (
+            img.rgba[i],
+            img.rgba[i + 1],
+            img.rgba[i + 2],
+            img.rgba[i + 3],
+        )
     }
 
     fn rasterize(json: &str, sources: &HashMap<usize, (&[u8], u32, u32)>) -> DecodedImage {
@@ -1222,7 +1422,11 @@ mod tests {
 
     #[test]
     fn base64_roundtrips() {
-        for data in [&b"\x00\x01\x02\x03"[..], &b"hello world"[..], &b"\xff\xff"[..]] {
+        for data in [
+            &b"\x00\x01\x02\x03"[..],
+            &b"hello world"[..],
+            &b"\xff\xff"[..],
+        ] {
             let enc = base64_encode(data);
             assert_eq!(base64_decode(&enc), data);
         }
@@ -1231,7 +1435,9 @@ mod tests {
     #[test]
     fn draw_image_blits_source_pixels() {
         // A 2x2 source: solid red. drawImage it into a 4x4 canvas at the whole canvas dest rect.
-        let red: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(4).flatten().collect();
+        let red: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 4)
+            .flatten()
+            .collect();
         let mut sources = HashMap::new();
         sources.insert(9usize, (red.as_slice(), 2u32, 2u32));
         let json = r##"[{"id":1,"width":4,"height":4,"commands":[
@@ -1244,7 +1450,9 @@ mod tests {
 
     #[test]
     fn draw_image_honors_global_alpha() {
-        let red: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(4).flatten().collect();
+        let red: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 4)
+            .flatten()
+            .collect();
         let mut sources = HashMap::new();
         sources.insert(9usize, (red.as_slice(), 2u32, 2u32));
         let json = r##"[{"id":1,"width":4,"height":4,"commands":[
@@ -1258,7 +1466,9 @@ mod tests {
     #[test]
     fn put_image_data_writes_block() {
         // A 2x2 red block (base64 of 16 bytes RGBA) put at (1,1) in a 4x4 canvas.
-        let block: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(4).flatten().collect();
+        let block: Vec<u8> = std::iter::repeat_n([255u8, 0, 0, 255], 4)
+            .flatten()
+            .collect();
         let b64 = base64_encode(&block);
         let json = format!(
             r##"[{{"id":1,"width":4,"height":4,"commands":[

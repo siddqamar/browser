@@ -14,3 +14,6 @@ engine = { path = "../engine" }
 
 [build-dependencies]
 cbindgen = "0.27"
+
+[lints]
+workspace = true

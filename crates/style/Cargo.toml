@@ -11,3 +11,6 @@ url = "2.5"
 
 [dev-dependencies]
 html = { path = "../html" }
+
+[lints]
+workspace = true

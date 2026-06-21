@@ -22,3 +22,6 @@ html = { path = "../html" }
 # URL parsing/joining, so dynamic `import()` can resolve relative specifiers against the
 # importing module's canonical URL and fetch modules not in the pre-fetched static graph.
 url = "2"
+
+[lints]
+workspace = true

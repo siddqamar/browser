@@ -56,13 +56,34 @@ struct Affine {
 
 impl Affine {
     fn identity() -> Self {
-        Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
     }
     fn translate(tx: f32, ty: f32) -> Self {
-        Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: tx,
+            f: ty,
+        }
     }
     fn scale(sx: f32, sy: f32) -> Self {
-        Affine { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
+        Affine {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            e: 0.0,
+            f: 0.0,
+        }
     }
     /// Matrix product `self ∘ other`: `other` is the *inner* (applied first) transform, `self` the
     /// outer. So `m.then(child)` composes the child transform inside `m` — a point is mapped by
@@ -79,7 +100,10 @@ impl Affine {
         }
     }
     fn apply(&self, x: f32, y: f32) -> (f32, f32) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
     }
     /// Approximate uniform scale factor (for mapping stroke-width user→device).
     fn mean_scale(&self) -> f32 {
@@ -95,8 +119,8 @@ impl Affine {
 
 #[derive(Clone)]
 struct PaintState {
-    fill: Option<Color>,      // None => fill:none
-    stroke: Option<Color>,    // None => stroke:none
+    fill: Option<Color>,   // None => fill:none
+    stroke: Option<Color>, // None => stroke:none
     stroke_width: f32,
     fill_opacity: f32,
     stroke_opacity: f32,
@@ -108,7 +132,12 @@ struct PaintState {
 impl Default for PaintState {
     fn default() -> Self {
         PaintState {
-            fill: Some(Color { r: 0, g: 0, b: 0, a: 255 }),
+            fill: Some(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
             stroke: None,
             stroke_width: 1.0,
             fill_opacity: 1.0,
@@ -122,15 +151,22 @@ impl Default for PaintState {
 impl PaintState {
     /// The effective fill color, folding in fill-opacity and the accumulated element opacity.
     fn fill_color(&self) -> Option<Color> {
-        self.fill.map(|c| apply_alpha(c, self.fill_opacity * self.opacity))
+        self.fill
+            .map(|c| apply_alpha(c, self.fill_opacity * self.opacity))
     }
     fn stroke_color(&self) -> Option<Color> {
-        self.stroke.map(|c| apply_alpha(c, self.stroke_opacity * self.opacity))
+        self.stroke
+            .map(|c| apply_alpha(c, self.stroke_opacity * self.opacity))
     }
 }
 
 fn apply_alpha(c: Color, alpha: f32) -> Color {
-    Color { a: ((c.a as f32) * alpha.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8, ..c }
+    Color {
+        a: ((c.a as f32) * alpha.clamp(0.0, 1.0))
+            .round()
+            .clamp(0.0, 255.0) as u8,
+        ..c
+    }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -145,7 +181,11 @@ struct Surface {
 
 impl Surface {
     fn new(w: u32, h: u32) -> Self {
-        Surface { w, h, px: vec![0u8; (w as usize) * (h as usize) * 4] }
+        Surface {
+            w,
+            h,
+            px: vec![0u8; (w as usize) * (h as usize) * 4],
+        }
     }
     #[inline]
     fn blend(&mut self, x: i32, y: i32, c: Color) {
@@ -271,11 +311,21 @@ fn stroke_polyline(surf: &mut Surface, pts: &[(f32, f32)], width: f32, color: Co
         let dy = by - ay;
         let len = (dx * dx + dy * dy).sqrt();
         let quad = if len <= 1e-4 {
-            [(ax - hw, ay - hw), (ax + hw, ay - hw), (ax + hw, ay + hw), (ax - hw, ay + hw)]
+            [
+                (ax - hw, ay - hw),
+                (ax + hw, ay - hw),
+                (ax + hw, ay + hw),
+                (ax - hw, ay + hw),
+            ]
         } else {
             let nx = -dy / len * hw;
             let ny = dx / len * hw;
-            [(ax + nx, ay + ny), (bx + nx, by + ny), (bx - nx, by - ny), (ax - nx, ay - ny)]
+            [
+                (ax + nx, ay + ny),
+                (bx + nx, by + ny),
+                (bx - nx, by - ny),
+                (ax - nx, ay - ny),
+            ]
         };
         fill_subpaths(surf, std::slice::from_ref(&quad.to_vec()), color, false);
     }
@@ -331,29 +381,59 @@ fn parse_transform(s: &str) -> Affine {
             "rotate" => {
                 let deg = nums.first().copied().unwrap_or(0.0);
                 let (sin, cos) = deg.to_radians().sin_cos();
-                let rot = Affine { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 };
+                let rot = Affine {
+                    a: cos,
+                    b: sin,
+                    c: -sin,
+                    d: cos,
+                    e: 0.0,
+                    f: 0.0,
+                };
                 if nums.len() >= 3 {
                     // rotate(angle, cx, cy) = translate(cx,cy) rotate translate(-cx,-cy)
                     let (cx, cy) = (nums[1], nums[2]);
-                    Affine::translate(cx, cy).then(rot).then(Affine::translate(-cx, -cy))
+                    Affine::translate(cx, cy)
+                        .then(rot)
+                        .then(Affine::translate(-cx, -cy))
                 } else {
                     rot
                 }
             }
             "matrix" => {
                 if nums.len() >= 6 {
-                    Affine { a: nums[0], b: nums[1], c: nums[2], d: nums[3], e: nums[4], f: nums[5] }
+                    Affine {
+                        a: nums[0],
+                        b: nums[1],
+                        c: nums[2],
+                        d: nums[3],
+                        e: nums[4],
+                        f: nums[5],
+                    }
                 } else {
                     Affine::identity()
                 }
             }
             "skewx" | "skewX" => {
                 let t = nums.first().copied().unwrap_or(0.0).to_radians().tan();
-                Affine { a: 1.0, b: 0.0, c: t, d: 1.0, e: 0.0, f: 0.0 }
+                Affine {
+                    a: 1.0,
+                    b: 0.0,
+                    c: t,
+                    d: 1.0,
+                    e: 0.0,
+                    f: 0.0,
+                }
             }
             "skewy" | "skewY" => {
                 let t = nums.first().copied().unwrap_or(0.0).to_radians().tan();
-                Affine { a: 1.0, b: t, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+                Affine {
+                    a: 1.0,
+                    b: t,
+                    c: 0.0,
+                    d: 1.0,
+                    e: 0.0,
+                    f: 0.0,
+                }
             }
             _ => Affine::identity(),
         };
@@ -414,10 +494,15 @@ struct PathParser<'a> {
 
 impl<'a> PathParser<'a> {
     fn new(s: &'a str) -> Self {
-        PathParser { b: s.as_bytes(), s, i: 0 }
+        PathParser {
+            b: s.as_bytes(),
+            s,
+            i: 0,
+        }
     }
     fn skip_sep(&mut self) {
-        while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b',' | b'\t' | b'\n' | b'\r') {
+        while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b',' | b'\t' | b'\n' | b'\r')
+        {
             self.i += 1;
         }
     }
@@ -561,7 +646,7 @@ fn flatten_path(d: &str, m: &Affine) -> (Vec<Vec<(f32, f32)>>, Vec<bool>) {
                 last_q = None;
             }
             b'C' | b'S' => {
-                let (x1, y1) = if cmd.to_ascii_uppercase() == b'C' {
+                let (x1, y1) = if cmd.eq_ignore_ascii_case(&b'C') {
                     let x1 = match p.num() {
                         Some(v) => v,
                         None => break,
@@ -595,7 +680,7 @@ fn flatten_path(d: &str, m: &Affine) -> (Vec<Vec<(f32, f32)>>, Vec<bool>) {
                 py = ey;
             }
             b'Q' | b'T' => {
-                let (cx, cy) = if cmd.to_ascii_uppercase() == b'Q' {
+                let (cx, cy) = if cmd.eq_ignore_ascii_case(&b'Q') {
                     let cx = match p.num() {
                         Some(v) => v,
                         None => break,
@@ -679,14 +764,8 @@ fn flatten_cubic(
     for k in 1..=CURVE_SEGMENTS {
         let t = k as f32 / CURVE_SEGMENTS as f32;
         let mt = 1.0 - t;
-        let x = mt * mt * mt * x0
-            + 3.0 * mt * mt * t * x1
-            + 3.0 * mt * t * t * x2
-            + t * t * t * x3;
-        let y = mt * mt * mt * y0
-            + 3.0 * mt * mt * t * y1
-            + 3.0 * mt * t * t * y2
-            + t * t * t * y3;
+        let x = mt * mt * mt * x0 + 3.0 * mt * mt * t * x1 + 3.0 * mt * t * t * x2 + t * t * t * x3;
+        let y = mt * mt * mt * y0 + 3.0 * mt * mt * t * y1 + 3.0 * mt * t * t * y2 + t * t * t * y3;
         cur.push(m.apply(x, y));
     }
 }
@@ -888,7 +967,12 @@ fn resolve_paint(val: &str, inherited: Option<Color>) -> Option<Color> {
     }
     // url(#...) gradients/patterns are unsupported → fall back to a mid-gray so the shape is visible.
     if v.starts_with("url(") {
-        return Some(Color { r: 128, g: 128, b: 128, a: 255 });
+        return Some(Color {
+            r: 128,
+            g: 128,
+            b: 128,
+            a: 255,
+        });
     }
     parse_css_color(v).or(inherited)
 }
@@ -966,7 +1050,13 @@ pub fn rasterize_svg(
 
     let el = match &doc.get(svg_id).data {
         NodeData::Element(e) => e,
-        _ => return DecodedImage { rgba: surf.px, w: out_w, h: out_h },
+        _ => {
+            return DecodedImage {
+                rgba: surf.px,
+                w: out_w,
+                h: out_h,
+            }
+        }
     };
 
     // viewBox → device: uniform scale-to-fit (xMidYMid meet), centered.
@@ -990,7 +1080,11 @@ pub fn rasterize_svg(
     let root_state = apply_paint(el, PaintState::default());
     render_children(doc, svg_id, base, &root_state, &mut surf, font, 0);
 
-    DecodedImage { rgba: surf.px, w: out_w, h: out_h }
+    DecodedImage {
+        rgba: surf.px,
+        w: out_w,
+        h: out_h,
+    }
 }
 
 /// Recurse over an element's children, rendering each shape / group. `depth` guards runaway nesting.
@@ -1015,8 +1109,19 @@ fn render_children(
         // Skip non-rendered defs/metadata/etc.
         if matches!(
             tag.as_str(),
-            "defs" | "symbol" | "clippath" | "mask" | "lineargradient" | "radialgradient"
-                | "pattern" | "filter" | "metadata" | "title" | "desc" | "style" | "use"
+            "defs"
+                | "symbol"
+                | "clippath"
+                | "mask"
+                | "lineargradient"
+                | "radialgradient"
+                | "pattern"
+                | "filter"
+                | "metadata"
+                | "title"
+                | "desc"
+                | "style"
+                | "use"
         ) {
             continue;
         }
@@ -1078,7 +1183,13 @@ fn render_children(
                 let pts = vec![child_m.apply(x1, y1), child_m.apply(x2, y2)];
                 // Lines never fill; only stroke.
                 if let Some(col) = child_state.stroke_color() {
-                    stroke_polyline(surf, &pts, child_state.stroke_width * child_m.mean_scale(), col, false);
+                    stroke_polyline(
+                        surf,
+                        &pts,
+                        child_state.stroke_width * child_m.mean_scale(),
+                        col,
+                        false,
+                    );
                 }
             }
             "polyline" | "polygon" => {
@@ -1153,11 +1264,20 @@ fn draw_text(
     }
     let x = num_attr(el, "x", 0.0);
     let y = num_attr(el, "y", 0.0);
-    let size = attr(el, "font-size").and_then(parse_len).unwrap_or(16.0).max(1.0) * m.mean_scale();
+    let size = attr(el, "font-size")
+        .and_then(parse_len)
+        .unwrap_or(16.0)
+        .max(1.0)
+        * m.mean_scale();
     let (dx, dy) = m.apply(x, y);
     let col = match state.fill_color() {
         Some(c) => c,
-        None => Color { r: 0, g: 0, b: 0, a: 255 },
+        None => Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        },
     };
     let advance: f32 = text.chars().map(|ch| font.advance(ch, size)).sum();
     let anchor = attr(el, "text-anchor").unwrap_or("start");
@@ -1176,7 +1296,10 @@ fn draw_text(
                     }
                     let gx = pen as i32 + g.left + col_i as i32;
                     let gy = dy as i32 + g.top + row as i32;
-                    let cc = Color { a: ((col.a as u16 * cov as u16) / 255) as u8, ..col };
+                    let cc = Color {
+                        a: ((col.a as u16 * cov as u16) / 255) as u8,
+                        ..col
+                    };
                     surf.blend(gx, gy, cc);
                 }
             }
@@ -1241,15 +1364,22 @@ mod tests {
     fn svg_id(doc: &Document) -> NodeId {
         (0..doc.len())
             .map(NodeId)
-            .find(|&id| matches!(&doc.get(id).data,
-                NodeData::Element(e) if e.tag.eq_ignore_ascii_case("svg")))
+            .find(|&id| {
+                matches!(&doc.get(id).data,
+                NodeData::Element(e) if e.tag.eq_ignore_ascii_case("svg"))
+            })
             .expect("an <svg> element")
     }
 
     /// RGBA pixel at (x,y) in a `DecodedImage`.
     fn px(img: &DecodedImage, x: u32, y: u32) -> (u8, u8, u8, u8) {
         let i = ((y * img.w + x) * 4) as usize;
-        (img.rgba[i], img.rgba[i + 1], img.rgba[i + 2], img.rgba[i + 3])
+        (
+            img.rgba[i],
+            img.rgba[i + 1],
+            img.rgba[i + 2],
+            img.rgba[i + 3],
+        )
     }
 
     fn render(html: &str, w: u32, h: u32) -> DecodedImage {
@@ -1318,8 +1448,16 @@ mod tests {
             100,
         );
         // Origin is now empty (transparent), the translated location is red.
-        assert_eq!(px(&img, 5, 5).3, 0, "origin should be empty after translate");
-        assert_eq!(px(&img, 55, 55), (255, 0, 0, 255), "rect shifted to (50,50)");
+        assert_eq!(
+            px(&img, 5, 5).3,
+            0,
+            "origin should be empty after translate"
+        );
+        assert_eq!(
+            px(&img, 55, 55),
+            (255, 0, 0, 255),
+            "rect shifted to (50,50)"
+        );
     }
 
     #[test]

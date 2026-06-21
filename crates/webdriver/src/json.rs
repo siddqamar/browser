@@ -275,9 +275,7 @@ impl<'a> Parser<'a> {
                                     if self.peek() == Some(b'u') {
                                         self.i += 1;
                                         let lo = self.hex4()?;
-                                        let c = 0x10000
-                                            + ((cp - 0xD800) << 10)
-                                            + (lo - 0xDC00);
+                                        let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                                         s.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
                                     } else {
                                         return None;
@@ -358,7 +356,10 @@ mod tests {
         assert_eq!(v.get("a").unwrap().as_f64(), Some(1.0));
         assert_eq!(v.get("b").unwrap().as_array().unwrap().len(), 3);
         // Stable serialization.
-        assert_eq!(v.to_string(), r#"{"a":1,"b":[true,null,"x"],"c":{"d":2.5}}"#);
+        assert_eq!(
+            v.to_string(),
+            r#"{"a":1,"b":[true,null,"x"],"c":{"d":2.5}}"#
+        );
     }
 
     #[test]

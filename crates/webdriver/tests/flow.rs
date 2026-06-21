@@ -12,7 +12,9 @@ use webdriver::json::{parse, Json};
 /// Minimal HTTP client: send one request, read the full response, return (status, body).
 fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
     let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -29,13 +31,19 @@ fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, Str
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let body = text.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|x| x.1)
+        .unwrap_or("")
+        .to_string();
     (status, body)
 }
 
 /// Extract `.value` from a `{"value": ...}` response body.
 fn value(body: &str) -> Json {
-    parse(body).and_then(|v| v.get("value").cloned()).unwrap_or(Json::Null)
+    parse(body)
+        .and_then(|v| v.get("value").cloned())
+        .unwrap_or(Json::Null)
 }
 
 #[test]
@@ -63,7 +71,11 @@ fn full_webdriver_flow() {
     );
     assert_eq!(st, 200, "new session body: {body}");
     let v = value(&body);
-    let sid = v.get("sessionId").and_then(|s| s.as_str()).expect("sessionId").to_string();
+    let sid = v
+        .get("sessionId")
+        .and_then(|s| s.as_str())
+        .expect("sessionId")
+        .to_string();
     assert!(!sid.is_empty());
 
     // Navigate to a file: page with a known title + an element. (Our `net` layer serves
@@ -73,20 +85,36 @@ fn full_webdriver_flow() {
     std::fs::write(&path, page).unwrap();
     let file_url = format!("file://{}", path.display());
     let nav_body = Json::Obj(
-        [("url".to_string(), Json::Str(file_url))].into_iter().collect(),
+        [("url".to_string(), Json::Str(file_url))]
+            .into_iter()
+            .collect(),
     )
     .to_string();
-    let (st, body) = request(port, "POST", &format!("/session/{sid}/url"), Some(&nav_body));
+    let (st, body) = request(
+        port,
+        "POST",
+        &format!("/session/{sid}/url"),
+        Some(&nav_body),
+    );
     assert_eq!(st, 200, "navigate body: {body}");
 
     // Get Title.
     let (st, body) = request(port, "GET", &format!("/session/{sid}/title"), None);
     assert_eq!(st, 200);
-    assert_eq!(value(&body).as_str(), Some("Hi There"), "title body: {body}");
+    assert_eq!(
+        value(&body).as_str(),
+        Some("Hi There"),
+        "title body: {body}"
+    );
 
     // Find Element (css).
     let find_body = r##"{"using":"css selector","value":"#greet"}"##;
-    let (st, body) = request(port, "POST", &format!("/session/{sid}/element"), Some(find_body));
+    let (st, body) = request(
+        port,
+        "POST",
+        &format!("/session/{sid}/element"),
+        Some(find_body),
+    );
     assert_eq!(st, 200, "find body: {body}");
     let el = value(&body);
     let handle = el
@@ -103,7 +131,11 @@ fn full_webdriver_flow() {
         None,
     );
     assert_eq!(st, 200, "text body: {body}");
-    assert_eq!(value(&body).as_str(), Some("Hello WD"), "element text: {body}");
+    assert_eq!(
+        value(&body).as_str(),
+        Some("Hello WD"),
+        "element text: {body}"
+    );
 
     // Execute Sync: return 1+1 → 2.
     let exec_body = r#"{"script":"return 1+1;","args":[]}"#;
@@ -131,7 +163,11 @@ fn full_webdriver_flow() {
     let (st, body) = request(port, "GET", &format!("/session/{sid}/screenshot"), None);
     assert_eq!(st, 200, "screenshot status");
     let b64 = value(&body).as_str().unwrap_or("").to_string();
-    assert!(b64.len() > 100, "screenshot base64 too short: {}", b64.len());
+    assert!(
+        b64.len() > 100,
+        "screenshot base64 too short: {}",
+        b64.len()
+    );
 
     // Find a missing element → 404 no such element.
     let (st, body) = request(
@@ -141,7 +177,10 @@ fn full_webdriver_flow() {
         Some(r##"{"using":"css selector","value":"#nope"}"##),
     );
     assert_eq!(st, 404, "missing element should 404: {body}");
-    assert_eq!(value(&body).get("error").and_then(|e| e.as_str()), Some("no such element"));
+    assert_eq!(
+        value(&body).get("error").and_then(|e| e.as_str()),
+        Some("no such element")
+    );
 
     // Delete Session.
     let (st, _) = request(port, "DELETE", &format!("/session/{sid}"), None);
@@ -150,5 +189,8 @@ fn full_webdriver_flow() {
     // Commands on a deleted session → 404 invalid session id.
     let (st, body) = request(port, "GET", &format!("/session/{sid}/title"), None);
     assert_eq!(st, 404, "deleted session should 404: {body}");
-    assert_eq!(value(&body).get("error").and_then(|e| e.as_str()), Some("invalid session id"));
+    assert_eq!(
+        value(&body).get("error").and_then(|e| e.as_str()),
+        Some("invalid session id")
+    );
 }

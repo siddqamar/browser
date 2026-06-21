@@ -21,6 +21,18 @@ edition = "2021"
 license = "MIT"
 rust-version = "1.80"
 
+# Lints shared by every crate (each crate opts in with `[lints] workspace = true`). We allow two
+# lints that fight the nature of an engine: deeply nested callback / `dyn Fn` types (the host
+# fetcher, etc.) and the pipeline functions that legitimately take many parameters. Everything
+# else stays denied in CI (`cargo clippy -- -D warnings`).
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+# Noisy/low-value for this codebase: doc-comment list continuation style, and explicit index loops
+# (clearer than iterators for the 2D grid math).
+doc_lazy_continuation = "allow"
+needless_range_loop = "allow"
+
 # Optimize the release build of the engine; debug stays fast to compile.
 [profile.release]
 opt-level = 3

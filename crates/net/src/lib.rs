@@ -87,7 +87,6 @@ fn record_net(entry: NetEntry) {
     }
 }
 
-
 /// GET `url` and return a [`Response`], or an `Err(String)` describing the failure.
 /// Supports `http(s)://` (via the reused HTTP client) and `file://` (local read), so
 /// local test pages can be loaded without a server.
@@ -155,7 +154,11 @@ fn request_streaming_core(
     });
     if log {
         let (status, ok, ct) = match &result {
-            Ok(m) => (m.status, (200..300).contains(&m.status), m.content_type.clone()),
+            Ok(m) => (
+                m.status,
+                (200..300).contains(&m.status),
+                m.content_type.clone(),
+            ),
             Err(_) => (0u16, false, String::new()),
         };
         record_net(NetEntry {
@@ -246,7 +249,13 @@ fn request_streaming_inner(
         } else {
             req.call()
         };
-        let backoff = |a: u32| std::time::Duration::from_millis(match a { 1 => 200, 2 => 500, _ => 1000 });
+        let backoff = |a: u32| {
+            std::time::Duration::from_millis(match a {
+                1 => 200,
+                2 => 500,
+                _ => 1000,
+            })
+        };
         match result {
             Ok(resp) => break resp,
             // Fast status failures: retry rate-limit/server statuses with backoff (up to 3×).
@@ -318,7 +327,11 @@ fn request_streaming_inner(
         }
     }
 
-    Ok(ResponseMeta { status, content_type, final_url: url.to_string() })
+    Ok(ResponseMeta {
+        status,
+        content_type,
+        final_url: url.to_string(),
+    })
 }
 
 /// Root directory of the on-disk HTTP cache. Like other browsers, this defaults to a per-user OS
@@ -374,7 +387,12 @@ fn fetch_file(path: &str, original: &str) -> Result<Response, String> {
         _ => "application/octet-stream",
     }
     .to_string();
-    Ok(Response { status: 200, content_type, body, final_url: original.to_string() })
+    Ok(Response {
+        status: 200,
+        content_type,
+        body,
+        final_url: original.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -545,10 +563,12 @@ fn ws_connect(
         .host_str()
         .ok_or_else(|| "WebSocket URL has no host".to_string())?
         .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(match parsed.scheme() {
-        "wss" => 443,
-        _ => 80,
-    });
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(match parsed.scheme() {
+            "wss" => 443,
+            _ => 80,
+        });
 
     // Resolve + connect with a timeout so a dead host can't hang the thread indefinitely.
     let addrs: Vec<_> = (host.as_str(), port)
@@ -609,7 +629,7 @@ mod tests {
     #[test]
     fn body_cap_exceeds_4gib() {
         // Tabs are not capped at 4 GiB; the body backstop must sit comfortably above it.
-        assert!(MAX_BODY_BYTES > 4 * 1024 * 1024 * 1024);
+        const _: () = assert!(MAX_BODY_BYTES > 4 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -650,7 +670,8 @@ mod tests {
         let url = format!("file://{}", path.display());
 
         let mut acc = Vec::new();
-        let meta = fetch_streaming(&url, &mut |chunk| acc.extend_from_slice(chunk)).expect("stream");
+        let meta =
+            fetch_streaming(&url, &mut |chunk| acc.extend_from_slice(chunk)).expect("stream");
         assert_eq!(acc, b"streamed contents");
         assert_eq!(meta.status, 200);
         assert_eq!(meta.final_url, url);
@@ -713,7 +734,12 @@ mod tests {
         let (evt_tx, evt_rx) = std::sync::mpsc::channel::<(u64, u8, String)>();
         let (out_tx, out_rx) = std::sync::mpsc::channel::<(u8, String)>();
         let handle = std::thread::spawn(move || {
-            ws_run("wss://ws.postman-echo.com/raw".to_string(), 1, evt_tx, out_rx);
+            ws_run(
+                "wss://ws.postman-echo.com/raw".to_string(),
+                1,
+                evt_tx,
+                out_rx,
+            );
         });
         // Wait for open (or error), bounded.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);

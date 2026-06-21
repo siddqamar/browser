@@ -31,8 +31,8 @@ const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 
 /// Elements that never have children and need no end tag.
 const VOID_ELEMENTS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-    "source", "track", "wbr",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
 ];
 
 /// Elements whose content is raw text (not parsed as HTML).
@@ -102,7 +102,10 @@ pub struct StreamParser {
 
 impl StreamParser {
     pub fn new() -> Self {
-        StreamParser { buffer: String::new(), carry: Vec::new() }
+        StreamParser {
+            buffer: String::new(),
+            carry: Vec::new(),
+        }
     }
 
     /// Append a chunk of raw bytes. Handles a UTF-8 multibyte sequence split across chunk
@@ -127,8 +130,7 @@ impl StreamParser {
                 if e.error_len().is_none() {
                     self.carry.extend_from_slice(remainder);
                 } else {
-                    self.buffer
-                        .push_str(&String::from_utf8_lossy(remainder));
+                    self.buffer.push_str(&String::from_utf8_lossy(remainder));
                 }
             }
         }
@@ -211,7 +213,8 @@ impl<'a> Parser<'a> {
     /// Close an open `<p>` (pop the stack down to and including it) if one is in button scope.
     fn close_p_in_button_scope(&mut self) {
         const STOP: &[&str] = &[
-            "button", "applet", "object", "marquee", "td", "th", "caption", "html", "table", "template",
+            "button", "applet", "object", "marquee", "td", "th", "caption", "html", "table",
+            "template",
         ];
         for i in (0..self.open.len()).rev() {
             let name = self.tag_of(self.open[i]);
@@ -251,7 +254,11 @@ impl<'a> Parser<'a> {
         let root = self.doc.root();
         let html = self.doc.append_child(
             root,
-            NodeData::Element(ElementData { tag: "html".into(), attrs: Default::default(), namespace: None }),
+            NodeData::Element(ElementData {
+                tag: "html".into(),
+                attrs: Default::default(),
+                namespace: None,
+            }),
         );
         self.html = Some(html);
         self.open.push(html);
@@ -269,7 +276,11 @@ impl<'a> Parser<'a> {
         let html = self.ensure_html();
         let head = self.doc.append_child(
             html,
-            NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default(), namespace: None }),
+            NodeData::Element(ElementData {
+                tag: "head".into(),
+                attrs: Default::default(),
+                namespace: None,
+            }),
         );
         self.head = Some(head);
         self.open.push(head);
@@ -297,14 +308,22 @@ impl<'a> Parser<'a> {
         if self.head.is_none() {
             let head = self.doc.append_child(
                 html,
-                NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default(), namespace: None }),
+                NodeData::Element(ElementData {
+                    tag: "head".into(),
+                    attrs: Default::default(),
+                    namespace: None,
+                }),
             );
             self.head = Some(head);
         }
         self.pop_head();
         let body = self.doc.append_child(
             html,
-            NodeData::Element(ElementData { tag: "body".into(), attrs: Default::default(), namespace: None }),
+            NodeData::Element(ElementData {
+                tag: "body".into(),
+                attrs: Default::default(),
+                namespace: None,
+            }),
         );
         self.body = Some(body);
         self.open.push(body);
@@ -451,7 +470,11 @@ impl<'a> Parser<'a> {
             }
             let digits_start = self.pos;
             while let Some(c) = self.peek_at(0) {
-                let ok = if hex { c.is_ascii_hexdigit() } else { c.is_ascii_digit() };
+                let ok = if hex {
+                    c.is_ascii_hexdigit()
+                } else {
+                    c.is_ascii_digit()
+                };
                 if ok {
                     self.pos += 1;
                 } else {
@@ -517,9 +540,8 @@ impl<'a> Parser<'a> {
         // would otherwise become stray text under root/head).
         if self.mode != InsertMode::InBody {
             let parent = self.current_parent();
-            let in_container = Some(parent) == self.html
-                || Some(parent) == self.head
-                || parent == self.doc.root();
+            let in_container =
+                Some(parent) == self.html || Some(parent) == self.head || parent == self.doc.root();
             if in_container {
                 if self.text_buf.trim().is_empty() {
                     self.text_buf.clear();
@@ -548,7 +570,9 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
         };
-        let content = std::str::from_utf8(&self.input[start..end]).unwrap_or("").to_string();
+        let content = std::str::from_utf8(&self.input[start..end])
+            .unwrap_or("")
+            .to_string();
         if self.pos < self.input.len() {
             self.pos += 3; // consume "-->"
         }
@@ -678,22 +702,33 @@ impl<'a> Parser<'a> {
             "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dialog"
             | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
             | "hgroup" | "main" | "menu" | "nav" | "ol" | "p" | "section" | "summary" | "ul"
-            | "pre" | "listing" | "hr" | "table" | "xmp"
-            | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            | "pre" | "listing" | "hr" | "table" | "xmp" | "h1" | "h2" | "h3" | "h4" | "h5"
+            | "h6" => {
                 self.close_p_in_button_scope();
                 if matches!(lt.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
-                    && matches!(self.open.last().map(|&n| self.tag_of(n)).as_deref(),
-                        Some("h1") | Some("h2") | Some("h3") | Some("h4") | Some("h5") | Some("h6"))
+                    && matches!(
+                        self.open.last().map(|&n| self.tag_of(n)).as_deref(),
+                        Some("h1") | Some("h2") | Some("h3") | Some("h4") | Some("h5") | Some("h6")
+                    )
                 {
                     self.open.pop();
                 }
             }
             "li" => {
-                self.close_to(&["li"], &["ul", "ol", "menu", "dir", "table", "template", "html", "body", "caption", "td", "th"]);
+                self.close_to(
+                    &["li"],
+                    &[
+                        "ul", "ol", "menu", "dir", "table", "template", "html", "body", "caption",
+                        "td", "th",
+                    ],
+                );
                 self.close_p_in_button_scope();
             }
             "dd" | "dt" => {
-                self.close_to(&["dd", "dt"], &["dl", "template", "html", "body", "caption", "td", "th"]);
+                self.close_to(
+                    &["dd", "dt"],
+                    &["dl", "template", "html", "body", "caption", "td", "th"],
+                );
                 self.close_p_in_button_scope();
             }
             "option" | "optgroup" => {
@@ -729,7 +764,11 @@ impl<'a> Parser<'a> {
         };
         let node = self.doc.append_child(
             parent,
-            NodeData::Element(ElementData { tag: tag.clone(), attrs, namespace }),
+            NodeData::Element(ElementData {
+                tag: tag.clone(),
+                attrs,
+                namespace,
+            }),
         );
 
         if is_void(&tag) || self_closing {
@@ -774,7 +813,9 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
         };
-        let content = std::str::from_utf8(&self.input[start..end]).unwrap_or("").to_string();
+        let content = std::str::from_utf8(&self.input[start..end])
+            .unwrap_or("")
+            .to_string();
         if !content.is_empty() {
             self.doc.append_child(node, NodeData::Text(content));
         }
@@ -823,9 +864,11 @@ impl<'a> Parser<'a> {
         }
 
         // Find nearest matching open element.
-        if let Some(idx) = self.open.iter().rposition(|&id| {
-            matches!(&self.doc.get(id).data, NodeData::Element(e) if e.tag == tag)
-        }) {
+        if let Some(idx) = self
+            .open
+            .iter()
+            .rposition(|&id| matches!(&self.doc.get(id).data, NodeData::Element(e) if e.tag == tag))
+        {
             // Don't pop past the body element: a stray `</div>` must never unwind body/html.
             let floor = self
                 .body
@@ -1592,7 +1635,10 @@ mod tests {
         let doc = parse("<script>a()</script><div></div><script>b()</script>");
         let head_scripts = children(&doc, head_of(&doc));
         assert_eq!(tag_of(&doc, head_scripts[0]), "script");
-        assert_eq!(text_of(&doc, children(&doc, head_scripts[0])[0]), Some("a()"));
+        assert_eq!(
+            text_of(&doc, children(&doc, head_scripts[0])[0]),
+            Some("a()")
+        );
         let body_kids = children(&doc, body_of(&doc));
         assert_eq!(tag_of(&doc, body_kids[0]), "div");
         assert_eq!(tag_of(&doc, body_kids[1]), "script");
@@ -1608,7 +1654,10 @@ mod tests {
     fn text_only_input_yields_skeleton_with_body_text() {
         let doc = parse("just text");
         assert_skeleton(&doc);
-        assert_eq!(text_of(&doc, children(&doc, body_of(&doc))[0]), Some("just text"));
+        assert_eq!(
+            text_of(&doc, children(&doc, body_of(&doc))[0]),
+            Some("just text")
+        );
     }
 
     #[test]

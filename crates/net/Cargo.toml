@@ -14,3 +14,6 @@ cookie_store = "0.21"
 tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 base64 = "0.22"
 url = "2.5"
+
+[lints]
+workspace = true

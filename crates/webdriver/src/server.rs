@@ -52,7 +52,11 @@ impl WdError {
         }
     }
     fn invalid_session(id: &str) -> Self {
-        WdError::new(404, "invalid session id", format!("No session with id {id}"))
+        WdError::new(
+            404,
+            "invalid session id",
+            format!("No session with id {id}"),
+        )
     }
     fn no_such_element() -> Self {
         WdError::new(404, "no such element", "Element not found")
@@ -186,7 +190,12 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Write an HTTP/1.1 response with a JSON body (`Connection: close`).
-fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str) -> std::io::Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n",
         body.len()
@@ -199,7 +208,11 @@ fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str)
 /// Route a request to its command handler. Path segments after `/session/{id}/` select the command.
 fn dispatch(method: &str, path: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let path = path.split(['?', '#']).next().unwrap_or(path);
-    let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let segs: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
 
     match (method, segs.as_slice()) {
         ("GET", ["status"]) => Ok(obj(vec![
@@ -261,7 +274,10 @@ fn with_session<T>(
     f: impl FnOnce(&mut Session) -> Result<T, WdError>,
 ) -> Result<T, WdError> {
     let mut guard = sessions.lock().unwrap();
-    let session = guard.map.get_mut(id).ok_or_else(|| WdError::invalid_session(id))?;
+    let session = guard
+        .map
+        .get_mut(id)
+        .ok_or_else(|| WdError::invalid_session(id))?;
     f(session)
 }
 
@@ -301,7 +317,10 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
         }
     }
 
-    let id = format!("browser-wd-{:08}", SESSION_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let id = format!(
+        "browser-wd-{:08}",
+        SESSION_COUNTER.fetch_add(1, Ordering::SeqCst)
+    );
     let session = Session {
         engine,
         width,
@@ -316,14 +335,8 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
         ("browserVersion", Json::Str("0.1.0".to_string())),
         ("platformName", Json::Str(std::env::consts::OS.to_string())),
         ("acceptInsecureCerts", Json::Bool(true)),
-        (
-            "setWindowRect",
-            Json::Bool(true),
-        ),
-        (
-            "proxy",
-            obj(vec![]),
-        ),
+        ("setWindowRect", Json::Bool(true)),
+        ("proxy", obj(vec![])),
     ]);
 
     Ok(obj(vec![
@@ -337,7 +350,11 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
 fn blank_page_url() -> Option<String> {
     let path = std::env::temp_dir().join("browser_wd_blank.html");
     if !path.exists() {
-        std::fs::write(&path, "<!DOCTYPE html><html><head><title></title></head><body></body></html>").ok()?;
+        std::fs::write(
+            &path,
+            "<!DOCTYPE html><html><head><title></title></head><body></body></html>",
+        )
+        .ok()?;
     }
     Some(format!("file://{}", path.display()))
 }
@@ -637,7 +654,9 @@ fn selector_for(using: &str, value: &str) -> Result<String, WdError> {
         "link text" | "partial link text" | "xpath" => Err(WdError::invalid_argument(format!(
             "unsupported locator strategy handled elsewhere: {using}"
         ))),
-        other => Err(WdError::invalid_argument(format!("invalid locator strategy: {other}"))),
+        other => Err(WdError::invalid_argument(format!(
+            "invalid locator strategy: {other}"
+        ))),
     }
 }
 
@@ -648,7 +667,10 @@ fn js_string(s: &str) -> String {
 
 fn find_element(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let parsed = parse(body).unwrap_or(Json::Null);
-    let using = parsed.get("using").and_then(|v| v.as_str()).unwrap_or("css selector");
+    let using = parsed
+        .get("using")
+        .and_then(|v| v.as_str())
+        .unwrap_or("css selector");
     let value = parsed
         .get("value")
         .and_then(|v| v.as_str())
@@ -657,7 +679,8 @@ fn find_element(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let find_expr = element_find_expr(using, value, false)?;
     with_session(id, sessions, |s| {
         let raw = s.engine.console_eval(&find_expr);
-        let v = parse(&raw).ok_or_else(|| WdError::javascript_error(format!("bad find result: {raw}")))?;
+        let v = parse(&raw)
+            .ok_or_else(|| WdError::javascript_error(format!("bad find result: {raw}")))?;
         if v == Json::Null {
             return Err(WdError::no_such_element());
         }
@@ -667,7 +690,10 @@ fn find_element(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
 
 fn find_elements(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let parsed = parse(body).unwrap_or(Json::Null);
-    let using = parsed.get("using").and_then(|v| v.as_str()).unwrap_or("css selector");
+    let using = parsed
+        .get("using")
+        .and_then(|v| v.as_str())
+        .unwrap_or("css selector");
     let value = parsed
         .get("value")
         .and_then(|v| v.as_str())
@@ -725,12 +751,7 @@ fn handle_node_js(eid: &str) -> Result<String, WdError> {
 
 /// Run an eval that reads a string property from the resolved element. Returns `no such element`
 /// if the handle does not resolve to a live node.
-fn element_eval(
-    id: &str,
-    eid: &str,
-    expr_on_node: &str,
-    sessions: &Mutex<Sessions>,
-) -> WdResult {
+fn element_eval(id: &str, eid: &str, expr_on_node: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let node = handle_node_js(eid)?;
     // `__n` is the node; if null → sentinel; else evaluate expr and JSON-stringify it.
     let wrapped = format!(
@@ -773,7 +794,9 @@ fn element_css(id: &str, eid: &str, prop: &str, sessions: &Mutex<Sessions>) -> W
     element_eval(
         id,
         eid,
-        &format!("(window.getComputedStyle ? window.getComputedStyle(__el).getPropertyValue({p}) : '')"),
+        &format!(
+            "(window.getComputedStyle ? window.getComputedStyle(__el).getPropertyValue({p}) : '')"
+        ),
         sessions,
     )
 }
@@ -909,10 +932,14 @@ fn element_screenshot(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResu
             return Err(WdError::no_such_element());
         }
         let r = parse(&raw).ok_or_else(|| WdError::javascript_error("bad rect"))?;
-        let rx = (r.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(0.0) as u32;
-        let ry = (r.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(0.0) as u32;
-        let rw = (r.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(1.0) as u32;
-        let rh = (r.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(1.0) as u32;
+        let rx =
+            (r.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(0.0) as u32;
+        let ry =
+            (r.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(0.0) as u32;
+        let rw = (r.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(1.0)
+            as u32;
+        let rh = (r.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0) * s.scale as f64).max(1.0)
+            as u32;
 
         let fb = s.engine.render();
         let (fw, fh, stride) = (fb.width, fb.height, fb.stride);
@@ -942,7 +969,9 @@ fn element_screenshot(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResu
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .map_err(|e| WdError::new(500, "unknown error", format!("png encode: {e}")))?;
-        Ok(Json::Str(base64::engine::general_purpose::STANDARD.encode(&png)))
+        Ok(Json::Str(
+            base64::engine::general_purpose::STANDARD.encode(&png),
+        ))
     })
 }
 

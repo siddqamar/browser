@@ -67,7 +67,10 @@ enum LoadState {
         /// Decoded `<img>` images keyed by their DOM node, fetched on the last navigation.
         images: HashMap<dom::NodeId, DecodedImage>,
     },
-    Failed { url: String, error: String },
+    Failed {
+        url: String,
+        error: String,
+    },
 }
 
 /// Cached cascade+layout result, reused across renders when only the scroll offset changes.
@@ -267,7 +270,10 @@ impl Engine {
         if let Some(session) = &self.session {
             let (mut snapshot, console) = session.notify_color_scheme_changed();
             snapshot.prune_invalid();
-            if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            if let LoadState::Loaded {
+                doc, console: c, ..
+            } = &mut self.state
+            {
                 *doc = Some(snapshot);
                 c.extend(console);
             }
@@ -373,7 +379,8 @@ impl Engine {
                     };
                     // Start a persistent JS runtime: runs classic scripts + ES modules and stays
                     // alive so event handlers/timers keep working. Returns the initial snapshot.
-                    let (session, mut snapshot, sess_console) = start_session(final_doc, &base, initial_rects);
+                    let (session, mut snapshot, sess_console) =
+                        start_session(final_doc, &base, initial_rects);
                     console.extend(sess_console);
                     // Page JS can leave stale node ids; drop any out of the arena.
                     snapshot.prune_invalid();
@@ -406,8 +413,8 @@ impl Engine {
                     images,
                 };
                 self.layout_cache = None; // partial frames left a stale (inline-only) cache
-                // Build the initial layout and push the rects to the JS Session so the first
-                // getBoundingClientRect/offsetWidth/scrollHeight reads after load see real geometry.
+                                          // Build the initial layout and push the rects to the JS Session so the first
+                                          // getBoundingClientRect/offsetWidth/scrollHeight reads after load see real geometry.
                 {
                     let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
                     let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
@@ -424,7 +431,10 @@ impl Engine {
                 0
             }
             Err(e) => {
-                self.state = LoadState::Failed { url: url.to_string(), error: e };
+                self.state = LoadState::Failed {
+                    url: url.to_string(),
+                    error: e,
+                };
                 self.layout_cache = None;
                 if self.frame_cb.is_some() {
                     self.emit_final_frame();
@@ -469,7 +479,9 @@ impl Engine {
     /// Read the last-painted framebuffer and forward it to the frame callback (if any). Pulled out
     /// so the `&mut self` render borrow is fully released before we read the buffer for the callback.
     fn dispatch_frame(&mut self) {
-        let Some((cb, ctx)) = self.frame_cb else { return };
+        let Some((cb, ctx)) = self.frame_cb else {
+            return;
+        };
         let view = match self.framebuffer.as_ref() {
             Some(fb) => FrameView {
                 pixels: fb.pixels.as_ptr(),
@@ -477,7 +489,12 @@ impl Engine {
                 height: fb.height,
                 stride: fb.stride,
             },
-            None => FrameView { pixels: std::ptr::null(), width: 0, height: 0, stride: 0 },
+            None => FrameView {
+                pixels: std::ptr::null(),
+                width: 0,
+                height: 0,
+                stride: 0,
+            },
         };
         cb(ctx, view);
     }
@@ -499,13 +516,24 @@ impl Engine {
         // under the cascade lock so it's atomic with the cascade (no separate global write here,
         // which would race a concurrent cascade reading the flag).
         // Feed pointer/keyboard interaction state to the cascade so `:hover`/`:focus`/… match.
-        style::set_interaction_state(self.hovered_node.map(|n| n.0), self.focused_node.map(|n| n.0));
+        style::set_interaction_state(
+            self.hovered_node.map(|n| n.0),
+            self.focused_node.map(|n| n.0),
+        );
         if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
             return false;
         }
         // Compute into owned values first so the `&self.state` borrow ends before we assign.
-        let computed = if let (Some(font), LoadState::Loaded { doc: Some(d), styles, console, images, .. }) =
-            (self.font.as_ref(), &self.state)
+        let computed = if let (
+            Some(font),
+            LoadState::Loaded {
+                doc: Some(d),
+                styles,
+                console,
+                images,
+                ..
+            },
+        ) = (self.font.as_ref(), &self.state)
         {
             // The page always uses the full framebuffer height; the console now lives in the
             // Swift devtools panel, not painted by the engine.
@@ -527,8 +555,15 @@ impl Engine {
             collect_svg_intrinsics(d, &mut intrinsic_sizes);
             let (computed, root_scheme_dark) =
                 style::cascade_with_root_scheme(d, styles, self.is_dark);
-            let root =
-                layout::layout_document(d, &computed, vw, vh, &measurer, &intrinsic_sizes, self.focused_node);
+            let root = layout::layout_document(
+                d,
+                &computed,
+                vw,
+                vh,
+                &measurer,
+                &intrinsic_sizes,
+                self.focused_node,
+            );
             let content_h = root.dimensions.margin_box().height;
             Some((root, content_h, root_scheme_dark))
         } else {
@@ -577,7 +612,9 @@ impl Engine {
             sources.insert(id.0, (img.rgba.as_slice(), img.w, img.h));
         }
         for (id, img) in self.canvas_bitmaps.iter() {
-            sources.entry(id.0).or_insert((img.rgba.as_slice(), img.w, img.h));
+            sources
+                .entry(id.0)
+                .or_insert((img.rgba.as_slice(), img.w, img.h));
         }
         let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         for cv in canvas::parse_canvas_lists(&json) {
@@ -586,8 +623,10 @@ impl Engine {
         }
         // Push the freshly-rasterized pixels back to the JS Session so getImageData reads real RGBA
         // (one-render lag — the next getImageData call sees these). Fire-and-forget.
-        let pixels: Vec<(usize, u32, u32, Vec<u8>)> =
-            next.iter().map(|(id, img)| (id.0, img.w, img.h, img.rgba.clone())).collect();
+        let pixels: Vec<(usize, u32, u32, Vec<u8>)> = next
+            .iter()
+            .map(|(id, img)| (id.0, img.w, img.h, img.rgba.clone()))
+            .collect();
         session.set_canvas_pixels(pixels);
         self.canvas_bitmaps = next;
     }
@@ -611,8 +650,10 @@ impl Engine {
         // drawn by their ancestor's walk, but rasterizing them standalone is harmless).
         let svg_ids: Vec<dom::NodeId> = (0..doc.len())
             .map(dom::NodeId)
-            .filter(|&id| matches!(&doc.get(id).data,
-                dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("svg")))
+            .filter(|&id| {
+                matches!(&doc.get(id).data,
+                dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("svg"))
+            })
             .collect();
         if svg_ids.is_empty() {
             if !self.svg_bitmaps.is_empty() {
@@ -688,7 +729,8 @@ impl Engine {
             }
         }
         // Drop cached sources no longer referenced by the page.
-        let live: std::collections::HashSet<&String> = targets.iter().map(|(_, _, m)| &m.url).collect();
+        let live: std::collections::HashSet<&String> =
+            targets.iter().map(|(_, _, m)| &m.url).collect();
         self.mask_sources.retain(|k, _| live.contains(k));
 
         let font = self.font.as_ref();
@@ -722,7 +764,11 @@ impl Engine {
         };
         let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
         collect_node_rects(&cache.root, &mut rects);
-        let inv = if self.scale > 0.0 { 1.0 / self.scale } else { 1.0 };
+        let inv = if self.scale > 0.0 {
+            1.0 / self.scale
+        } else {
+            1.0
+        };
         let list: Vec<(usize, f32, f32, f32, f32)> = rects
             .iter()
             .map(|(&id, r)| (id, r.x * inv, r.y * inv, r.width * inv, r.height * inv))
@@ -730,9 +776,10 @@ impl Engine {
         // Decoded intrinsic size of each <img>, for img.naturalWidth/naturalHeight. The decoded
         // bitmap's w/h are stored in CSS px (the same values layout seeds into intrinsic_sizes).
         let naturals: Vec<(usize, f32, f32)> = match &self.state {
-            LoadState::Loaded { images, .. } => {
-                images.iter().map(|(id, img)| (id.0, img.w as f32, img.h as f32)).collect()
-            }
+            LoadState::Loaded { images, .. } => images
+                .iter()
+                .map(|(id, img)| (id.0, img.w as f32, img.h as f32))
+                .collect(),
             _ => Vec::new(),
         };
         // CSSOM used inset values per positioned box (device px -> CSS px), for getComputedStyle's
@@ -752,7 +799,14 @@ impl Engine {
             .collect();
         let scroll_y_css = self.scroll_y * inv;
         let doc_height_css = cache.content_h * inv;
-        session.set_layout_rects(list, naturals, inset_list, margin_list, scroll_y_css, doc_height_css);
+        session.set_layout_rects(
+            list,
+            naturals,
+            inset_list,
+            margin_list,
+            scroll_y_css,
+            doc_height_css,
+        );
     }
 
     /// Paint the current state into a fresh framebuffer and return a reference to it.
@@ -796,12 +850,28 @@ impl Engine {
         if let Some(font) = self.font.as_ref() {
             match &self.state {
                 LoadState::Empty => {
-                    draw_text(&mut fb, font, "browser — phase 2", 12.0 * self.scale,
-                              19.0 * self.scale, 13.0 * self.scale, Color::rgb(120, 200, 255));
-                    draw_text(&mut fb, font, "Enter a URL and press Go.",
-                              12.0 * self.scale, 60.0 * self.scale, px, Color::WHITE);
+                    draw_text(
+                        &mut fb,
+                        font,
+                        "browser — phase 2",
+                        12.0 * self.scale,
+                        19.0 * self.scale,
+                        13.0 * self.scale,
+                        Color::rgb(120, 200, 255),
+                    );
+                    draw_text(
+                        &mut fb,
+                        font,
+                        "Enter a URL and press Go.",
+                        12.0 * self.scale,
+                        60.0 * self.scale,
+                        px,
+                        Color::WHITE,
+                    );
                 }
-                LoadState::Loaded { url, doc, images, .. } => {
+                LoadState::Loaded {
+                    url, doc, images, ..
+                } => {
                     let left = 0.0;
                     // The page fills the full framebuffer height; the console panel is rendered by
                     // the Swift devtools, not the engine.
@@ -823,27 +893,70 @@ impl Engine {
                         };
                         let mut run_idx = 0usize;
                         paint_box(
-                            &mut fb, font, &cache.root, left, header_h - scroll_y, header_h,
-                            page_max_y, images, &self.canvas_bitmaps, &self.svg_bitmaps,
-                            &self.mask_bitmaps, &sel_ranges, &mut run_idx,
+                            &mut fb,
+                            font,
+                            &cache.root,
+                            left,
+                            header_h - scroll_y,
+                            header_h,
+                            page_max_y,
+                            images,
+                            &self.canvas_bitmaps,
+                            &self.svg_bitmaps,
+                            &self.mask_bitmaps,
+                            &sel_ranges,
+                            &mut run_idx,
                         );
                         // Overlay scrollbar on the right edge when the page overflows the viewport.
-                        paint_scrollbar(&mut fb, header_h, viewport_height, cache.content_h, scroll_y, self.scale);
+                        paint_scrollbar(
+                            &mut fb,
+                            header_h,
+                            viewport_height,
+                            cache.content_h,
+                            scroll_y,
+                            self.scale,
+                        );
                     } else if doc.is_none() {
                         draw_text(
-                            &mut fb, font, &format!("(non-HTML content: {})", url),
-                            left, header_h + px * 1.4, px, Color::WHITE,
+                            &mut fb,
+                            font,
+                            &format!("(non-HTML content: {})", url),
+                            left,
+                            header_h + px * 1.4,
+                            px,
+                            Color::WHITE,
                         );
                     }
                 }
                 LoadState::Failed { url, error } => {
-                    draw_text(&mut fb, font, "browser — phase 2", 12.0 * self.scale,
-                              19.0 * self.scale, 13.0 * self.scale, Color::rgb(120, 200, 255));
+                    draw_text(
+                        &mut fb,
+                        font,
+                        "browser — phase 2",
+                        12.0 * self.scale,
+                        19.0 * self.scale,
+                        13.0 * self.scale,
+                        Color::rgb(120, 200, 255),
+                    );
                     let baseline = 60.0 * self.scale;
-                    draw_text(&mut fb, font, &format!("Failed: {url}"),
-                              16.0 * self.scale, baseline, px, Color::rgb(255, 120, 120));
-                    draw_text(&mut fb, font, error, 16.0 * self.scale,
-                              baseline + px * 1.4, px, Color::rgb(255, 180, 180));
+                    draw_text(
+                        &mut fb,
+                        font,
+                        &format!("Failed: {url}"),
+                        16.0 * self.scale,
+                        baseline,
+                        px,
+                        Color::rgb(255, 120, 120),
+                    );
+                    draw_text(
+                        &mut fb,
+                        font,
+                        error,
+                        16.0 * self.scale,
+                        baseline + px * 1.4,
+                        px,
+                        Color::rgb(255, 180, 180),
+                    );
                 }
             }
         }
@@ -861,14 +974,40 @@ impl Engine {
                     let w = r.width.round().max(0.0) as i32;
                     let h = r.height.round().max(0.0) as i32;
                     if w > 0 && h > 0 {
-                        let fill = Color { r: 90, g: 160, b: 255, a: 64 }; // rgba(90,160,255,0.25)
-                        let line = Color { r: 90, g: 160, b: 255, a: 230 }; // rgba(90,160,255,0.9)
+                        let fill = Color {
+                            r: 90,
+                            g: 160,
+                            b: 255,
+                            a: 64,
+                        }; // rgba(90,160,255,0.25)
+                        let line = Color {
+                            r: 90,
+                            g: 160,
+                            b: 255,
+                            a: 230,
+                        }; // rgba(90,160,255,0.9)
                         fb.fill_rect(Rect { x, y, w, h }, fill);
                         // 1px solid outline around the border box.
                         fb.fill_rect(Rect { x, y, w, h: 1 }, line);
-                        fb.fill_rect(Rect { x, y: y + h - 1, w, h: 1 }, line);
+                        fb.fill_rect(
+                            Rect {
+                                x,
+                                y: y + h - 1,
+                                w,
+                                h: 1,
+                            },
+                            line,
+                        );
                         fb.fill_rect(Rect { x, y, w: 1, h }, line);
-                        fb.fill_rect(Rect { x: x + w - 1, y, w: 1, h }, line);
+                        fb.fill_rect(
+                            Rect {
+                                x: x + w - 1,
+                                y,
+                                w: 1,
+                                h,
+                            },
+                            line,
+                        );
                     }
                 }
             }
@@ -941,7 +1080,9 @@ impl Engine {
 
         let cache = self.layout_cache.as_ref()?;
         let (doc, page_url) = match &self.state {
-            LoadState::Loaded { doc: Some(d), url, .. } => (d, url),
+            LoadState::Loaded {
+                doc: Some(d), url, ..
+            } => (d, url),
             _ => return None,
         };
 
@@ -992,7 +1133,10 @@ impl Engine {
         let cy = (y / self.scale) as f64;
         let (mut snapshot, console) = session.dispatch_event(node.0, kind, cx, cy);
         snapshot.prune_invalid();
-        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+        if let LoadState::Loaded {
+            doc, console: c, ..
+        } = &mut self.state
+        {
             *doc = Some(snapshot);
             c.extend(console);
             self.layout_cache = None;
@@ -1034,7 +1178,9 @@ impl Engine {
                 if old.0 < snapshot.len() {
                     // change fires first (bubbles) when the value differs from focus time.
                     let cur_val = node_value(&snapshot, old);
-                    if self.focus_value.is_some() && self.focus_value.as_deref() != cur_val.as_deref() {
+                    if self.focus_value.is_some()
+                        && self.focus_value.as_deref() != cur_val.as_deref()
+                    {
                         let (s, c) = session.fire_event(old.0, "change");
                         snapshot = s;
                         snapshot.prune_invalid();
@@ -1082,7 +1228,10 @@ impl Engine {
             console.extend(c);
         }
 
-        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+        if let LoadState::Loaded {
+            doc, console: c, ..
+        } = &mut self.state
+        {
             *doc = Some(snapshot);
             c.extend(console);
             self.layout_cache = None; // DOM may have changed → re-cascade/layout/paint
@@ -1113,9 +1262,7 @@ impl Engine {
             let id = cur?;
             if id.0 < doc.len() {
                 if let dom::NodeData::Element(el) = &doc.get(id).data {
-                    if el.tag.eq_ignore_ascii_case("select")
-                        && !el.attrs.contains_key("disabled")
-                    {
+                    if el.tag.eq_ignore_ascii_case("select") && !el.attrs.contains_key("disabled") {
                         break id;
                     }
                 }
@@ -1157,7 +1304,10 @@ impl Engine {
         };
         let (changed, mut snapshot, console) = session.set_select_index(node_id, index);
         snapshot.prune_invalid();
-        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+        if let LoadState::Loaded {
+            doc, console: c, ..
+        } = &mut self.state
+        {
             *doc = Some(snapshot);
             c.extend(console);
             self.layout_cache = None; // selection changed the DOM → re-cascade/layout/paint
@@ -1170,14 +1320,20 @@ impl Engine {
     /// pre-scroll coordinates it would pass to [`dispatch_click`]; the engine folds in `scroll_y`
     /// here so the stored point is in document space and stays valid as the page scrolls.
     pub fn selection_start(&mut self, x: f32, y: f32) {
-        let p = Point { x, y: y + self.scroll_y };
+        let p = Point {
+            x,
+            y: y + self.scroll_y,
+        };
         self.selection = Some((p, p));
     }
 
     /// Extend the active selection's focus to viewport-relative device pixel `(x, y)` (document
     /// space after folding in `scroll_y`), keeping the anchor fixed. No-op if no selection exists.
     pub fn selection_extend(&mut self, x: f32, y: f32) {
-        let p = Point { x, y: y + self.scroll_y };
+        let p = Point {
+            x,
+            y: y + self.scroll_y,
+        };
         if let Some((anchor, _)) = self.selection {
             self.selection = Some((anchor, p));
         } else {
@@ -1344,7 +1500,10 @@ impl Engine {
         // when no JS snapshot was produced.
         self.layout_cache = None;
         if let Some(snap) = snapshot {
-            if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            if let LoadState::Loaded {
+                doc, console: c, ..
+            } = &mut self.state
+            {
                 *doc = Some(snap);
                 c.extend(console);
                 return true;
@@ -1382,7 +1541,10 @@ impl Engine {
             }
         }
 
-        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+        if let LoadState::Loaded {
+            doc, console: c, ..
+        } = &mut self.state
+        {
             *doc = Some(snapshot);
             c.extend(console);
             self.layout_cache = None;
@@ -1432,7 +1594,10 @@ impl Engine {
         let mut dirty = false;
         if let Some((mut snapshot, console)) = session.tick() {
             snapshot.prune_invalid();
-            if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            if let LoadState::Loaded {
+                doc, console: c, ..
+            } = &mut self.state
+            {
                 *doc = Some(snapshot);
                 c.extend(console);
                 self.layout_cache = None;
@@ -1582,7 +1747,10 @@ impl Engine {
         };
         let (mut snapshot, console) = session.deliver_observations(&arr);
         snapshot.prune_invalid();
-        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+        if let LoadState::Loaded {
+            doc, console: c, ..
+        } = &mut self.state
+        {
             *doc = Some(snapshot);
             c.extend(console);
             self.layout_cache = None; // callbacks may have mutated the DOM
@@ -1617,7 +1785,10 @@ impl Engine {
         };
         let (display, mut snapshot, console) = session.repl_eval(code);
         snapshot.prune_invalid();
-        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+        if let LoadState::Loaded {
+            doc, console: c, ..
+        } = &mut self.state
+        {
             *doc = Some(snapshot);
             c.extend(console);
             self.layout_cache = None; // the eval may have mutated the DOM
@@ -1705,7 +1876,8 @@ impl Engine {
     pub fn set_inspect_node(&mut self, node: Option<usize>) {
         self.inspect_node = match node {
             Some(id) => {
-                let valid = matches!(&self.state, LoadState::Loaded { doc: Some(d), .. } if id < d.len());
+                let valid =
+                    matches!(&self.state, LoadState::Loaded { doc: Some(d), .. } if id < d.len());
                 if valid {
                     Some(dom::NodeId(id))
                 } else {
@@ -1904,7 +2076,14 @@ fn page_background(root: &layout::LayoutBox, root_scheme_dark: bool) -> Color {
 /// Draw a macOS-style overlay scrollbar (a semi-transparent rounded thumb on the right edge) when
 /// the document is taller than the viewport. `top` is the content area's top (device px), `viewport_h`
 /// its height, `content_h` the full document height, `scroll_y` the current offset — all device px.
-fn paint_scrollbar(fb: &mut Framebuffer, top: f32, viewport_h: f32, content_h: f32, scroll_y: f32, scale: f32) {
+fn paint_scrollbar(
+    fb: &mut Framebuffer,
+    top: f32,
+    viewport_h: f32,
+    content_h: f32,
+    scroll_y: f32,
+    scale: f32,
+) {
     if content_h <= viewport_h + 1.0 || viewport_h <= 1.0 {
         return; // nothing to scroll
     }
@@ -1917,8 +2096,22 @@ fn paint_scrollbar(fb: &mut Framebuffer, top: f32, viewport_h: f32, content_h: f
     let frac = (scroll_y / (content_h - viewport_h)).clamp(0.0, 1.0);
     let y = (top + frac * max_off).round() as i32;
     // Semi-transparent neutral grey reads on both light and dark pages.
-    let thumb = Color { r: 128, g: 128, b: 128, a: 150 };
-    fb.fill_round_rect(Rect { x, y, w: w.round() as i32, h: thumb_h.round() as i32 }, w / 2.0, thumb);
+    let thumb = Color {
+        r: 128,
+        g: 128,
+        b: 128,
+        a: 150,
+    };
+    fb.fill_round_rect(
+        Rect {
+            x,
+            y,
+            w: w.round() as i32,
+            h: thumb_h.round() as i32,
+        },
+        w / 2.0,
+        thumb,
+    );
 }
 
 fn paint_gradient(fb: &mut Framebuffer) {
@@ -1930,7 +2123,15 @@ fn paint_gradient(fb: &mut Framebuffer) {
             (20.0 + t * 14.0) as u8,
             (28.0 + t * 26.0) as u8,
         );
-        fb.fill_rect(Rect { x: 0, y: y as i32, w: fb.width as i32, h: 1 }, c);
+        fb.fill_rect(
+            Rect {
+                x: 0,
+                y: y as i32,
+                w: fb.width as i32,
+                h: 1,
+            },
+            c,
+        );
     }
 }
 
@@ -2139,7 +2340,11 @@ fn parse_observed_targets(json: &str) -> Option<Vec<ObservedTarget>> {
         };
         let observer_id = json_number_field(obj, "observerId")? as u64;
         let node_id = json_number_field(obj, "nodeId")? as usize;
-        out.push(ObservedTarget { kind, observer_id, node_id });
+        out.push(ObservedTarget {
+            kind,
+            observer_id,
+            node_id,
+        });
         i = end + 1;
     }
     Some(out)
@@ -2278,7 +2483,12 @@ const MAX_DOM_DEPTH: usize = 512;
 /// Serialize a single DOM node (and its subtree) into `out` as the JSON object documented on
 /// [`Engine::dom_tree_json`]. Returns `false` (and writes nothing) when the node is an empty /
 /// all-whitespace text node (or a non-rendered node kind), so callers can skip it.
-fn serialize_dom_node(doc: &dom::Document, id: dom::NodeId, depth: usize, out: &mut String) -> bool {
+fn serialize_dom_node(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    depth: usize,
+    out: &mut String,
+) -> bool {
     if id.0 >= doc.len() {
         return false;
     }
@@ -2332,7 +2542,8 @@ fn serialize_dom_node(doc: &dom::Document, id: dom::NodeId, depth: usize, out: &
 
 fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
     if let Some(node) = b.node {
-        out.entry(node.0).or_insert_with(|| b.dimensions.border_box());
+        out.entry(node.0)
+            .or_insert_with(|| b.dimensions.border_box());
     }
     for c in &b.children {
         collect_node_rects(c, out);
@@ -2398,8 +2609,10 @@ fn compute_initial_rects(
     let vw = (dw as f32).max(1.0);
     let vh = (dh as f32).max(1.0);
     let measurer = FontMeasurer { font };
-    let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> =
-        images.iter().map(|(&id, img)| (id, (img.w as f32, img.h as f32))).collect();
+    let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
+        .iter()
+        .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))
+        .collect();
     collect_canvas_intrinsics(doc, &mut intrinsic_sizes);
     collect_svg_intrinsics(doc, &mut intrinsic_sizes);
     let (computed, _root_scheme_dark) = style::cascade_with_root_scheme(doc, styles, is_dark);
@@ -2409,19 +2622,34 @@ fn compute_initial_rects(
     let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
     collect_node_rects(&root, &mut rects);
     let inv = if scale > 0.0 { 1.0 / scale } else { 1.0 };
-    let rect_list: Vec<(usize, f32, f32, f32, f32)> =
-        rects.iter().map(|(&id, r)| (id, r.x * inv, r.y * inv, r.width * inv, r.height * inv)).collect();
-    let naturals: Vec<(usize, f32, f32)> =
-        images.iter().map(|(&id, img)| (id.0, img.w as f32, img.h as f32)).collect();
+    let rect_list: Vec<(usize, f32, f32, f32, f32)> = rects
+        .iter()
+        .map(|(&id, r)| (id, r.x * inv, r.y * inv, r.width * inv, r.height * inv))
+        .collect();
+    let naturals: Vec<(usize, f32, f32)> = images
+        .iter()
+        .map(|(&id, img)| (id.0, img.w as f32, img.h as f32))
+        .collect();
     let mut insets: HashMap<usize, [f32; 4]> = HashMap::new();
     collect_used_insets(&root, &mut insets);
-    let inset_list: Vec<(usize, f32, f32, f32, f32)> =
-        insets.iter().map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)).collect();
+    let inset_list: Vec<(usize, f32, f32, f32, f32)> = insets
+        .iter()
+        .map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv))
+        .collect();
     let mut margins: HashMap<usize, [f32; 4]> = HashMap::new();
     collect_used_margins(&root, &mut margins);
-    let margin_list: Vec<(usize, f32, f32, f32, f32)> =
-        margins.iter().map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)).collect();
-    Some((rect_list, naturals, inset_list, margin_list, 0.0, content_h * inv))
+    let margin_list: Vec<(usize, f32, f32, f32, f32)> = margins
+        .iter()
+        .map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv))
+        .collect();
+    Some((
+        rect_list,
+        naturals,
+        inset_list,
+        margin_list,
+        0.0,
+        content_h * inv,
+    ))
 }
 
 /// Collect every masked box: its node id, border-box rect (device px), and the resolved
@@ -2453,11 +2681,15 @@ fn load_mask_source(url: &str, base: &str) -> Option<MaskSource> {
         let meta = &rest[..comma].to_ascii_lowercase();
         let bytes = decode_data_url(url)?;
         if meta.contains("image/svg") {
-            return Some(MaskSource::Svg(String::from_utf8_lossy(&bytes).into_owned()));
+            return Some(MaskSource::Svg(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ));
         }
         // No explicit svg type: sniff the decoded bytes for `<svg`.
         if sniff_svg(&bytes) {
-            return Some(MaskSource::Svg(String::from_utf8_lossy(&bytes).into_owned()));
+            return Some(MaskSource::Svg(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ));
         }
         return decode_image(&bytes).map(MaskSource::Raster);
     }
@@ -2465,7 +2697,9 @@ fn load_mask_source(url: &str, base: &str) -> Option<MaskSource> {
     let abs = resolve_url(base, url)?;
     let resp = net::fetch(&abs).ok()?;
     if abs.to_ascii_lowercase().ends_with(".svg") || sniff_svg(&resp.body) {
-        return Some(MaskSource::Svg(String::from_utf8_lossy(&resp.body).into_owned()));
+        return Some(MaskSource::Svg(
+            String::from_utf8_lossy(&resp.body).into_owned(),
+        ));
     }
     decode_image(&resp.body).map(MaskSource::Raster)
 }
@@ -2505,14 +2739,22 @@ fn rasterize_mask_coverage(
             });
             match svg_id {
                 Some(id) => svg::rasterize_svg(&doc, id, out_w, out_h, font),
-                None => DecodedImage { rgba: vec![0; (out_w * out_h * 4) as usize], w: out_w, h: out_h },
+                None => DecodedImage {
+                    rgba: vec![0; (out_w * out_h * 4) as usize],
+                    w: out_w,
+                    h: out_h,
+                },
             }
         }
         MaskSource::Raster(img) => {
             // Fit the decoded raster into the box and sample its alpha into the coverage buffer.
             let mut rgba = vec![0u8; (out_w * out_h * 4) as usize];
             if img.w == 0 || img.h == 0 {
-                return DecodedImage { rgba, w: out_w, h: out_h };
+                return DecodedImage {
+                    rgba,
+                    w: out_w,
+                    h: out_h,
+                };
             }
             // Destination sub-rect (device px) the mask occupies, per the size keyword.
             let (dx, dy, dw, dh) = match size {
@@ -2520,7 +2762,11 @@ fn rasterize_mask_coverage(
                 style::MaskSize::Contain | style::MaskSize::Cover => {
                     let sx = out_w as f32 / img.w as f32;
                     let sy = out_h as f32 / img.h as f32;
-                    let s = if matches!(size, style::MaskSize::Cover) { sx.max(sy) } else { sx.min(sy) };
+                    let s = if matches!(size, style::MaskSize::Cover) {
+                        sx.max(sy)
+                    } else {
+                        sx.min(sy)
+                    };
                     let dw = img.w as f32 * s;
                     let dh = img.h as f32 * s;
                     ((out_w as f32 - dw) / 2.0, (out_h as f32 - dh) / 2.0, dw, dh)
@@ -2543,7 +2789,11 @@ fn rasterize_mask_coverage(
                     rgba[di + 3] = a;
                 }
             }
-            DecodedImage { rgba, w: out_w, h: out_h }
+            DecodedImage {
+                rgba,
+                w: out_w,
+                h: out_h,
+            }
         }
     }
 }
@@ -2552,7 +2802,14 @@ fn rasterize_mask_coverage(
 /// (whose ALPHA channel is the coverage). Each destination pixel's alpha = `c.a * cov_alpha`, so
 /// the result is the background color in the shape of the mask. Axis-aligned only (the common case);
 /// under a non-axis-aligned transform we fall back to the device bounding box (an approximation).
-fn paint_masked_bg(fb: &mut Framebuffer, xf: &Affine, border: layout::Rect, cov: &DecodedImage, c: Color, axis: bool) {
+fn paint_masked_bg(
+    fb: &mut Framebuffer,
+    xf: &Affine,
+    border: layout::Rect,
+    cov: &DecodedImage,
+    c: Color,
+    axis: bool,
+) {
     if cov.w == 0 || cov.h == 0 {
         return;
     }
@@ -2569,9 +2826,17 @@ fn paint_masked_bg(fb: &mut Framebuffer, xf: &Affine, border: layout::Rect, cov:
         ];
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for (px, py) in p {
-            x0 = x0.min(px); y0 = y0.min(py); x1 = x1.max(px); y1 = y1.max(py);
+            x0 = x0.min(px);
+            y0 = y0.min(py);
+            x1 = x1.max(px);
+            y1 = y1.max(py);
         }
-        Rect { x: x0.round() as i32, y: y0.round() as i32, w: (x1 - x0).round() as i32, h: (y1 - y0).round() as i32 }
+        Rect {
+            x: x0.round() as i32,
+            y: y0.round() as i32,
+            w: (x1 - x0).round() as i32,
+            h: (y1 - y0).round() as i32,
+        }
     };
     if dst.w <= 0 || dst.h <= 0 {
         return;
@@ -2611,8 +2876,16 @@ fn collect_canvas_intrinsics(doc: &dom::Document, out: &mut HashMap<dom::NodeId,
         let id = dom::NodeId(i);
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("canvas") {
-                let w = e.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(300.0);
-                let h = e.attrs.get("height").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(150.0);
+                let w = e
+                    .attrs
+                    .get("width")
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(300.0);
+                let h = e
+                    .attrs
+                    .get("height")
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(150.0);
                 out.insert(id, (w.max(1.0), h.max(1.0)));
             }
         }
@@ -2659,7 +2932,11 @@ fn is_editable_text_field(doc: &dom::Document, id: dom::NodeId) -> bool {
     if !el.tag.eq_ignore_ascii_case("input") {
         return false;
     }
-    let ty = el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let ty = el
+        .attrs
+        .get("type")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     matches!(
         ty.as_str(),
         "" | "text" | "search" | "email" | "url" | "tel" | "password" | "number"
@@ -2700,8 +2977,11 @@ fn checkable_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeI
     fn is_checkable(doc: &dom::Document, id: dom::NodeId) -> bool {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("input") && !e.attrs.contains_key("disabled") {
-                let ty =
-                    e.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+                let ty = e
+                    .attrs
+                    .get("type")
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .unwrap_or_default();
                 return ty == "checkbox" || ty == "radio";
             }
         }
@@ -2829,8 +3109,11 @@ fn submit_target_form(doc: &dom::Document, node: dom::NodeId) -> Option<dom::Nod
             if e.attrs.contains_key("disabled") {
                 return false;
             }
-            let ty =
-                e.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+            let ty = e
+                .attrs
+                .get("type")
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default();
             if e.tag.eq_ignore_ascii_case("button") {
                 // A <button> defaults to type=submit.
                 return ty.is_empty() || ty == "submit";
@@ -2881,7 +3164,21 @@ fn paint_box(
     // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
     // declarations compose additional affines on top per-box.
     let xf = Affine::translate(ox, oy);
-    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, mask_bitmaps, 1.0, sel_ranges, run_idx);
+    paint_box_opacity(
+        fb,
+        font,
+        b,
+        &xf,
+        clip_top,
+        clip_bottom,
+        images,
+        canvas_bitmaps,
+        svg_bitmaps,
+        mask_bitmaps,
+        1.0,
+        sel_ranges,
+        run_idx,
+    );
 }
 
 /// A 2D affine mapping a CSS-space point `(x, y)` to a device-space point: `x' = a*x + c*y + e`,
@@ -2901,11 +3198,21 @@ struct Affine {
 
 impl Affine {
     fn translate(tx: f32, ty: f32) -> Affine {
-        Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: tx,
+            f: ty,
+        }
     }
     /// Map a CSS point to device space.
     fn apply(&self, x: f32, y: f32) -> (f32, f32) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
     }
     /// `self` ∘ `m`: apply `m` first (in CSS space), then `self`.
     fn then(&self, m: &Affine) -> Affine {
@@ -2932,12 +3239,19 @@ fn xf_rect(xf: &Affine, x: f32, y: f32, w: f32, h: f32) -> Rect {
     let (x1, y1) = xf.apply(x + w, y + h);
     let (lx, rx) = (x0.min(x1), x0.max(x1));
     let (ty, by) = (y0.min(y1), y0.max(y1));
-    Rect { x: lx.round() as i32, y: ty.round() as i32, w: (rx - lx).round() as i32, h: (by - ty).round() as i32 }
+    Rect {
+        x: lx.round() as i32,
+        y: ty.round() as i32,
+        w: (rx - lx).round() as i32,
+        h: (by - ty).round() as i32,
+    }
 }
 
 /// Scale a u8 alpha by an effective opacity in 0.0..=1.0.
 fn scale_alpha(a: u8, opacity: f32) -> u8 {
-    ((a as f32) * opacity.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8
+    ((a as f32) * opacity.clamp(0.0, 1.0))
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// Paint a box, multiplying every painted alpha by `effective_opacity` (the product of this
@@ -2982,7 +3296,14 @@ fn paint_box_opacity(
         // since the parser already produced absolute px for px translates, only the matrix's e/f
         // (which were 0 for %), this is a no-op for the common case. Keeping it simple: apply m
         // about (ox, oy): T(ox,oy) * m * T(-ox,-oy).
-        let pivot = Affine { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] };
+        let pivot = Affine {
+            a: m[0],
+            b: m[1],
+            c: m[2],
+            d: m[3],
+            e: m[4],
+            f: m[5],
+        };
         let to_origin = Affine::translate(ox, oy);
         let from_origin = Affine::translate(-ox, -oy);
         local_xf = xf.then(&to_origin.then(&pivot).then(&from_origin));
@@ -2999,7 +3320,12 @@ fn paint_box_opacity(
         let y1 = (border.y + border.height).max(content.y + content.height);
         let x0 = border.x.min(content.x);
         let x1 = (border.x + border.width).max(content.x + content.width);
-        let corners = [xf.apply(x0, y0), xf.apply(x1, y0), xf.apply(x0, y1), xf.apply(x1, y1)];
+        let corners = [
+            xf.apply(x0, y0),
+            xf.apply(x1, y0),
+            xf.apply(x0, y1),
+            xf.apply(x1, y1),
+        ];
         let mut t = f32::MAX;
         let mut bt = f32::MIN;
         for (_, cy) in corners {
@@ -3037,7 +3363,12 @@ fn paint_box_opacity(
         if let Some(cov) = mask_cov {
             if let Some((r, g, bl)) = b.style.background_color {
                 // Masked solid background: stamp the color through the coverage alpha.
-                let c = Color { r, g, b: bl, a: scale_alpha(255, opacity) };
+                let c = Color {
+                    r,
+                    g,
+                    b: bl,
+                    a: scale_alpha(255, opacity),
+                };
                 paint_masked_bg(fb, xf, border, cov, c, axis);
             } else if let Some(grad) = extras.and_then(|e| e.background_gradient.as_ref()) {
                 // Gradient-as-background under a mask is out of scope (the icon technique uses a solid
@@ -3047,8 +3378,23 @@ fn paint_box_opacity(
         } else if let Some(grad) = extras.and_then(|e| e.background_gradient.as_ref()) {
             paint_gradient_fill(fb, xf, border, radius, grad, opacity, axis);
         } else if let Some((r, g, bl)) = b.style.background_color {
-            let c = Color { r, g, b: bl, a: scale_alpha(255, opacity) };
-            fill_box(fb, xf, border.x, border.y, border.width, border.height, radius, c, axis);
+            let c = Color {
+                r,
+                g,
+                b: bl,
+                a: scale_alpha(255, opacity),
+            };
+            fill_box(
+                fb,
+                xf,
+                border.x,
+                border.y,
+                border.width,
+                border.height,
+                radius,
+                c,
+                axis,
+            );
         }
 
         // (b) Borders. For a collapsed table CELL, draw single shared 1px lines: left/top at the
@@ -3057,30 +3403,115 @@ fn paint_box_opacity(
         // not a doubled/gapped pair). Otherwise: the normal four filled edge rects.
         let e = b.dimensions.border;
         let ba = scale_alpha(255, opacity);
-        let bc = Color { r: b.style.border_color.0, g: b.style.border_color.1, b: b.style.border_color.2, a: ba };
+        let bc = Color {
+            r: b.style.border_color.0,
+            g: b.style.border_color.1,
+            b: b.style.border_color.2,
+            a: ba,
+        };
         let collapsed_cell = b.style.is_table_cell
             && b.style.border_collapse == style::BorderCollapse::Collapse
             && (e.top > 0.0 || e.right > 0.0 || e.bottom > 0.0 || e.left > 0.0);
         if collapsed_cell {
             let lw = 1.0f32; // single hairline regardless of declared width (simplified resolution)
-            // left + top at the border-box edges
-            fill_box(fb, xf, border.x, border.y, lw, border.height + lw, 0.0, bc, axis);
-            fill_box(fb, xf, border.x, border.y, border.width + lw, lw, 0.0, bc, axis);
+                             // left + top at the border-box edges
+            fill_box(
+                fb,
+                xf,
+                border.x,
+                border.y,
+                lw,
+                border.height + lw,
+                0.0,
+                bc,
+                axis,
+            );
+            fill_box(
+                fb,
+                xf,
+                border.x,
+                border.y,
+                border.width + lw,
+                lw,
+                0.0,
+                bc,
+                axis,
+            );
             // right + bottom at the OUTER edge coordinate (coincides with the neighbour's left/top)
-            fill_box(fb, xf, border.x + border.width, border.y, lw, border.height + lw, 0.0, bc, axis);
-            fill_box(fb, xf, border.x, border.y + border.height, border.width + lw, lw, 0.0, bc, axis);
+            fill_box(
+                fb,
+                xf,
+                border.x + border.width,
+                border.y,
+                lw,
+                border.height + lw,
+                0.0,
+                bc,
+                axis,
+            );
+            fill_box(
+                fb,
+                xf,
+                border.x,
+                border.y + border.height,
+                border.width + lw,
+                lw,
+                0.0,
+                bc,
+                axis,
+            );
         } else {
             if e.top > 0.0 {
-                fill_box(fb, xf, border.x, border.y, border.width, e.top, radius.min(e.top.max(1.0)), bc, axis);
+                fill_box(
+                    fb,
+                    xf,
+                    border.x,
+                    border.y,
+                    border.width,
+                    e.top,
+                    radius.min(e.top.max(1.0)),
+                    bc,
+                    axis,
+                );
             }
             if e.bottom > 0.0 {
-                fill_box(fb, xf, border.x, border.y + border.height - e.bottom, border.width, e.bottom, radius.min(e.bottom.max(1.0)), bc, axis);
+                fill_box(
+                    fb,
+                    xf,
+                    border.x,
+                    border.y + border.height - e.bottom,
+                    border.width,
+                    e.bottom,
+                    radius.min(e.bottom.max(1.0)),
+                    bc,
+                    axis,
+                );
             }
             if e.left > 0.0 {
-                fill_box(fb, xf, border.x, border.y, e.left, border.height, 0.0, bc, axis);
+                fill_box(
+                    fb,
+                    xf,
+                    border.x,
+                    border.y,
+                    e.left,
+                    border.height,
+                    0.0,
+                    bc,
+                    axis,
+                );
             }
             if e.right > 0.0 {
-                fill_box(fb, xf, border.x + border.width - e.right, border.y, e.right, border.height, 0.0, bc, axis);
+                fill_box(
+                    fb,
+                    xf,
+                    border.x + border.width - e.right,
+                    border.y,
+                    e.right,
+                    border.height,
+                    0.0,
+                    bc,
+                    axis,
+                );
             }
         }
 
@@ -3106,7 +3537,12 @@ fn paint_box_opacity(
                 let scale = ((sx + sy) * 0.5).max(0.01);
                 let fs = b.style.font_size * scale;
                 let ta = scale_alpha(255, opacity);
-                let color = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ta };
+                let color = Color {
+                    r: b.style.color.0,
+                    g: b.style.color.1,
+                    b: b.style.color.2,
+                    a: ta,
+                };
                 let x = dx;
                 let baseline = dy + fs * 0.8;
                 // Selection highlight: if this run (identified by its DFS index) has a selected
@@ -3134,13 +3570,33 @@ fn paint_box_opacity(
                         let w = (hx1 - hx0).round() as i32;
                         if w > 0 {
                             // A translucent macOS-ish selection blue, composited over the text bg.
-                            let hl = Color { r: 74, g: 144, b: 255, a: scale_alpha(102, opacity) };
-                            fb.fill_rect(Rect { x: hx0.round() as i32, y: top, w, h }, hl);
+                            let hl = Color {
+                                r: 74,
+                                g: 144,
+                                b: 255,
+                                a: scale_alpha(102, opacity),
+                            };
+                            fb.fill_rect(
+                                Rect {
+                                    x: hx0.round() as i32,
+                                    y: top,
+                                    w,
+                                    h,
+                                },
+                                hl,
+                            );
                         }
                     }
                 }
                 let end_x = draw_run(
-                    fb, font, s, x, baseline, fs, color, b.style.bold,
+                    fb,
+                    font,
+                    s,
+                    x,
+                    baseline,
+                    fs,
+                    color,
+                    b.style.bold,
                     b.style.letter_spacing * scale,
                 );
                 let run_w = (end_x - x).max(0.0);
@@ -3148,16 +3604,40 @@ fn paint_box_opacity(
                     let thickness = (fs / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
                     if b.style.underline {
                         let uy = (baseline + 1.0).round() as i32;
-                        fb.fill_rect(Rect { x: x.round() as i32, y: uy, w: run_w.round() as i32, h: thickness }, color);
+                        fb.fill_rect(
+                            Rect {
+                                x: x.round() as i32,
+                                y: uy,
+                                w: run_w.round() as i32,
+                                h: thickness,
+                            },
+                            color,
+                        );
                     }
                     if b.style.line_through {
                         let my = (baseline - fs * 0.3).round() as i32;
-                        fb.fill_rect(Rect { x: x.round() as i32, y: my, w: run_w.round() as i32, h: thickness }, color);
+                        fb.fill_rect(
+                            Rect {
+                                x: x.round() as i32,
+                                y: my,
+                                w: run_w.round() as i32,
+                                h: thickness,
+                            },
+                            color,
+                        );
                     }
                     if b.style.overline {
                         // A line above the text, near the top of the em box (~0.8em above baseline).
                         let oy = (baseline - fs * 0.8).round() as i32;
-                        fb.fill_rect(Rect { x: x.round() as i32, y: oy, w: run_w.round() as i32, h: thickness }, color);
+                        fb.fill_rect(
+                            Rect {
+                                x: x.round() as i32,
+                                y: oy,
+                                w: run_w.round() as i32,
+                                h: thickness,
+                            },
+                            color,
+                        );
                     }
                 }
             }
@@ -3173,9 +3653,24 @@ fn paint_box_opacity(
                 let scale = ((sx + sy) * 0.5).max(0.01);
                 let fs = b.style.font_size * scale;
                 let ta = scale_alpha(255, opacity);
-                let color = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ta };
+                let color = Color {
+                    r: b.style.color.0,
+                    g: b.style.color.1,
+                    b: b.style.color.2,
+                    a: ta,
+                };
                 let baseline = dy + fs * 0.8;
-                draw_run(fb, font, s, dx, baseline, fs, color, b.style.bold, b.style.letter_spacing * scale);
+                draw_run(
+                    fb,
+                    font,
+                    s,
+                    dx,
+                    baseline,
+                    fs,
+                    color,
+                    b.style.bold,
+                    b.style.letter_spacing * scale,
+                );
             }
         }
 
@@ -3183,8 +3678,23 @@ fn paint_box_opacity(
         // the foreground color (mapped through the affine like any other box).
         if matches!(b.content, layout::BoxContent::Caret) {
             let ca = scale_alpha(255, opacity);
-            let cc = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ca };
-            fill_box(fb, xf, content.x, content.y, content.width, content.height, 0.0, cc, axis);
+            let cc = Color {
+                r: b.style.color.0,
+                g: b.style.color.1,
+                b: b.style.color.2,
+                a: ca,
+            };
+            fill_box(
+                fb,
+                xf,
+                content.x,
+                content.y,
+                content.width,
+                content.height,
+                0.0,
+                cc,
+                axis,
+            );
         }
 
         // (c3) Form widget: a checkbox/radio, range slider, color swatch, or progress/meter bar,
@@ -3216,12 +3726,49 @@ fn paint_box_opacity(
                         fb.blit_rgba(dst, &scaled, img.w, img.h);
                     }
                     None => {
-                        let ph = Color { r: 140, g: 140, b: 150, a: scale_alpha(120, opacity) };
+                        let ph = Color {
+                            r: 140,
+                            g: 140,
+                            b: 150,
+                            a: scale_alpha(120, opacity),
+                        };
                         if dst.w > 0 && dst.h > 0 {
-                            fb.fill_rect(Rect { x: dst.x, y: dst.y, w: dst.w, h: 1 }, ph);
-                            fb.fill_rect(Rect { x: dst.x, y: dst.y + dst.h - 1, w: dst.w, h: 1 }, ph);
-                            fb.fill_rect(Rect { x: dst.x, y: dst.y, w: 1, h: dst.h }, ph);
-                            fb.fill_rect(Rect { x: dst.x + dst.w - 1, y: dst.y, w: 1, h: dst.h }, ph);
+                            fb.fill_rect(
+                                Rect {
+                                    x: dst.x,
+                                    y: dst.y,
+                                    w: dst.w,
+                                    h: 1,
+                                },
+                                ph,
+                            );
+                            fb.fill_rect(
+                                Rect {
+                                    x: dst.x,
+                                    y: dst.y + dst.h - 1,
+                                    w: dst.w,
+                                    h: 1,
+                                },
+                                ph,
+                            );
+                            fb.fill_rect(
+                                Rect {
+                                    x: dst.x,
+                                    y: dst.y,
+                                    w: 1,
+                                    h: dst.h,
+                                },
+                                ph,
+                            );
+                            fb.fill_rect(
+                                Rect {
+                                    x: dst.x + dst.w - 1,
+                                    y: dst.y,
+                                    w: 1,
+                                    h: dst.h,
+                                },
+                                ph,
+                            );
                         }
                     }
                 }
@@ -3239,13 +3786,37 @@ fn paint_box_opacity(
     }
 
     for child in &b.children {
-        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, canvas_bitmaps, svg_bitmaps, mask_bitmaps, opacity, sel_ranges, run_idx);
+        paint_box_opacity(
+            fb,
+            font,
+            child,
+            xf,
+            clip_top,
+            clip_bottom,
+            images,
+            canvas_bitmaps,
+            svg_bitmaps,
+            mask_bitmaps,
+            opacity,
+            sel_ranges,
+            run_idx,
+        );
     }
 }
 
 /// Fill a CSS-space rect through an affine: axis-aligned → a (rounded) device rect; otherwise a
 /// transformed quad (rounding ignored). `radius` only applies in the axis-aligned case.
-fn fill_box(fb: &mut Framebuffer, xf: &Affine, x: f32, y: f32, w: f32, h: f32, radius: f32, c: Color, axis: bool) {
+fn fill_box(
+    fb: &mut Framebuffer,
+    xf: &Affine,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    radius: f32,
+    c: Color,
+    axis: bool,
+) {
     if axis {
         fb.fill_round_rect(xf_rect(xf, x, y, w, h), radius, c);
     } else {
@@ -3264,10 +3835,42 @@ fn stroke_rect(fb: &mut Framebuffer, r: Rect, t: i32, c: Color) {
         return;
     }
     let t = t.min(r.w).min(r.h);
-    fb.fill_rect(Rect { x: r.x, y: r.y, w: r.w, h: t }, c); // top
-    fb.fill_rect(Rect { x: r.x, y: r.y + r.h - t, w: r.w, h: t }, c); // bottom
-    fb.fill_rect(Rect { x: r.x, y: r.y, w: t, h: r.h }, c); // left
-    fb.fill_rect(Rect { x: r.x + r.w - t, y: r.y, w: t, h: r.h }, c); // right
+    fb.fill_rect(
+        Rect {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: t,
+        },
+        c,
+    ); // top
+    fb.fill_rect(
+        Rect {
+            x: r.x,
+            y: r.y + r.h - t,
+            w: r.w,
+            h: t,
+        },
+        c,
+    ); // bottom
+    fb.fill_rect(
+        Rect {
+            x: r.x,
+            y: r.y,
+            w: t,
+            h: r.h,
+        },
+        c,
+    ); // left
+    fb.fill_rect(
+        Rect {
+            x: r.x + r.w - t,
+            y: r.y,
+            w: t,
+            h: r.h,
+        },
+        c,
+    ); // right
 }
 
 /// Fill a circle (device-space center `cx,cy`, radius `rad`) source-over at `c`, with 1px AA at the
@@ -3307,7 +3910,15 @@ fn draw_line(fb: &mut Framebuffer, x0: f32, y0: f32, x1: f32, y1: f32, t: i32, c
     let sy = if y0 < y1 { 1 } else { -1 };
     let mut err = dx + dy;
     loop {
-        fb.fill_rect(Rect { x: x0 - t / 2, y: y0 - t / 2, w: t, h: t }, c);
+        fb.fill_rect(
+            Rect {
+                x: x0 - t / 2,
+                y: y0 - t / 2,
+                w: t,
+                h: t,
+            },
+            c,
+        );
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -3339,7 +3950,12 @@ fn paint_widget(
     if r.w <= 0 || r.h <= 0 {
         return;
     }
-    let border = Color { r: 118, g: 118, b: 118, a }; // #767676, the UA control border
+    let border = Color {
+        r: 118,
+        g: 118,
+        b: 118,
+        a,
+    }; // #767676, the UA control border
     match kind {
         layout::WidgetKind::Checkbox { checked } => {
             // A square box (centered in the content rect), white fill, gray border; a check mark
@@ -3347,23 +3963,72 @@ fn paint_widget(
             let s = r.w.min(r.h);
             let bx = r.x + (r.w - s) / 2;
             let by = r.y + (r.h - s) / 2;
-            let sq = Rect { x: bx, y: by, w: s, h: s };
-            fb.fill_round_rect(sq, 2.0, Color { r: 255, g: 255, b: 255, a });
+            let sq = Rect {
+                x: bx,
+                y: by,
+                w: s,
+                h: s,
+            };
+            fb.fill_round_rect(
+                sq,
+                2.0,
+                Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a,
+                },
+            );
             stroke_rect(fb, sq, 1, border);
             if checked {
                 // A blue-ish fill behind a white check, or just a dark check on white. We draw a
                 // filled accent box + white check for a clear "on" state.
                 let inset = (s as f32 * 0.0).max(0.0) as i32;
-                let acc = Rect { x: bx + inset, y: by + inset, w: s - 2 * inset, h: s - 2 * inset };
-                fb.fill_round_rect(acc, 2.0, Color { r: 36, g: 110, b: 230, a }); // accent blue
+                let acc = Rect {
+                    x: bx + inset,
+                    y: by + inset,
+                    w: s - 2 * inset,
+                    h: s - 2 * inset,
+                };
+                fb.fill_round_rect(
+                    acc,
+                    2.0,
+                    Color {
+                        r: 36,
+                        g: 110,
+                        b: 230,
+                        a,
+                    },
+                ); // accent blue
                 let fx = bx as f32;
                 let fy = by as f32;
                 let fs = s as f32;
-                let check = Color { r: 255, g: 255, b: 255, a };
+                let check = Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a,
+                };
                 let t = (fs / 7.0).round().clamp(1.0, 3.0) as i32;
                 // ✓ : down-stroke from (0.22,0.52) to (0.42,0.74), up-stroke to (0.78,0.28).
-                draw_line(fb, fx + fs * 0.24, fy + fs * 0.52, fx + fs * 0.43, fy + fs * 0.72, t, check);
-                draw_line(fb, fx + fs * 0.43, fy + fs * 0.72, fx + fs * 0.76, fy + fs * 0.30, t, check);
+                draw_line(
+                    fb,
+                    fx + fs * 0.24,
+                    fy + fs * 0.52,
+                    fx + fs * 0.43,
+                    fy + fs * 0.72,
+                    t,
+                    check,
+                );
+                draw_line(
+                    fb,
+                    fx + fs * 0.43,
+                    fy + fs * 0.72,
+                    fx + fs * 0.76,
+                    fy + fs * 0.30,
+                    t,
+                    check,
+                );
             }
         }
         layout::WidgetKind::Radio { checked } => {
@@ -3372,12 +4037,45 @@ fn paint_widget(
             let cx = r.x as f32 + r.w as f32 / 2.0;
             let cy = r.y as f32 + r.h as f32 / 2.0;
             let rad = s as f32 / 2.0;
-            fill_circle(fb, cx, cy, rad, Color { r: 255, g: 255, b: 255, a });
+            fill_circle(
+                fb,
+                cx,
+                cy,
+                rad,
+                Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a,
+                },
+            );
             // Border ring: a slightly larger circle in border color, then the white re-fill.
             fill_circle(fb, cx, cy, rad, border);
-            fill_circle(fb, cx, cy, (rad - 1.0).max(0.5), Color { r: 255, g: 255, b: 255, a });
+            fill_circle(
+                fb,
+                cx,
+                cy,
+                (rad - 1.0).max(0.5),
+                Color {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a,
+                },
+            );
             if checked {
-                fill_circle(fb, cx, cy, (rad * 0.5).max(1.0), Color { r: 36, g: 110, b: 230, a });
+                fill_circle(
+                    fb,
+                    cx,
+                    cy,
+                    (rad * 0.5).max(1.0),
+                    Color {
+                        r: 36,
+                        g: 110,
+                        b: 230,
+                        a,
+                    },
+                );
             }
         }
         layout::WidgetKind::Range { fraction } => {
@@ -3385,51 +4083,176 @@ fn paint_widget(
             let track_h = (r.h / 4).max(3);
             let ty = r.y + (r.h - track_h) / 2;
             let pad = r.h / 2; // keep the thumb inside the box at the extremes
-            let track = Rect { x: r.x + pad, y: ty, w: (r.w - 2 * pad).max(1), h: track_h };
-            fb.fill_round_rect(track, track_h as f32 / 2.0, Color { r: 180, g: 180, b: 180, a });
+            let track = Rect {
+                x: r.x + pad,
+                y: ty,
+                w: (r.w - 2 * pad).max(1),
+                h: track_h,
+            };
+            fb.fill_round_rect(
+                track,
+                track_h as f32 / 2.0,
+                Color {
+                    r: 180,
+                    g: 180,
+                    b: 180,
+                    a,
+                },
+            );
             // Filled (left) portion in the accent color.
             let filled_w = (track.w as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
             if filled_w > 0 {
                 fb.fill_round_rect(
-                    Rect { x: track.x, y: ty, w: filled_w, h: track_h },
+                    Rect {
+                        x: track.x,
+                        y: ty,
+                        w: filled_w,
+                        h: track_h,
+                    },
                     track_h as f32 / 2.0,
-                    Color { r: 36, g: 110, b: 230, a },
+                    Color {
+                        r: 36,
+                        g: 110,
+                        b: 230,
+                        a,
+                    },
                 );
             }
             let thumb_cx = track.x as f32 + track.w as f32 * fraction.clamp(0.0, 1.0);
             let thumb_cy = r.y as f32 + r.h as f32 / 2.0;
             let thumb_r = (r.h as f32 / 2.0 - 1.0).max(3.0);
-            fill_circle(fb, thumb_cx, thumb_cy, thumb_r, Color { r: 240, g: 240, b: 240, a });
+            fill_circle(
+                fb,
+                thumb_cx,
+                thumb_cy,
+                thumb_r,
+                Color {
+                    r: 240,
+                    g: 240,
+                    b: 240,
+                    a,
+                },
+            );
             fill_circle(fb, thumb_cx, thumb_cy, thumb_r, border);
-            fill_circle(fb, thumb_cx, thumb_cy, (thumb_r - 1.0).max(1.0), Color { r: 245, g: 245, b: 245, a });
+            fill_circle(
+                fb,
+                thumb_cx,
+                thumb_cy,
+                (thumb_r - 1.0).max(1.0),
+                Color {
+                    r: 245,
+                    g: 245,
+                    b: 245,
+                    a,
+                },
+            );
         }
         layout::WidgetKind::Color { rgb } => {
             // A swatch filled with the chosen color, thin gray border (with a small inner inset so
             // the color reads clearly).
             stroke_rect(fb, r, 1, border);
-            let inner = Rect { x: r.x + 2, y: r.y + 2, w: (r.w - 4).max(1), h: (r.h - 4).max(1) };
-            fb.fill_rect(inner, Color { r: rgb.0, g: rgb.1, b: rgb.2, a });
+            let inner = Rect {
+                x: r.x + 2,
+                y: r.y + 2,
+                w: (r.w - 4).max(1),
+                h: (r.h - 4).max(1),
+            };
+            fb.fill_rect(
+                inner,
+                Color {
+                    r: rgb.0,
+                    g: rgb.1,
+                    b: rgb.2,
+                    a,
+                },
+            );
         }
         layout::WidgetKind::Progress { fraction } => {
             // A rounded track (light bg) with a blue filled portion = fraction. Indeterminate
             // (None) → a fully filled track (a reasonable static stand-in for the animation).
             let rad = (r.h as f32 / 2.0).min(6.0);
-            fb.fill_round_rect(r, rad, Color { r: 225, g: 225, b: 225, a });
-            stroke_rect(fb, r, 1, Color { r: 190, g: 190, b: 190, a });
+            fb.fill_round_rect(
+                r,
+                rad,
+                Color {
+                    r: 225,
+                    g: 225,
+                    b: 225,
+                    a,
+                },
+            );
+            stroke_rect(
+                fb,
+                r,
+                1,
+                Color {
+                    r: 190,
+                    g: 190,
+                    b: 190,
+                    a,
+                },
+            );
             let frac = fraction.unwrap_or(1.0).clamp(0.0, 1.0);
             let fw = (r.w as f32 * frac).round() as i32;
             if fw > 0 {
-                fb.fill_round_rect(Rect { x: r.x, y: r.y, w: fw, h: r.h }, rad, Color { r: 36, g: 110, b: 230, a });
+                fb.fill_round_rect(
+                    Rect {
+                        x: r.x,
+                        y: r.y,
+                        w: fw,
+                        h: r.h,
+                    },
+                    rad,
+                    Color {
+                        r: 36,
+                        g: 110,
+                        b: 230,
+                        a,
+                    },
+                );
             }
         }
         layout::WidgetKind::Meter { fraction } => {
             // Like progress but a greenish fill.
             let rad = (r.h as f32 / 2.0).min(6.0);
-            fb.fill_round_rect(r, rad, Color { r: 225, g: 225, b: 225, a });
-            stroke_rect(fb, r, 1, Color { r: 190, g: 190, b: 190, a });
+            fb.fill_round_rect(
+                r,
+                rad,
+                Color {
+                    r: 225,
+                    g: 225,
+                    b: 225,
+                    a,
+                },
+            );
+            stroke_rect(
+                fb,
+                r,
+                1,
+                Color {
+                    r: 190,
+                    g: 190,
+                    b: 190,
+                    a,
+                },
+            );
             let fw = (r.w as f32 * fraction.clamp(0.0, 1.0)).round() as i32;
             if fw > 0 {
-                fb.fill_round_rect(Rect { x: r.x, y: r.y, w: fw, h: r.h }, rad, Color { r: 76, g: 174, b: 80, a });
+                fb.fill_round_rect(
+                    Rect {
+                        x: r.x,
+                        y: r.y,
+                        w: fw,
+                        h: r.h,
+                    },
+                    rad,
+                    Color {
+                        r: 76,
+                        g: 174,
+                        b: 80,
+                        a,
+                    },
+                );
             }
         }
     }
@@ -3443,9 +4266,19 @@ fn fill_quad(fb: &mut Framebuffer, pts: [(f32, f32); 4], c: Color) {
     let xs = [pts[0].0, pts[1].0, pts[2].0, pts[3].0];
     let ys = [pts[0].1, pts[1].1, pts[2].1, pts[3].1];
     let minx = xs.iter().cloned().fold(f32::MAX, f32::min).floor().max(0.0) as i32;
-    let maxx = xs.iter().cloned().fold(f32::MIN, f32::max).ceil().min(fb.width as f32) as i32;
+    let maxx = xs
+        .iter()
+        .cloned()
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(fb.width as f32) as i32;
     let miny = ys.iter().cloned().fold(f32::MAX, f32::min).floor().max(0.0) as i32;
-    let maxy = ys.iter().cloned().fold(f32::MIN, f32::max).ceil().min(fb.height as f32) as i32;
+    let maxy = ys
+        .iter()
+        .cloned()
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(fb.height as f32) as i32;
     if maxx <= minx || maxy <= miny {
         return;
     }
@@ -3524,7 +4357,10 @@ fn paint_gradient_fill(
     }
     let dw = (dst.w.max(1)) as f32;
     let dh = (dst.h.max(1)) as f32;
-    let r = radius.min(dst.w as f32 / 2.0).min(dst.h as f32 / 2.0).max(0.0);
+    let r = radius
+        .min(dst.w as f32 / 2.0)
+        .min(dst.h as f32 / 2.0)
+        .max(0.0);
     // Linear gradient axis direction in normalized box space (CSS angle: 0=up, 90=right).
     let (dirx, diry, half_len);
     match grad {
@@ -3560,11 +4396,19 @@ fn paint_gradient_fill(
             let t = match grad {
                 style::Gradient::Linear { .. } => {
                     let proj = (px - cx) * dirx + (py - cy) * diry;
-                    if half_len > 0.0 { (proj / half_len) * 0.5 + 0.5 } else { 0.5 }
+                    if half_len > 0.0 {
+                        (proj / half_len) * 0.5 + 0.5
+                    } else {
+                        0.5
+                    }
                 }
                 style::Gradient::Radial { .. } => {
                     let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
-                    if half_len > 0.0 { dist / half_len } else { 0.0 }
+                    if half_len > 0.0 {
+                        dist / half_len
+                    } else {
+                        0.0
+                    }
                 }
             };
             let col = sample_stops(stops, t.clamp(0.0, 1.0));
@@ -3573,7 +4417,15 @@ fn paint_gradient_fill(
                 continue;
             }
             let i = row + (x as usize) * 4;
-            blend_pixel(&mut fb.pixels[i..i + 4], Color { r: col.r, g: col.g, b: col.b, a });
+            blend_pixel(
+                &mut fb.pixels[i..i + 4],
+                Color {
+                    r: col.r,
+                    g: col.g,
+                    b: col.b,
+                    a,
+                },
+            );
         }
     }
 }
@@ -3584,8 +4436,20 @@ fn inside_round_rect(px: f32, py: f32, rect: Rect, r: f32) -> bool {
     let right_cx = (rect.x + rect.w) as f32 - r;
     let top_cy = rect.y as f32 + r;
     let bottom_cy = (rect.y + rect.h) as f32 - r;
-    let cx = if px < left_cx { Some(left_cx) } else if px > right_cx { Some(right_cx) } else { None };
-    let cy = if py < top_cy { Some(top_cy) } else if py > bottom_cy { Some(bottom_cy) } else { None };
+    let cx = if px < left_cx {
+        Some(left_cx)
+    } else if px > right_cx {
+        Some(right_cx)
+    } else {
+        None
+    };
+    let cy = if py < top_cy {
+        Some(top_cy)
+    } else if py > bottom_cy {
+        Some(bottom_cy)
+    } else {
+        None
+    };
     match (cx, cy) {
         (Some(cx), Some(cy)) => ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() <= r,
         _ => true,
@@ -3595,7 +4459,12 @@ fn inside_round_rect(px: f32, py: f32, rect: Rect, r: f32) -> bool {
 /// Linearly interpolate the gradient stops at parameter `t` in 0..1 (stops sorted by `pos`).
 fn sample_stops(stops: &[style::GradientStop], t: f32) -> style::Rgba {
     if stops.is_empty() {
-        return style::Rgba { r: 0, g: 0, b: 0, a: 0 };
+        return style::Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
     }
     if t <= stops[0].pos {
         return stops[0].color;
@@ -3622,7 +4491,9 @@ fn sample_stops(stops: &[style::GradientStop], t: f32) -> style::Rgba {
 }
 
 fn lerp_u8(a: u8, b: u8, f: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * f).round().clamp(0.0, 255.0) as u8
+    (a as f32 + (b as f32 - a as f32) * f)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// Paint one box-shadow layer. OUTER: a rect offset by (dx,dy), inflated by `spread`, with a `blur`
@@ -3642,7 +4513,12 @@ fn paint_box_shadow(
     if base_a == 0 {
         return;
     }
-    let col = |a: u8| Color { r: sh.color.r, g: sh.color.g, b: sh.color.b, a };
+    let col = |a: u8| Color {
+        r: sh.color.r,
+        g: sh.color.g,
+        b: sh.color.b,
+        a,
+    };
     if !inset {
         // Outer: core rect = border box, offset by (dx,dy), inflated by spread.
         let bx = border.x + sh.dx - sh.spread;
@@ -3665,12 +4541,49 @@ fn paint_box_shadow(
             if a == 0 {
                 continue;
             }
-            let ring = Rect { x: core.x - k, y: core.y - k, w: core.w + 2 * k, h: core.h + 2 * k };
+            let ring = Rect {
+                x: core.x - k,
+                y: core.y - k,
+                w: core.w + 2 * k,
+                h: core.h + 2 * k,
+            };
             // Draw just the 1px ring (top/bottom/left/right strips) to avoid re-darkening the core.
-            fb.fill_rect(Rect { x: ring.x, y: ring.y, w: ring.w, h: 1 }, col(a));
-            fb.fill_rect(Rect { x: ring.x, y: ring.y + ring.h - 1, w: ring.w, h: 1 }, col(a));
-            fb.fill_rect(Rect { x: ring.x, y: ring.y, w: 1, h: ring.h }, col(a));
-            fb.fill_rect(Rect { x: ring.x + ring.w - 1, y: ring.y, w: 1, h: ring.h }, col(a));
+            fb.fill_rect(
+                Rect {
+                    x: ring.x,
+                    y: ring.y,
+                    w: ring.w,
+                    h: 1,
+                },
+                col(a),
+            );
+            fb.fill_rect(
+                Rect {
+                    x: ring.x,
+                    y: ring.y + ring.h - 1,
+                    w: ring.w,
+                    h: 1,
+                },
+                col(a),
+            );
+            fb.fill_rect(
+                Rect {
+                    x: ring.x,
+                    y: ring.y,
+                    w: 1,
+                    h: ring.h,
+                },
+                col(a),
+            );
+            fb.fill_rect(
+                Rect {
+                    x: ring.x + ring.w - 1,
+                    y: ring.y,
+                    w: 1,
+                    h: ring.h,
+                },
+                col(a),
+            );
         }
     } else {
         // Inset (best-effort): a feathered band just inside the border box, offset by (dx,dy).
@@ -3686,22 +4599,53 @@ fn paint_box_shadow(
             let dxk = sh.dx.round() as i32;
             let dyk = sh.dy.round() as i32;
             // Top & left bands shift with the offset.
-            fb.fill_rect(Rect { x: inner.x + dxk, y: inner.y + k + dyk, w: inner.w, h: 1 }, col(a));
-            fb.fill_rect(Rect { x: inner.x + k + dxk, y: inner.y + dyk, w: 1, h: inner.h }, col(a));
-            fb.fill_rect(Rect { x: inner.x + dxk, y: inner.y + inner.h - 1 - k + dyk, w: inner.w, h: 1 }, col(a));
-            fb.fill_rect(Rect { x: inner.x + inner.w - 1 - k + dxk, y: inner.y + dyk, w: 1, h: inner.h }, col(a));
+            fb.fill_rect(
+                Rect {
+                    x: inner.x + dxk,
+                    y: inner.y + k + dyk,
+                    w: inner.w,
+                    h: 1,
+                },
+                col(a),
+            );
+            fb.fill_rect(
+                Rect {
+                    x: inner.x + k + dxk,
+                    y: inner.y + dyk,
+                    w: 1,
+                    h: inner.h,
+                },
+                col(a),
+            );
+            fb.fill_rect(
+                Rect {
+                    x: inner.x + dxk,
+                    y: inner.y + inner.h - 1 - k + dyk,
+                    w: inner.w,
+                    h: 1,
+                },
+                col(a),
+            );
+            fb.fill_rect(
+                Rect {
+                    x: inner.x + inner.w - 1 - k + dxk,
+                    y: inner.y + dyk,
+                    w: 1,
+                    h: inner.h,
+                },
+                col(a),
+            );
         }
     }
 }
-
 
 /// Tags whose subtrees contribute no visible text.
 const SKIP_SUBTREE: &[&str] = &["script", "style", "head", "title", "noscript"];
 
 /// Block-ish tags that introduce a line break around their content.
 const BLOCK_TAGS: &[&str] = &[
-    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br", "section", "article",
-    "header", "footer", "ul", "ol", "tr",
+    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "br", "section", "article", "header",
+    "footer", "ul", "ol", "tr",
 ];
 
 /// Walk the DOM depth-first and collect visible text, skipping non-rendered subtrees,
@@ -3742,7 +4686,11 @@ fn build_request_fetcher(
 ) -> std::sync::Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> {
     std::sync::Arc::new(|method: &str, url: &str, body: &str, headers_json: &str| {
         let headers = parse_headers_json(headers_json);
-        let body_opt: Option<&[u8]> = if body.is_empty() { None } else { Some(body.as_bytes()) };
+        let body_opt: Option<&[u8]> = if body.is_empty() {
+            None
+        } else {
+            Some(body.as_bytes())
+        };
         let resp = net::request(method, url, body_opt, &headers).ok()?;
         let ok = (200..300).contains(&resp.status);
         let status_text = reason_phrase(resp.status);
@@ -4057,7 +5005,14 @@ pub fn collect_stylesheets(doc: &dom::Document, base: &str) -> (Vec<css::Stylesh
             StyleSource::Inline(src) => {
                 // Inline `<style>` may itself `@import` (rare, but cheap): resolve those against
                 // the page/base URL, recursively pulling them in BEFORE the inline body's rules.
-                process_css_text(&src, base, &mut sheets, &mut console, &mut fetched, &mut seen);
+                process_css_text(
+                    &src,
+                    base,
+                    &mut sheets,
+                    &mut console,
+                    &mut fetched,
+                    &mut seen,
+                );
             }
             StyleSource::External(url) => {
                 fetch_css(&url, &mut sheets, &mut console, &mut fetched, &mut seen);
@@ -4176,7 +5131,12 @@ fn collect_images(
     console: &mut Vec<String>,
 ) -> HashMap<dom::NodeId, DecodedImage> {
     // Gather (node, absolute-url) pairs in document order.
-    fn walk(doc: &dom::Document, id: dom::NodeId, base: &str, out: &mut Vec<(dom::NodeId, String)>) {
+    fn walk(
+        doc: &dom::Document,
+        id: dom::NodeId,
+        base: &str,
+        out: &mut Vec<(dom::NodeId, String)>,
+    ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("img") {
                 if let Some(src) = e.attrs.get("src") {
@@ -4198,14 +5158,17 @@ fn collect_images(
     walk(doc, doc.root(), base, &mut targets);
     if targets.len() > MAX_IMAGES {
         for (_, url) in targets.drain(MAX_IMAGES..) {
-            console.push(format!("[skipped image (limit {MAX_IMAGES} reached): {url}]"));
+            console.push(format!(
+                "[skipped image (limit {MAX_IMAGES} reached): {url}]"
+            ));
         }
     }
 
     // `data:` images decode inline (no I/O); network images are fetched concurrently across a
     // small pool of scoped threads, since they're independent and order doesn't matter.
-    let (data_targets, net_targets): (Vec<_>, Vec<_>) =
-        targets.into_iter().partition(|(_, url)| url.starts_with("data:"));
+    let (data_targets, net_targets): (Vec<_>, Vec<_>) = targets
+        .into_iter()
+        .partition(|(_, url)| url.starts_with("data:"));
 
     let mut results: Vec<(dom::NodeId, String, Result<DecodedImage, String>)> = Vec::new();
     for (node, url) in data_targets {
@@ -4216,7 +5179,7 @@ fn collect_images(
     }
 
     if !net_targets.is_empty() {
-        let n_threads = net_targets.len().min(8).max(1);
+        let n_threads = net_targets.len().clamp(1, 8);
         let chunks: Vec<Vec<(dom::NodeId, String)>> = {
             let mut cs: Vec<Vec<_>> = (0..n_threads).map(|_| Vec::new()).collect();
             for (i, t) in net_targets.into_iter().enumerate() {
@@ -4232,11 +5195,10 @@ fn collect_images(
                         chunk
                             .into_iter()
                             .map(|(node, url)| {
-                                let r = net::fetch(&url)
-                                    .and_then(|resp| {
-                                        decode_image(&resp.body)
-                                            .ok_or_else(|| "decode failed".to_string())
-                                    });
+                                let r = net::fetch(&url).and_then(|resp| {
+                                    decode_image(&resp.body)
+                                        .ok_or_else(|| "decode failed".to_string())
+                                });
                                 (node, url, r)
                             })
                             .collect::<Vec<_>>()
@@ -4256,7 +5218,11 @@ fn collect_images(
                 images.insert(node, img);
             }
             Err(e) => {
-                let label = if url.starts_with("data:") { "data: image" } else { &url };
+                let label = if url.starts_with("data:") {
+                    "data: image"
+                } else {
+                    &url
+                };
                 console.push(format!("[failed to load image: {label} — {e}]"));
             }
         }
@@ -4274,7 +5240,11 @@ fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
         return None;
     }
     let rgba = dynimg.to_rgba8();
-    Some(DecodedImage { rgba: rgba.into_raw(), w, h })
+    Some(DecodedImage {
+        rgba: rgba.into_raw(),
+        w,
+        h,
+    })
 }
 
 /// Decode a `data:[<mediatype>][;base64],<data>` URL into its raw bytes. Returns `None` if it
@@ -4364,7 +5334,16 @@ fn draw_run(
 ) -> f32 {
     let end = draw_text_spaced(fb, font, text, x, baseline_y, px, color, letter_spacing);
     if bold {
-        draw_text_spaced(fb, font, text, x + 1.0, baseline_y, px, color, letter_spacing);
+        draw_text_spaced(
+            fb,
+            font,
+            text,
+            x + 1.0,
+            baseline_y,
+            px,
+            color,
+            letter_spacing,
+        );
     }
     end
 }
@@ -4619,7 +5598,11 @@ fn extract_specifiers(src: &str) -> Vec<SpecifierRef> {
                         }
                         if k < n && (b[k] == b'"' || b[k] == b'\'') {
                             if let Some((spec, end)) = read_string(b, k) {
-                                out.push(SpecifierRef { start: k, end, spec });
+                                out.push(SpecifierRef {
+                                    start: k,
+                                    end,
+                                    spec,
+                                });
                                 i = end;
                                 continue;
                             }
@@ -4638,7 +5621,11 @@ fn extract_specifiers(src: &str) -> Vec<SpecifierRef> {
                     }
                     if p < n && (b[p] == b'"' || b[p] == b'\'') {
                         if let Some((spec, end)) = read_string(b, p) {
-                            out.push(SpecifierRef { start: p, end, spec });
+                            out.push(SpecifierRef {
+                                start: p,
+                                end,
+                                spec,
+                            });
                             i = end;
                             continue;
                         }
@@ -4663,7 +5650,11 @@ fn extract_specifiers(src: &str) -> Vec<SpecifierRef> {
                         }
                         if p < stmt_end && (b[p] == b'"' || b[p] == b'\'') {
                             if let Some((spec, end)) = read_string(b, p) {
-                                out.push(SpecifierRef { start: p, end, spec });
+                                out.push(SpecifierRef {
+                                    start: p,
+                                    end,
+                                    spec,
+                                });
                                 i = end;
                                 matched = true;
                                 break;
@@ -4754,13 +5745,17 @@ pub fn collect_module_graph(
         let remaining = MAX_MODULES.saturating_sub(sources.len());
         if remaining == 0 {
             for u in &frontier {
-                notes.push(format!("[skipped module (limit {MAX_MODULES} reached): {u}]"));
+                notes.push(format!(
+                    "[skipped module (limit {MAX_MODULES} reached): {u}]"
+                ));
             }
             break;
         }
         if frontier.len() > remaining {
             for u in frontier.split_off(remaining) {
-                notes.push(format!("[skipped module (limit {MAX_MODULES} reached): {u}]"));
+                notes.push(format!(
+                    "[skipped module (limit {MAX_MODULES} reached): {u}]"
+                ));
             }
         }
 
@@ -4777,7 +5772,7 @@ pub fn collect_module_graph(
 
         // Fetch this level concurrently across a small scoped thread pool.
         if !net_urls.is_empty() {
-            let n = net_urls.len().min(8).max(1);
+            let n = net_urls.len().clamp(1, 8);
             let mut chunks: Vec<Vec<String>> = (0..n).map(|_| Vec::new()).collect();
             for (i, u) in net_urls.into_iter().enumerate() {
                 chunks[i % n].push(u);
@@ -4791,11 +5786,19 @@ pub fn collect_module_graph(
                                 .into_iter()
                                 .map(|u| {
                                     let r = match net::fetch(&u) {
-                                        Ok(resp) if resp.body.len() > MAX_MODULE_BYTES => Err(
-                                            format!("[skipped large module: {} ({} bytes)]", u, resp.body.len()),
-                                        ),
-                                        Ok(resp) => Ok(String::from_utf8_lossy(&resp.body).into_owned()),
-                                        Err(e) => Err(format!("[failed to load module: {u} — {e}]")),
+                                        Ok(resp) if resp.body.len() > MAX_MODULE_BYTES => {
+                                            Err(format!(
+                                                "[skipped large module: {} ({} bytes)]",
+                                                u,
+                                                resp.body.len()
+                                            ))
+                                        }
+                                        Ok(resp) => {
+                                            Ok(String::from_utf8_lossy(&resp.body).into_owned())
+                                        }
+                                        Err(e) => {
+                                            Err(format!("[failed to load module: {u} — {e}]"))
+                                        }
                                     };
                                     (u, r)
                                 })
@@ -4820,7 +5823,11 @@ pub fn collect_module_graph(
                 }
             };
             // Imports resolve against the page URL for inline entries, else the module's own URL.
-            let base = if url.contains("#inline-module-") { page_url.to_string() } else { url.clone() };
+            let base = if url.contains("#inline-module-") {
+                page_url.to_string()
+            } else {
+                url.clone()
+            };
             let specs = extract_specifiers(&body);
             let mut replacements: Vec<(usize, usize, String)> = Vec::new();
             for sp in &specs {
@@ -4828,10 +5835,16 @@ pub fn collect_module_graph(
                     notes.push(format!("[skipped bare import: {}]", sp.spec));
                     continue;
                 }
-                let resolved = match url::Url::parse(&base).ok().and_then(|b| b.join(sp.spec.trim()).ok()) {
+                let resolved = match url::Url::parse(&base)
+                    .ok()
+                    .and_then(|b| b.join(sp.spec.trim()).ok())
+                {
                     Some(u) => u.to_string(),
                     None => {
-                        notes.push(format!("[failed to resolve import: {} (in {url})]", sp.spec));
+                        notes.push(format!(
+                            "[failed to resolve import: {} (in {url})]",
+                            sp.spec
+                        ));
                         continue;
                     }
                 };
@@ -4872,7 +5885,12 @@ pub fn run_modules(doc: dom::Document, page_url: &str) -> (dom::Document, Vec<St
     // On-demand fetcher for dynamic imports of modules not in the pre-fetched static graph.
     // Called only on the JS isolate's own worker thread, so blocking `net::fetch` is fine here.
     let fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send> = Box::new(|u: &str| {
-        net::fetch(u).ok().map(|r| (String::from_utf8_lossy(&r.body).into_owned(), r.content_type))
+        net::fetch(u).ok().map(|r| {
+            (
+                String::from_utf8_lossy(&r.body).into_owned(),
+                r.content_type,
+            )
+        })
     });
     let request_fetcher = build_request_fetcher();
     let (doc, results) = js::run_modules(doc, page_url, entries, sources, fetcher, request_fetcher);
@@ -4915,7 +5933,10 @@ pub fn run_scripts(doc: dom::Document, base: &str) -> (dom::Document, Vec<String
         match item {
             ScriptSource::Inline(src) => {
                 if src.len() > MAX_SCRIPT_BYTES {
-                    slots.push(Slot::Note(format!("[skipped large script: {} bytes]", src.len())));
+                    slots.push(Slot::Note(format!(
+                        "[skipped large script: {} bytes]",
+                        src.len()
+                    )));
                 } else {
                     slots.push(Slot::Source(sources.len()));
                     sources.push(src);
@@ -4930,9 +5951,13 @@ pub fn run_scripts(doc: dom::Document, base: &str) -> (dom::Document, Vec<String
                 }
                 fetched += 1;
                 match net::fetch(&url) {
-                    Ok(resp) if resp.body.len() > MAX_SCRIPT_BYTES => slots.push(Slot::Note(
-                        format!("[skipped large script: {} ({} bytes)]", url, resp.body.len()),
-                    )),
+                    Ok(resp) if resp.body.len() > MAX_SCRIPT_BYTES => {
+                        slots.push(Slot::Note(format!(
+                            "[skipped large script: {} ({} bytes)]",
+                            url,
+                            resp.body.len()
+                        )))
+                    }
                     Ok(resp) => {
                         slots.push(Slot::Source(sources.len()));
                         sources.push(String::from_utf8_lossy(&resp.body).into_owned());
@@ -5034,12 +6059,24 @@ fn start_session(
     // idle isolate, and it makes `Engine::console_eval` work on every loaded HTML page.
 
     let fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send> = Box::new(|u: &str| {
-        net::fetch(u).ok().map(|r| (String::from_utf8_lossy(&r.body).into_owned(), r.content_type))
+        net::fetch(u).ok().map(|r| {
+            (
+                String::from_utf8_lossy(&r.body).into_owned(),
+                r.content_type,
+            )
+        })
     });
     let request_fetcher = build_request_fetcher();
     let ws_connector = build_ws_connector();
     let (session, snapshot, results) = js::Session::new(
-        doc, classic, entries, module_sources, base, fetcher, request_fetcher, ws_connector,
+        doc,
+        classic,
+        entries,
+        module_sources,
+        base,
+        fetcher,
+        request_fetcher,
+        ws_connector,
         initial_rects,
     );
     for result in results {
@@ -5180,11 +6217,21 @@ fn draw_console_panel(
 
     // Panel background (slightly darker than the gradient) and a top divider line.
     fb.fill_rect(
-        Rect { x: 0, y: top, w: dw as i32, h: (dh as i32 - top).max(0) },
+        Rect {
+            x: 0,
+            y: top,
+            w: dw as i32,
+            h: (dh as i32 - top).max(0),
+        },
         Color::rgb(14, 15, 20),
     );
     fb.fill_rect(
-        Rect { x: 0, y: top, w: dw as i32, h: (2.0 * scale).max(1.0) as i32 },
+        Rect {
+            x: 0,
+            y: top,
+            w: dw as i32,
+            h: (2.0 * scale).max(1.0) as i32,
+        },
         Color::rgb(60, 120, 160),
     );
 
@@ -5195,7 +6242,15 @@ fn draw_console_panel(
 
     // "console" label just under the divider.
     let mut baseline = top as f32 + label_px + 6.0 * scale;
-    draw_text(fb, font, "console", left, baseline, label_px, Color::rgb(120, 200, 255));
+    draw_text(
+        fb,
+        font,
+        "console",
+        left,
+        baseline,
+        label_px,
+        Color::rgb(120, 200, 255),
+    );
     baseline += line_h;
 
     let max_y = dh as f32;
@@ -5213,7 +6268,16 @@ fn draw_console_panel(
         // Wrap each console line so long output doesn't run off the right edge.
         let mut line_baseline = baseline;
         draw_wrapped_text(
-            fb, font, line, left, &mut line_baseline, line_px, line_h, max_x, max_y, color,
+            fb,
+            font,
+            line,
+            left,
+            &mut line_baseline,
+            line_px,
+            line_h,
+            max_x,
+            max_y,
+            color,
         );
         // Advance past however many wrapped rows this line consumed (at least one).
         baseline = line_baseline.max(baseline + line_h);
@@ -5230,7 +6294,9 @@ mod tests {
     static COLOR_SCHEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn color_scheme_guard() -> std::sync::MutexGuard<'static, ()> {
-        COLOR_SCHEME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        COLOR_SCHEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Column of RGB pixels down the middle of a framebuffer (for comparing renders).
@@ -5264,7 +6330,10 @@ mod tests {
             for x in 0..fb.width {
                 let i = (y * fb.stride) as usize + (x as usize) * 4;
                 let (r, g, b) = (fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]);
-                if (r as i32 - 136).abs() < 30 && (g as i32 - 136).abs() < 30 && (b as i32 - 136).abs() < 30 {
+                if (r as i32 - 136).abs() < 30
+                    && (g as i32 - 136).abs() < 30
+                    && (b as i32 - 136).abs() < 30
+                {
                     gray += 1;
                 }
             }
@@ -5274,7 +6343,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_band, "expected a horizontal band of gray rule pixels for <hr>");
+        assert!(
+            found_band,
+            "expected a horizontal band of gray rule pixels for <hr>"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5301,12 +6373,18 @@ mod tests {
         // Scroll down well past one viewport and re-render.
         e.scroll_by(600.0);
         let scrolled = center_column(e.render()).clone();
-        assert_ne!(top, scrolled, "scrolling a tall page must change the visible content");
+        assert_ne!(
+            top, scrolled,
+            "scrolling a tall page must change the visible content"
+        );
 
         // Scrolling back to the top restores the original view (clamped at 0).
         e.scroll_by(-100000.0);
         let back = center_column(e.render()).clone();
-        assert_eq!(top, back, "scrolling back to the top restores the original render");
+        assert_eq!(
+            top, back,
+            "scrolling back to the top restores the original render"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -5337,7 +6415,11 @@ mod tests {
         };
         // Centre of the box (20,20) is inside the circle → red.
         let (cr, cg, cb) = px(20, 20);
-        assert!(cr > 200 && cg < 60 && cb < 60, "centre should be red, got {:?}", (cr, cg, cb));
+        assert!(
+            cr > 200 && cg < 60 && cb < 60,
+            "centre should be red, got {:?}",
+            (cr, cg, cb)
+        );
         // Corner (1,1) is outside the circle → page background (white), NOT red.
         let (kr, kg, kb) = px(1, 1);
         assert!(
@@ -5380,7 +6462,10 @@ mod tests {
 
         let mut e = Engine::new();
         e.set_viewport(100, 100, 1.0);
-        assert_eq!(e.load_url(&format!("file://{}", dir.join("index.html").display())), 0);
+        assert_eq!(
+            e.load_url(&format!("file://{}", dir.join("index.html").display())),
+            0
+        );
         let fb = e.render();
         let px = |x: u32, y: u32| -> (u8, u8, u8) {
             let i = (y * fb.stride) as usize + (x as usize) * 4;
@@ -5388,7 +6473,11 @@ mod tests {
         };
         // Centre of the 40x40 box is inside the circle → red.
         let (cr, cg, cb) = px(20, 20);
-        assert!(cr > 200 && cg < 60 && cb < 60, "centre should be red, got {:?}", (cr, cg, cb));
+        assert!(
+            cr > 200 && cg < 60 && cb < 60,
+            "centre should be red, got {:?}",
+            (cr, cg, cb)
+        );
         // Corner is outside the circle → page background, NOT red — proving the mask loaded from the
         // sheet-relative `../icons/dot.svg`. If url() resolved against the document the SVG would
         // 404, leaving the whole box red (corner red).
@@ -5413,9 +6502,13 @@ mod tests {
         e.set_viewport(100, 100, 1.0);
         assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
         let fb = e.render();
-        let i = (1 * fb.stride) as usize + 1 * 4;
+        let i = fb.stride as usize + 4;
         let (r, g, b) = (fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]);
-        assert!(r > 200 && g < 60 && b < 60, "unmasked box corner should be red, got {:?}", (r, g, b));
+        assert!(
+            r > 200 && g < 60 && b < 60,
+            "unmasked box corner should be red, got {:?}",
+            (r, g, b)
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5435,7 +6528,10 @@ mod tests {
         // Find the text run for "Hello world" via the same DFS the resolver uses.
         let cache = e.layout_cache.as_ref().expect("layout");
         let runs = collect_text_runs(&cache.root);
-        let run = runs.iter().find(|r| r.text.contains("Hello")).expect("text run");
+        let run = runs
+            .iter()
+            .find(|r| r.text.contains("Hello"))
+            .expect("text run");
         let font = e.font.as_ref().expect("font");
 
         // Left edge of the run (start of "Hello"), at the vertical middle of the run.
@@ -5451,13 +6547,19 @@ mod tests {
         // Selection points are passed pre-scroll (scroll_y == 0 here, so document == viewport).
         e.selection_start(x_start, y_mid);
         e.selection_extend(x_mid, y_mid);
-        assert!(e.has_selection(), "a drag across words must produce a selection");
+        assert!(
+            e.has_selection(),
+            "a drag across words must produce a selection"
+        );
         let sel = e.selected_text();
         assert!(
             sel.starts_with("Hello") && sel.contains("wor"),
             "expected selection to span 'Hello'..'wor', got {sel:?}"
         );
-        assert!(!sel.contains("world"), "selection should stop mid-word, got {sel:?}");
+        assert!(
+            !sel.contains("world"),
+            "selection should stop mid-word, got {sel:?}"
+        );
 
         // Clearing empties the selection.
         e.selection_clear();
@@ -5516,27 +6618,37 @@ mod tests {
         let _ = e.render(); // ensure layout is built + rects pushed
 
         // elementFromPoint inside the box (CSS px, viewport-relative) returns the div.
-        let id = e.console_eval(
-            "var el = document.elementFromPoint(20, 20); el ? el.id : 'null'",
+        let id = e.console_eval("var el = document.elementFromPoint(20, 20); el ? el.id : 'null'");
+        assert_eq!(
+            id, "box",
+            "elementFromPoint(20,20) should return the div#box"
         );
-        assert_eq!(id, "box", "elementFromPoint(20,20) should return the div#box");
 
         // A point outside the viewport yields null.
         let outside = e.console_eval("document.elementFromPoint(-5, 5) === null");
-        assert_eq!(outside, "true", "elementFromPoint outside the viewport is null");
+        assert_eq!(
+            outside, "true",
+            "elementFromPoint outside the viewport is null"
+        );
 
         // caretPositionFromPoint throws TypeError with too few arguments (arity check).
         let arity = e.console_eval(
             "var t = false; try { document.caretPositionFromPoint(); } catch (e) { t = (e instanceof TypeError); } t",
         );
-        assert_eq!(arity, "true", "caretPositionFromPoint() with no args throws TypeError");
+        assert_eq!(
+            arity, "true",
+            "caretPositionFromPoint() with no args throws TypeError"
+        );
 
         // caretRangeFromPoint(0, 0) returns a collapsed Range with offsets 0/0.
         let range = e.console_eval(
             "var r = document.caretRangeFromPoint(0, 0); \
              (r instanceof Range) + ',' + r.startOffset + ',' + r.endOffset + ',' + r.collapsed",
         );
-        assert_eq!(range, "true,0,0,true", "caretRangeFromPoint(0,0) is a collapsed Range at 0/0");
+        assert_eq!(
+            range, "true,0,0,true",
+            "caretRangeFromPoint(0,0) is a collapsed Range at 0/0"
+        );
 
         // caretPositionFromPoint over the box returns a CaretPosition whose offsetNode is contained
         // by the div (the text node "hello" or the div itself).
@@ -5544,7 +6656,10 @@ mod tests {
             "var p = document.caretPositionFromPoint(20, 20); \
              (p instanceof CaretPosition) + ',' + (p && document.getElementById('box').contains(p.offsetNode))",
         );
-        assert_eq!(caret, "true,true", "caretPositionFromPoint over the box returns a CaretPosition inside it");
+        assert_eq!(
+            caret, "true,true",
+            "caretPositionFromPoint over the box returns a CaretPosition inside it"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -5615,8 +6730,10 @@ mod tests {
     /// by a parallel test mid-render.
     fn canvas_top_left(html: &str, os_dark: bool) -> (u8, u8, u8) {
         let _g = color_scheme_guard();
-        let path = std::env::temp_dir()
-            .join(format!("browser_color_scheme_canvas_{}.html", rand_suffix()));
+        let path = std::env::temp_dir().join(format!(
+            "browser_color_scheme_canvas_{}.html",
+            rand_suffix()
+        ));
         std::fs::write(&path, html).unwrap();
         let mut e = Engine::new();
         e.set_viewport(200, 200, 1.0);
@@ -5630,17 +6747,29 @@ mod tests {
 
     fn rand_suffix() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     }
 
     #[test]
     fn color_scheme_dark_gives_dark_canvas() {
         // `color-scheme: dark` (only dark) → dark canvas regardless of OS flag.
         let html = "<html style=\"color-scheme: dark\"><body>hi</body></html>";
-        assert_eq!(canvas_top_left(html, true), (0x1e, 0x1e, 0x1e), "dark canvas in Dark OS");
-        assert_eq!(canvas_top_left(html, false), (0x1e, 0x1e, 0x1e), "dark canvas in Light OS");
+        assert_eq!(
+            canvas_top_left(html, true),
+            (0x1e, 0x1e, 0x1e),
+            "dark canvas in Dark OS"
+        );
+        assert_eq!(
+            canvas_top_left(html, false),
+            (0x1e, 0x1e, 0x1e),
+            "dark canvas in Light OS"
+        );
         // Via :root { color-scheme: dark } too.
-        let html2 = "<html><head><style>:root{color-scheme:dark}</style></head><body>hi</body></html>";
+        let html2 =
+            "<html><head><style>:root{color-scheme:dark}</style></head><body>hi</body></html>";
         assert_eq!(canvas_top_left(html2, true), (0x1e, 0x1e, 0x1e));
     }
 
@@ -5648,19 +6777,35 @@ mod tests {
     fn color_scheme_light_or_unset_stays_white() {
         // Only-light → white canvas regardless of OS flag.
         let light = "<html style=\"color-scheme: light\"><body>hi</body></html>";
-        assert_eq!(canvas_top_left(light, true), (0xff, 0xff, 0xff), "light stays white in Dark OS");
+        assert_eq!(
+            canvas_top_left(light, true),
+            (0xff, 0xff, 0xff),
+            "light stays white in Dark OS"
+        );
         assert_eq!(canvas_top_left(light, false), (0xff, 0xff, 0xff));
         // Unset → white canvas even when the OS is dark (no opt-in).
         let unset = "<html><body>hi</body></html>";
-        assert_eq!(canvas_top_left(unset, true), (0xff, 0xff, 0xff), "no opt-in stays white");
+        assert_eq!(
+            canvas_top_left(unset, true),
+            (0xff, 0xff, 0xff),
+            "no opt-in stays white"
+        );
     }
 
     #[test]
     fn color_scheme_light_dark_follows_os() {
         // `light dark` (both supported) → follow the OS appearance.
         let html = "<html style=\"color-scheme: light dark\"><body>hi</body></html>";
-        assert_eq!(canvas_top_left(html, true), (0x1e, 0x1e, 0x1e), "dark canvas when OS Dark");
-        assert_eq!(canvas_top_left(html, false), (0xff, 0xff, 0xff), "white canvas when OS Light");
+        assert_eq!(
+            canvas_top_left(html, true),
+            (0x1e, 0x1e, 0x1e),
+            "dark canvas when OS Dark"
+        );
+        assert_eq!(
+            canvas_top_left(html, false),
+            (0xff, 0xff, 0xff),
+            "white canvas when OS Light"
+        );
     }
 
     #[test]
@@ -5672,8 +6817,16 @@ mod tests {
             @media (prefers-color-scheme: dark){:root{color-scheme:dark}} \
             body{background:var(--undefined-var)}\
             </style></head><body>hi</body></html>";
-        assert_eq!(canvas_top_left(html, true), (0x1e, 0x1e, 0x1e), "dark canvas when OS Dark");
-        assert_eq!(canvas_top_left(html, false), (0xff, 0xff, 0xff), "white canvas when OS Light");
+        assert_eq!(
+            canvas_top_left(html, true),
+            (0x1e, 0x1e, 0x1e),
+            "dark canvas when OS Dark"
+        );
+        assert_eq!(
+            canvas_top_left(html, false),
+            (0xff, 0xff, 0xff),
+            "white canvas when OS Light"
+        );
     }
 
     #[test]
@@ -5681,19 +6834,27 @@ mod tests {
         let _g = color_scheme_guard();
         // `light dark` page: toggling the OS appearance re-resolves the used scheme on next render.
         let html = "<html style=\"color-scheme: light dark\"><body>hi</body></html>";
-        let path = std::env::temp_dir()
-            .join(format!("browser_color_scheme_toggle_{}.html", rand_suffix()));
+        let path = std::env::temp_dir().join(format!(
+            "browser_color_scheme_toggle_{}.html",
+            rand_suffix()
+        ));
         std::fs::write(&path, html).unwrap();
         let mut e = Engine::new();
         e.set_viewport(200, 200, 1.0);
         e.set_color_scheme(false);
         assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
         let fb = e.render();
-        assert_eq!((fb.pixels[0], fb.pixels[1], fb.pixels[2]), (0xff, 0xff, 0xff));
+        assert_eq!(
+            (fb.pixels[0], fb.pixels[1], fb.pixels[2]),
+            (0xff, 0xff, 0xff)
+        );
         // Flip to Dark — the cascade re-runs and the canvas goes dark.
         e.set_color_scheme(true);
         let fb = e.render();
-        assert_eq!((fb.pixels[0], fb.pixels[1], fb.pixels[2]), (0x1e, 0x1e, 0x1e));
+        assert_eq!(
+            (fb.pixels[0], fb.pixels[1], fb.pixels[2]),
+            (0x1e, 0x1e, 0x1e)
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5712,7 +6873,10 @@ mod tests {
         let _ = e.render();
 
         // Focus the input (click-to-focus is fiddly for an empty zero-width control in a test).
-        assert!(e.focus_first_text_field(), "page must have an editable text field");
+        assert!(
+            e.focus_first_text_field(),
+            "page must have an editable text field"
+        );
         let f = e.focused_node_for_test().expect("focused node");
         assert!(e.has_text_focus(), "an input must report text focus");
 
@@ -5749,9 +6913,15 @@ mod tests {
         assert!(e.node_attr(c, "checked").is_none(), "starts unchecked");
         let (cx, cy) = e.node_center_device(c).expect("checkbox laid out");
 
-        assert!(e.dispatch_click(cx, cy), "clicking the checkbox warrants a re-render");
+        assert!(
+            e.dispatch_click(cx, cy),
+            "clicking the checkbox warrants a re-render"
+        );
         let c2 = e.node_by_attr_id("c").expect("checkbox node");
-        assert!(e.node_attr(c2, "checked").is_some(), "checkbox should be checked after click");
+        assert!(
+            e.node_attr(c2, "checked").is_some(),
+            "checkbox should be checked after click"
+        );
         // The page's change handler set a body attribute.
         let body = e.node_by_attr_id("__nope__"); // sanity: missing id returns None
         assert!(body.is_none());
@@ -5824,7 +6994,12 @@ mod tests {
             let (mut sum, mut cnt) = (0.0f32, 0.0f32);
             for y in r.y as i32..(r.y + r.height) as i32 {
                 for x in r.x as i32..(r.x + r.width) as i32 {
-                    if x >= 0 && y >= 0 && x < fb.width as i32 && y < fb.height as i32 && px_at(&e, x, y) != bg {
+                    if x >= 0
+                        && y >= 0
+                        && x < fb.width as i32
+                        && y < fb.height as i32
+                        && px_at(&e, x, y) != bg
+                    {
                         sum += x as f32;
                         cnt += 1.0;
                     }
@@ -5835,7 +7010,10 @@ mod tests {
         };
         let lo = centroid_x("lo");
         let hi = centroid_x("hi");
-        assert!(hi > lo + 10.0, "thumb should move right with value: lo={lo}, hi={hi}");
+        assert!(
+            hi > lo + 10.0,
+            "thumb should move right with value: lo={lo}, hi={hi}"
+        );
     }
 
     #[test]
@@ -5845,9 +7023,15 @@ mod tests {
         let n = e.node_by_attr_id("c").unwrap();
         let r = e.node_device_rect(n).unwrap();
         // The swatch center should be ≈ #3366ff.
-        let (cr, cg, cb) = px_at(&e, (r.x + r.width / 2.0) as i32, (r.y + r.height / 2.0) as i32);
+        let (cr, cg, cb) = px_at(
+            &e,
+            (r.x + r.width / 2.0) as i32,
+            (r.y + r.height / 2.0) as i32,
+        );
         assert!(
-            (cr as i32 - 0x33).abs() < 24 && (cg as i32 - 0x66).abs() < 24 && (cb as i32 - 0xff).abs() < 24,
+            (cr as i32 - 0x33).abs() < 24
+                && (cg as i32 - 0x66).abs() < 24
+                && (cb as i32 - 0xff).abs() < 24,
             "swatch center {:?} should be ~#3366ff",
             (cr, cg, cb)
         );
@@ -5896,8 +7080,14 @@ mod tests {
         let ur = e.node_device_rect(u).unwrap();
         let cr = e.node_device_rect(c).unwrap();
         // Both paint a visible box.
-        assert!(painted_pixels_in(&e, ur) > 0, "unchecked checkbox painted nothing");
-        assert!(painted_pixels_in(&e, cr) > 0, "checked checkbox painted nothing");
+        assert!(
+            painted_pixels_in(&e, ur) > 0,
+            "unchecked checkbox painted nothing"
+        );
+        assert!(
+            painted_pixels_in(&e, cr) > 0,
+            "checked checkbox painted nothing"
+        );
         // The checked one (filled accent + check) has more painted/colored pixels than the empty one.
         assert!(
             painted_pixels_in(&e, cr) > painted_pixels_in(&e, ur),
@@ -5917,13 +7107,19 @@ mod tests {
         let lbl = e.node_by_attr_id("lbl").expect("label node");
         // The label now lays out with a real, non-zero box (was 0x0 before).
         let r = e.node_device_rect(lbl).expect("label laid out");
-        assert!(r.width > 0.0 && r.height > 0.0, "label should have a non-zero rect: {r:?}");
+        assert!(
+            r.width > 0.0 && r.height > 0.0,
+            "label should have a non-zero rect: {r:?}"
+        );
 
         let cb = e.node_by_attr_id("cb").unwrap();
         assert!(e.node_attr(cb, "checked").is_none(), "starts unchecked");
         // Click the center of the label → the for= target checkbox toggles on.
         let (lx, ly) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
-        assert!(e.dispatch_click(lx, ly), "clicking the label warrants a re-render");
+        assert!(
+            e.dispatch_click(lx, ly),
+            "clicking the label warrants a re-render"
+        );
         let cb2 = e.node_by_attr_id("cb").unwrap();
         assert!(
             e.node_attr(cb2, "checked").is_some(),
@@ -5950,14 +7146,20 @@ mod tests {
 
         let m = e.node_by_attr_id("m").expect("menu node");
         let (cx, cy) = e.node_center_device(m).expect("menu laid out");
-        assert!(e.dispatch_move(cx, cy), "moving over a new node should change hover");
+        assert!(
+            e.dispatch_move(cx, cy),
+            "moving over a new node should change hover"
+        );
         assert_eq!(e.visible_attr_body("data-hover").as_deref(), Some("yes"));
 
         // Moving again to the same node is a cheap no-op (returns false).
         let _ = e.render();
         let m2 = e.node_by_attr_id("m").expect("menu node");
         let (cx2, cy2) = e.node_center_device(m2).expect("menu laid out");
-        assert!(!e.dispatch_move(cx2, cy2), "hovering the same node again is a no-op");
+        assert!(
+            !e.dispatch_move(cx2, cy2),
+            "hovering the same node again is a no-op"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -5991,7 +7193,10 @@ mod tests {
             Some("yes"),
             "clicking outside the field should fire blur"
         );
-        assert!(e.focused_node_for_test().is_none(), "focus cleared after clicking outside");
+        assert!(
+            e.focused_node_for_test().is_none(),
+            "focus cleared after clicking outside"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -6021,15 +7226,27 @@ mod tests {
         let (cx, cy) = e.node_center_device(s).expect("select laid out");
 
         // select_at over the laid-out <select> returns its three options + selected index (Banana).
-        let hit = e.select_at(cx, cy).expect("click on <select> returns a SelectHit");
+        let hit = e
+            .select_at(cx, cy)
+            .expect("click on <select> returns a SelectHit");
         assert_eq!(hit.node_id, s.0);
-        assert_eq!(hit.options, vec!["Apple".to_string(), "Banana".to_string(), "Cherry".to_string()]);
+        assert_eq!(
+            hit.options,
+            vec![
+                "Apple".to_string(),
+                "Banana".to_string(),
+                "Cherry".to_string()
+            ]
+        );
         assert_eq!(hit.selected, 1, "Banana is the pre-selected option");
         assert!(hit.width > 0.0 && hit.height > 0.0, "rect has a size");
 
         // Picking Cherry changes the selection, fires change (handler stamps body), and is reflected
         // by a fresh select_at (now selected index 2).
-        assert!(e.set_select_index(s.0, 2), "selecting a different option changes it");
+        assert!(
+            e.set_select_index(s.0, 2),
+            "selecting a different option changes it"
+        );
         assert_eq!(
             e.visible_attr_body("data-changed").as_deref(),
             Some("c"),
@@ -6042,22 +7259,36 @@ mod tests {
         assert_eq!(hit2.selected, 2, "Cherry is now selected");
 
         // Re-selecting the same option reports no change.
-        assert!(!e.set_select_index(s2.0, 2), "re-picking the current option is a no-op");
+        assert!(
+            !e.set_select_index(s2.0, 2),
+            "re-picking the current option is a no-op"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
 
     fn base64_encode(data: &[u8]) -> String {
-        const A: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in data.chunks(3) {
-            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
             let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
             out.push(A[(n >> 18 & 63) as usize] as char);
             out.push(A[(n >> 12 & 63) as usize] as char);
-            out.push(if chunk.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
-            out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 1 {
+                A[(n >> 6 & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                A[(n & 63) as usize] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -6172,7 +7403,8 @@ mod tests {
 
     #[test]
     fn runs_inline_scripts_and_captures_console() {
-        let doc = html::parse(r#"<html><body><script>console.log("hi", 6*7)</script></body></html>"#);
+        let doc =
+            html::parse(r#"<html><body><script>console.log("hi", 6*7)</script></body></html>"#);
         let (_doc, console) = run_scripts(doc, "https://example.com/");
         assert!(
             console.iter().any(|l| l == "hi 42"),
@@ -6218,7 +7450,10 @@ mod tests {
         // Fragment-only and javascript: are not fetchable.
         assert_eq!(resolve_url("https://a.com/x/y.html", "#frag"), None);
         assert_eq!(resolve_url("https://a.com/x/y.html", "javascript:0"), None);
-        assert_eq!(resolve_url("https://a.com/x/y.html", "data:text/css,a{}"), None);
+        assert_eq!(
+            resolve_url("https://a.com/x/y.html", "data:text/css,a{}"),
+            None
+        );
         assert_eq!(resolve_url("https://a.com/x/y.html", ""), None);
     }
 
@@ -6268,13 +7503,22 @@ mod tests {
         let doc = html::parse(
             r#"<html><head><base href="https://cdn.example/assets/"></head><body></body></html>"#,
         );
-        assert_eq!(base_url(&doc, "https://orig.com/page.html"), "https://cdn.example/assets/");
+        assert_eq!(
+            base_url(&doc, "https://orig.com/page.html"),
+            "https://cdn.example/assets/"
+        );
         // A relative <base href> resolves against the response URL.
         let doc2 = html::parse(r#"<html><head><base href="/sub/"></head></html>"#);
-        assert_eq!(base_url(&doc2, "https://orig.com/a/b.html"), "https://orig.com/sub/");
+        assert_eq!(
+            base_url(&doc2, "https://orig.com/a/b.html"),
+            "https://orig.com/sub/"
+        );
         // No <base>: falls back to the response URL.
         let doc3 = html::parse("<html><head></head></html>");
-        assert_eq!(base_url(&doc3, "https://orig.com/a/b.html"), "https://orig.com/a/b.html");
+        assert_eq!(
+            base_url(&doc3, "https://orig.com/a/b.html"),
+            "https://orig.com/a/b.html"
+        );
     }
 
     #[test]
@@ -6301,7 +7545,10 @@ mod tests {
         assert!(console.is_empty(), "unexpected notes: {console:?}");
         // The external sheet (second) carries the `p` rule from the file.
         assert!(
-            sheets[1].rules.iter().any(|r| r.selectors.iter().any(|s| s.contains('p'))),
+            sheets[1]
+                .rules
+                .iter()
+                .any(|r| r.selectors.iter().any(|s| s.contains('p'))),
             "external sheet not parsed: {:?}",
             sheets[1]
         );
@@ -6321,7 +7568,11 @@ mod tests {
         std::fs::write(&tokens_path, ".token { color: #111111 }").unwrap();
         // main.css imports tokens.css (relative) then defines `.main`.
         let main_path = dir.join("main.css");
-        std::fs::write(&main_path, "@import \"tokens.css\";\n.main { color: #222222 }").unwrap();
+        std::fs::write(
+            &main_path,
+            "@import \"tokens.css\";\n.main { color: #222222 }",
+        )
+        .unwrap();
 
         let css_url = format!("file://{}", main_path.display());
         let base = format!("file://{}/page.html", dir.display());
@@ -6335,11 +7586,17 @@ mod tests {
         assert_eq!(sheets.len(), 2, "console: {console:?}");
         assert!(console.is_empty(), "unexpected notes: {console:?}");
         assert!(
-            sheets[0].rules.iter().any(|r| r.selectors.iter().any(|s| s == ".token")),
+            sheets[0]
+                .rules
+                .iter()
+                .any(|r| r.selectors.iter().any(|s| s == ".token")),
             "imported tokens.css should come first: {sheets:?}"
         );
         assert!(
-            sheets[1].rules.iter().any(|r| r.selectors.iter().any(|s| s == ".main")),
+            sheets[1]
+                .rules
+                .iter()
+                .any(|r| r.selectors.iter().any(|s| s == ".main")),
             "importer main.css should come second: {sheets:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -6347,9 +7604,15 @@ mod tests {
 
     #[test]
     fn script_errors_are_captured_as_warnings() {
-        let doc = html::parse(r#"<html><body><script>throw new Error("boom")</script></body></html>"#);
+        let doc =
+            html::parse(r#"<html><body><script>throw new Error("boom")</script></body></html>"#);
         let (_doc, console) = run_scripts(doc, "https://example.com/");
-        assert!(console.iter().any(|l| l.starts_with('⚠') && l.contains("boom")), "got {console:?}");
+        assert!(
+            console
+                .iter()
+                .any(|l| l.starts_with('⚠') && l.contains("boom")),
+            "got {console:?}"
+        );
     }
 
     #[test]
@@ -6384,7 +7647,7 @@ mod tests {
         let computed = style::cascade(&doc, &sheets);
 
         // Find the <h1> and <p> nodes.
-        fn find<'a>(doc: &'a dom::Document, tag: &str) -> dom::NodeId {
+        fn find(doc: &dom::Document, tag: &str) -> dom::NodeId {
             fn walk(doc: &dom::Document, id: dom::NodeId, tag: &str) -> Option<dom::NodeId> {
                 if let dom::NodeData::Element(e) = &doc.get(id).data {
                     if e.tag == tag {
@@ -6459,7 +7722,21 @@ mod tests {
         let mut fb = Framebuffer::new(400, 300);
         let images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &no_canvas, &no_canvas, &no_canvas, &[], &mut 0);
+        paint_box(
+            &mut fb,
+            &NoFont,
+            &root,
+            16.0,
+            28.0,
+            28.0,
+            300.0,
+            &images,
+            &no_canvas,
+            &no_canvas,
+            &no_canvas,
+            &[],
+            &mut 0,
+        );
 
         // The root box should exist; with the parallel layout stub it may have no children yet,
         // so only assert the path completed and the root carries the viewport width.
@@ -6498,12 +7775,27 @@ mod tests {
             let doc = html::parse(&html);
             let (sheets, _c) = collect_stylesheets(&doc, "https://example.com/");
             let computed = style::cascade(&doc, &sheets);
-            let root = layout::layout_document(&doc, &computed, 100.0, 200.0, &M, &HashMap::new(), None);
+            let root =
+                layout::layout_document(&doc, &computed, 100.0, 200.0, &M, &HashMap::new(), None);
             let mut fb = Framebuffer::new(100, 100);
             paint_gradient(&mut fb);
             let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
             let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &no_canvas, &no_canvas, &no_canvas, &[], &mut 0);
+            paint_box(
+                &mut fb,
+                &NoFont,
+                &root,
+                0.0,
+                0.0,
+                0.0,
+                200.0,
+                &imgs,
+                &no_canvas,
+                &no_canvas,
+                &no_canvas,
+                &[],
+                &mut 0,
+            );
             // Sample a pixel inside the div.
             let i = (50 * fb.stride + 50 * 4) as usize;
             [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
@@ -6515,8 +7807,17 @@ mod tests {
         assert!(opaque[0] > 240, "opaque white r={}", opaque[0]);
         // Half opacity → blended with the dark gradient → noticeably darker than opaque white,
         // but lighter than the bare gradient (which is < ~50).
-        assert!(half[0] < opaque[0], "half {:?} should be darker than opaque {:?}", half, opaque);
-        assert!(half[0] > 80, "half white over dark should still be fairly light, r={}", half[0]);
+        assert!(
+            half[0] < opaque[0],
+            "half {:?} should be darker than opaque {:?}",
+            half,
+            opaque
+        );
+        assert!(
+            half[0] > 80,
+            "half white over dark should still be fairly light, r={}",
+            half[0]
+        );
     }
 
     // A no-op text measurer/font used by the paint render tests below.
@@ -6544,12 +7845,34 @@ mod tests {
         let doc = html::parse(html);
         let (sheets, _c) = collect_stylesheets(&doc, "https://example.com/");
         let computed = style::cascade(&doc, &sheets);
-        let root = layout::layout_document(&doc, &computed, w as f32, h as f32, &TM, &HashMap::new(), None);
+        let root = layout::layout_document(
+            &doc,
+            &computed,
+            w as f32,
+            h as f32,
+            &TM,
+            &HashMap::new(),
+            None,
+        );
         let mut fb = Framebuffer::new(w, h);
         fb.clear(Color::BLACK);
         let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &no_canvas, &no_canvas, &no_canvas, &[], &mut 0);
+        paint_box(
+            &mut fb,
+            &NF,
+            &root,
+            0.0,
+            0.0,
+            0.0,
+            h as f32,
+            &imgs,
+            &no_canvas,
+            &no_canvas,
+            &no_canvas,
+            &[],
+            &mut 0,
+        );
         fb
     }
 
@@ -6564,12 +7887,16 @@ mod tests {
         // white.
         let fb = render_html(
             r#"<html><body><div style="height:60px; background: linear-gradient(to right, rgb(0,0,0), rgb(255,255,255))"></div></body></html>"#,
-            200, 80,
+            200,
+            80,
         );
         let left = px_rgb(&fb, 2, 30);
         let right = px_rgb(&fb, 197, 30);
         assert!(left[0] < 40, "left edge should be near black, got {left:?}");
-        assert!(right[0] > 215, "right edge should be near white, got {right:?}");
+        assert!(
+            right[0] > 215,
+            "right edge should be near white, got {right:?}"
+        );
         assert!(right[0] > left[0] + 150, "gradient should ramp dark→light");
     }
 
@@ -6580,12 +7907,16 @@ mod tests {
         // top-left corner stays background-black.
         let fb = render_html(
             r#"<html><body><div style="width:40px; height:40px; margin:20px; background:rgb(0,0,255); box-shadow: 12px 12px 0px rgb(255,0,0)"></div></body></html>"#,
-            120, 120,
+            120,
+            120,
         );
         // The box occupies roughly x∈[20,60], y∈[20,60] (margin 20). Shadow offset +12,+12.
         // Sample a point inside the shadow but outside the box (e.g. x=66, y=66).
         let shadow = px_rgb(&fb, 66, 66);
-        assert!(shadow[0] > 100, "expected red-ish shadow outside the box, got {shadow:?}");
+        assert!(
+            shadow[0] > 100,
+            "expected red-ish shadow outside the box, got {shadow:?}"
+        );
         // Far above-left of everything: untouched background.
         let bg = px_rgb(&fb, 5, 5);
         assert_eq!(bg, [0, 0, 0], "top-left should be background black");
@@ -6597,11 +7928,13 @@ mod tests {
         // pixels shifted right by ~40px.
         let base = render_html(
             r#"<html><body><div style="width:30px; height:30px; background:rgb(0,200,0)"></div></body></html>"#,
-            200, 60,
+            200,
+            60,
         );
         let moved = render_html(
             r#"<html><body><div style="width:30px; height:30px; background:rgb(0,200,0); transform: translate(40px,0)"></div></body></html>"#,
-            200, 60,
+            200,
+            60,
         );
         // Find the rightmost green pixel on row y=15 in each render.
         let rightmost_green = |fb: &Framebuffer| -> i32 {
@@ -6617,7 +7950,10 @@ mod tests {
         let b = rightmost_green(&base);
         let m = rightmost_green(&moved);
         assert!(b >= 0 && m >= 0, "green not found base={b} moved={m}");
-        assert!((m - b - 40).abs() <= 3, "translate should shift ~40px: base={b} moved={m}");
+        assert!(
+            (m - b - 40).abs() <= 3,
+            "translate should shift ~40px: base={b} moved={m}"
+        );
     }
 
     // Count colored (non-black) pixels on a given row within an x range.
@@ -6639,11 +7975,13 @@ mod tests {
         // horizontal colored line; a plain run must not.
         let underlined = render_html(
             r#"<html><body style="margin:0"><span style="text-decoration:underline; color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
-            200, 60,
+            200,
+            60,
         );
         let plain = render_html(
             r#"<html><body style="margin:0"><span style="color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
-            200, 60,
+            200,
+            60,
         );
         // The run sits on the first line; baseline ≈ 20*0.8 = 16, underline just below it.
         let mut found_underline = false;
@@ -6658,18 +7996,23 @@ mod tests {
         for y in 0..60 {
             plain_colored += colored_on_row(&plain, y, 0, 60);
         }
-        assert_eq!(plain_colored, 0, "undecorated text should paint no line, got {plain_colored} px");
+        assert_eq!(
+            plain_colored, 0,
+            "undecorated text should paint no line, got {plain_colored} px"
+        );
     }
 
     #[test]
     fn line_through_and_overline_paint_at_distinct_heights() {
         let strike = render_html(
             r#"<html><body style="margin:0"><span style="text-decoration:line-through; color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
-            200, 60,
+            200,
+            60,
         );
         let over = render_html(
             r#"<html><body style="margin:0"><span style="text-decoration:overline; color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
-            200, 60,
+            200,
+            60,
         );
         let row_of = |fb: &Framebuffer| -> i32 {
             for y in 0..40 {
@@ -6684,14 +8027,18 @@ mod tests {
         assert!(strike_y >= 0, "line-through not painted");
         assert!(over_y >= 0, "overline not painted");
         // Overline sits clearly above the strike-through (which crosses the x-height middle).
-        assert!(over_y < strike_y, "overline ({over_y}) should be above line-through ({strike_y})");
+        assert!(
+            over_y < strike_y,
+            "overline ({over_y}) should be above line-through ({strike_y})"
+        );
     }
 
     #[test]
     fn mark_paints_yellow_behind_the_text() {
         let fb = render_html(
             r#"<html><body style="margin:0"><mark>hi</mark></body></html>"#,
-            200, 60,
+            200,
+            60,
         );
         // Scan the top line for yellow (#ffff00) pixels behind the run.
         let mut yellow = 0;
@@ -6703,7 +8050,10 @@ mod tests {
                 }
             }
         }
-        assert!(yellow > 20, "expected a yellow mark highlight band, got {yellow} px");
+        assert!(
+            yellow > 20,
+            "expected a yellow mark highlight band, got {yellow} px"
+        );
     }
 
     #[test]
@@ -6714,11 +8064,13 @@ mod tests {
         // line we can locate.
         let normal = render_html(
             r#"<html><body style="margin:0"><span style="text-decoration:underline; color:rgb(255,255,255); font-size:20px">x</span></body></html>"#,
-            120, 80,
+            120,
+            80,
         );
         let supscript = render_html(
             r#"<html><body style="margin:0"><sup style="text-decoration:underline; color:rgb(255,255,255); font-size:20px">x</sup></body></html>"#,
-            120, 80,
+            120,
+            80,
         );
         let top_y = |fb: &Framebuffer| -> i32 {
             for y in 0..80 {
@@ -6731,7 +8083,10 @@ mod tests {
         let n = top_y(&normal);
         let s = top_y(&supscript);
         assert!(n >= 0 && s >= 0, "lines not found normal={n} sup={s}");
-        assert!(s < n, "superscript run ({s}) should sit above the normal run ({n})");
+        assert!(
+            s < n,
+            "superscript run ({s}) should sit above the normal run ({n})"
+        );
     }
 
     #[test]
@@ -6772,9 +8127,7 @@ mod tests {
         buf.save(&png_path).unwrap();
 
         let img_url = format!("file://{}", png_path.display());
-        let html = format!(
-            r#"<html><body><img src="{img_url}"></body></html>"#
-        );
+        let html = format!(r#"<html><body><img src="{img_url}"></body></html>"#);
         let html_path = dir.join("page.html");
         std::fs::write(&html_path, html).unwrap();
 
@@ -6790,7 +8143,8 @@ mod tests {
         // re-running layout with the same intrinsic map the engine builds.
         let body = std::fs::read_to_string(&html_path).unwrap();
         let doc = html::parse(&body);
-        let (sheets, _console) = collect_stylesheets(&doc, &format!("file://{}", html_path.display()));
+        let (sheets, _console) =
+            collect_stylesheets(&doc, &format!("file://{}", html_path.display()));
         let computed = style::cascade(&doc, &sheets);
         let base = base_url(&doc, &format!("file://{}", html_path.display()));
         let mut console = Vec::new();
@@ -6846,14 +8200,25 @@ mod tests {
                </body></html>"#,
         );
         let entries = collect_module_entries(&doc, "https://x.com/page/");
-        assert_eq!(entries.len(), 2, "classic script must be excluded: {entries:?}");
-        assert_eq!(entries[0], ModuleEntry::External("https://x.com/app.js".to_string()));
+        assert_eq!(
+            entries.len(),
+            2,
+            "classic script must be excluded: {entries:?}"
+        );
+        assert_eq!(
+            entries[0],
+            ModuleEntry::External("https://x.com/app.js".to_string())
+        );
         assert!(matches!(&entries[1], ModuleEntry::Inline(s) if s.contains("./side.js")));
         // Classic scripts are NOT collected as modules.
         let classic = collect_script_sources(&doc, "https://x.com/page/");
-        assert!(classic.iter().any(|s| matches!(s, ScriptSource::External(u) if u.ends_with("classic.js"))));
+        assert!(classic
+            .iter()
+            .any(|s| matches!(s, ScriptSource::External(u) if u.ends_with("classic.js"))));
         // ...and the module scripts are skipped by the classic collector.
-        assert!(!classic.iter().any(|s| matches!(s, ScriptSource::External(u) if u.ends_with("app.js"))));
+        assert!(!classic
+            .iter()
+            .any(|s| matches!(s, ScriptSource::External(u) if u.ends_with("app.js"))));
     }
 
     #[test]
@@ -6922,7 +8287,9 @@ mod tests {
         );
         // The bare `vue` import is recorded as skipped (and left intact / unresolved).
         assert!(
-            notes.iter().any(|n| n.contains("[skipped bare import: vue]")),
+            notes
+                .iter()
+                .any(|n| n.contains("[skipped bare import: vue]")),
             "expected bare-import note, got {notes:?}"
         );
     }
@@ -6952,7 +8319,11 @@ mod tests {
         let _ = e.render();
 
         // Target is ~2000px down; the 300px viewport at the top can't see it → not intersecting.
-        assert_eq!(e.body_attr("data-seen"), None, "target must not be seen at the top");
+        assert_eq!(
+            e.body_attr("data-seen"),
+            None,
+            "target must not be seen at the top"
+        );
 
         // Scroll down past the spacer so the target enters the viewport, then tick to re-evaluate.
         e.scroll_by(2000.0);
@@ -6965,7 +8336,10 @@ mod tests {
                 break;
             }
         }
-        assert!(fired, "IntersectionObserver callback must fire once the target scrolls into view");
+        assert!(
+            fired,
+            "IntersectionObserver callback must fire once the target scrolls into view"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -7003,7 +8377,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
             e.tick();
         }
-        assert!(closed, "WebSocket to an unreachable host must fire onclose with readyState 3");
+        assert!(
+            closed,
+            "WebSocket to an unreachable host must fire onclose with readyState 3"
+        );
         assert_eq!(
             e.console_eval("String(window.__wsErr)"),
             "1",
@@ -7038,7 +8415,10 @@ mod tests {
 
         // Initial observation must have fired with the initial (200-wide) box.
         let initial = e.body_attr("data-w");
-        assert!(initial.is_some(), "ResizeObserver must deliver an initial size, got {initial:?}");
+        assert!(
+            initial.is_some(),
+            "ResizeObserver must deliver an initial size, got {initial:?}"
+        );
 
         // Widen the viewport so the full-width block reflows to ~400px wide.
         e.set_viewport(400, 300, 1.0);
@@ -7095,22 +8475,44 @@ mod tests {
         let ref_fb_center = center_column(reference.render()).clone();
 
         // Streaming: install a frame callback that counts invocations + records last dims.
-        let mut probe = FrameProbe { count: 0, last_w: 0, last_h: 0 };
+        let mut probe = FrameProbe {
+            count: 0,
+            last_w: 0,
+            last_h: 0,
+        };
         let mut e = Engine::new();
         e.set_viewport(200, 150, 2.0);
-        e.set_frame_callback(Some((probe_cb, &mut probe as *mut FrameProbe as *mut std::ffi::c_void)));
+        e.set_frame_callback(Some((
+            probe_cb,
+            &mut probe as *mut FrameProbe as *mut std::ffi::c_void,
+        )));
         assert_eq!(e.load_url(&url), 0);
 
         // file:// delivers one chunk → at least the first partial frame + the final frame.
-        assert!(probe.count >= 1, "frame callback must fire at least once, got {}", probe.count);
+        assert!(
+            probe.count >= 1,
+            "frame callback must fire at least once, got {}",
+            probe.count
+        );
         // The last frame's dims are the device viewport (200*2 x 150*2).
-        assert_eq!((probe.last_w, probe.last_h), (400, 300), "final frame dims = device viewport");
+        assert_eq!(
+            (probe.last_w, probe.last_h),
+            (400, 300),
+            "final frame dims = device viewport"
+        );
 
         // The FINAL state/render is byte-for-byte the non-streaming result (streaming only adds
         // earlier partial frames).
-        assert_eq!(e.visible_text(), ref_text, "streamed final text matches non-streaming");
+        assert_eq!(
+            e.visible_text(),
+            ref_text,
+            "streamed final text matches non-streaming"
+        );
         let stream_fb_center = center_column(e.render()).clone();
-        assert_eq!(stream_fb_center, ref_fb_center, "streamed final render matches non-streaming");
+        assert_eq!(
+            stream_fb_center, ref_fb_center,
+            "streamed final render matches non-streaming"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -7128,8 +8530,14 @@ mod tests {
         assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
         let _ = e.render();
         let text = e.visible_text();
-        assert!(text.contains("Title"), "visible text must contain the heading: {text:?}");
-        assert!(text.contains("Body text here."), "visible text must contain the paragraph: {text:?}");
+        assert!(
+            text.contains("Title"),
+            "visible text must contain the heading: {text:?}"
+        );
+        assert!(
+            text.contains("Body text here."),
+            "visible text must contain the paragraph: {text:?}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -7147,8 +8555,14 @@ mod tests {
 
         let json = e.dom_tree_json();
         // Structure: root is <html> with type "element".
-        assert!(json.starts_with("{\"id\":"), "tree must start with a node object: {json}");
-        assert!(json.contains("\"type\":\"element\""), "elements tagged: {json}");
+        assert!(
+            json.starts_with("{\"id\":"),
+            "tree must start with a node object: {json}"
+        );
+        assert!(
+            json.contains("\"type\":\"element\""),
+            "elements tagged: {json}"
+        );
         assert!(json.contains("\"tag\":\"html\""), "root tag html: {json}");
         assert!(json.contains("\"tag\":\"body\""), "body nested: {json}");
         assert!(json.contains("\"tag\":\"div\""), "div nested: {json}");
@@ -7157,12 +8571,24 @@ mod tests {
         assert!(json.contains("\"class\":\"box\""), "class attr: {json}");
         assert!(json.contains("\"id\":\"main\""), "id attr: {json}");
         // Text node: whitespace-collapsed, tagged as text.
-        assert!(json.contains("\"type\":\"text\""), "text node present: {json}");
-        assert!(json.contains("\"text\":\"Hello world\""), "collapsed text: {json}");
+        assert!(
+            json.contains("\"type\":\"text\""),
+            "text node present: {json}"
+        );
+        assert!(
+            json.contains("\"text\":\"Hello world\""),
+            "collapsed text: {json}"
+        );
         // The all-whitespace trailing text node was skipped (no empty text node).
-        assert!(!json.contains("\"text\":\"\""), "empty text nodes skipped: {json}");
+        assert!(
+            !json.contains("\"text\":\"\""),
+            "empty text nodes skipped: {json}"
+        );
         // It parses as a single JSON value (balanced braces/brackets).
-        assert!(json.matches('{').count() == json.matches('}').count(), "balanced braces: {json}");
+        assert!(
+            json.matches('{').count() == json.matches('}').count(),
+            "balanced braces: {json}"
+        );
 
         // No document loaded → "{}".
         let empty = Engine::new();
@@ -7188,7 +8614,10 @@ mod tests {
 
         // A point well inside the block: returns some element id.
         let node = e.node_at_point(60.0, 40.0);
-        assert!(node.is_some(), "node_at_point over laid-out content returns an element id");
+        assert!(
+            node.is_some(),
+            "node_at_point over laid-out content returns an element id"
+        );
 
         // Highlight that node; the render must differ where the overlay draws.
         e.set_inspect_node(node);
@@ -7198,7 +8627,10 @@ mod tests {
         // Clearing the highlight restores the original render.
         e.set_inspect_node(None);
         let cleared = center_column(e.render()).clone();
-        assert_eq!(before, cleared, "clearing the inspect node restores the render");
+        assert_eq!(
+            before, cleared,
+            "clearing the inspect node restores the render"
+        );
 
         // Setting an out-of-range node id is ignored (no panic, no overlay).
         e.set_inspect_node(Some(usize::MAX));
@@ -7208,7 +8640,10 @@ mod tests {
     }
 
     /// Render a canvas page at 1x and return the framebuffer pixel (r,g,b,a) at device (x,y).
-    fn canvas_render_px(html: &str, name: &str) -> (Engine, Box<dyn Fn(&Framebuffer, i32, i32) -> [u8; 4]>) {
+    fn canvas_render_px(
+        html: &str,
+        name: &str,
+    ) -> (Engine, Box<dyn Fn(&Framebuffer, i32, i32) -> [u8; 4]>) {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, html).unwrap();
         let mut e = Engine::new();
@@ -7221,7 +8656,12 @@ mod tests {
                 return [0, 0, 0, 0];
             }
             let i = (y as u32 * fb.stride) as usize + x as usize * 4;
-            [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2], fb.pixels[i + 3]]
+            [
+                fb.pixels[i],
+                fb.pixels[i + 1],
+                fb.pixels[i + 2],
+                fb.pixels[i + 3],
+            ]
         };
         (e, Box::new(at))
     }
@@ -7236,10 +8676,16 @@ mod tests {
         let fb = e.render();
         // Inside the rect (30,30): red.
         let inside = at(fb, 30, 30);
-        assert!(inside[0] > 200 && inside[1] < 60 && inside[2] < 60, "inside should be red, got {inside:?}");
+        assert!(
+            inside[0] > 200 && inside[1] < 60 && inside[2] < 60,
+            "inside should be red, got {inside:?}"
+        );
         // Outside the rect (120,90): NOT red.
         let outside = at(fb, 120, 90);
-        assert!(!(outside[0] > 200 && outside[1] < 60 && outside[2] < 60), "outside must not be red, got {outside:?}");
+        assert!(
+            !(outside[0] > 200 && outside[1] < 60 && outside[2] < 60),
+            "outside must not be red, got {outside:?}"
+        );
     }
 
     #[test]
@@ -7273,10 +8719,16 @@ mod tests {
         let fb = e.render();
         // Centroid is inside → blue.
         let inside = at(fb, 50, 33);
-        assert!(inside[2] > 200 && inside[0] < 60 && inside[1] < 60, "triangle interior should be blue, got {inside:?}");
+        assert!(
+            inside[2] > 200 && inside[0] < 60 && inside[1] < 60,
+            "triangle interior should be blue, got {inside:?}"
+        );
         // A corner well outside the triangle (5,90) is NOT blue.
         let outside = at(fb, 5, 90);
-        assert!(!(outside[2] > 200 && outside[0] < 60), "outside the triangle must not be blue, got {outside:?}");
+        assert!(
+            !(outside[2] > 200 && outside[0] < 60),
+            "outside the triangle must not be blue, got {outside:?}"
+        );
     }
 
     // --- Table presentational attributes / border-collapse -------------------------------------
@@ -7287,7 +8739,10 @@ mod tests {
         let html = "<html><body style='margin:0'>\
             <table cellspacing='0'><tr><td id='c' bgcolor='red'>cell</td></tr></table></body></html>";
         let e = load_rendered(html, "browser_td_bgcolor.html", 200, 100);
-        let td = e.node_by_attr_id("c").and_then(|id| e.node_device_rect(id)).expect("td rect");
+        let td = e
+            .node_by_attr_id("c")
+            .and_then(|id| e.node_device_rect(id))
+            .expect("td rect");
         // Scan the cell interior for a clearly-red pixel.
         let mut red = false;
         let x0 = td.x as i32 + 1;
@@ -7314,10 +8769,21 @@ mod tests {
             <style>table{border-collapse:collapse} td{border:1px solid black; padding:6px}</style>\
             <table><tr><td id='a'>AA</td><td id='b'>BB</td></tr></table></body></html>";
         let e = load_rendered(html, "browser_collapse_line.html", 200, 100);
-        let r0 = e.node_by_attr_id("a").and_then(|id| e.node_device_rect(id)).expect("td0");
-        let r1 = e.node_by_attr_id("b").and_then(|id| e.node_device_rect(id)).expect("td1");
+        let r0 = e
+            .node_by_attr_id("a")
+            .and_then(|id| e.node_device_rect(id))
+            .expect("td0");
+        let r1 = e
+            .node_by_attr_id("b")
+            .and_then(|id| e.node_device_rect(id))
+            .expect("td1");
         // The two cells are flush: cell1's left == cell0's right (within 1px).
-        assert!((r1.x - (r0.x + r0.width)).abs() <= 1.5, "collapsed cells not flush: {} vs {}", r1.x, r0.x + r0.width);
+        assert!(
+            (r1.x - (r0.x + r0.width)).abs() <= 1.5,
+            "collapsed cells not flush: {} vs {}",
+            r1.x,
+            r0.x + r0.width
+        );
         // Scan a row through the middle of the cells; count dark vertical runs across the boundary.
         let y = (r0.y + r0.height / 2.0) as i32;
         let scan_x0 = (r0.x + r0.width) as i32 - 4;
@@ -7332,7 +8798,10 @@ mod tests {
             }
             prev_dark = dark;
         }
-        assert_eq!(runs, 1, "collapsed shared edge should be a single line, found {runs} dark runs");
+        assert_eq!(
+            runs, 1,
+            "collapsed shared edge should be a single line, found {runs} dark runs"
+        );
     }
 
     #[test]
@@ -7341,7 +8810,10 @@ mod tests {
         let html = "<html><body style='margin:0'>\
             <table id='t' border='2' cellspacing='0'><tr><td>X</td></tr></table></body></html>";
         let e = load_rendered(html, "browser_table_border_attr.html", 200, 100);
-        let r = e.node_by_attr_id("t").and_then(|id| e.node_device_rect(id)).expect("table rect");
+        let r = e
+            .node_by_attr_id("t")
+            .and_then(|id| e.node_device_rect(id))
+            .expect("table rect");
         // Scan the top border band for dark pixels.
         let mut dark = 0;
         let yb = r.y as i32;
@@ -7353,6 +8825,9 @@ mod tests {
                 }
             }
         }
-        assert!(dark > 5, "table border=2 should paint a visible top border, dark px = {dark}");
+        assert!(
+            dark > 5,
+            "table border=2 should paint a visible top border, dark px = {dark}"
+        );
     }
 }

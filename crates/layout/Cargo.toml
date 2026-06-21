@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 dom = { path = "../dom" }
 style = { path = "../style" }
+
+[lints]
+workspace = true

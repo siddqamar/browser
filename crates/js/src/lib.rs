@@ -53,9 +53,8 @@ type WsOut = (u8, String);
 /// Host WebSocket connector (built by the engine, mirroring `request_fetcher`): given
 /// `(url, id, ws_evt_tx)` it spawns the socket thread and returns the per-socket outgoing sender,
 /// or `Err` if the thread couldn't start. Crosses the crate boundary with PRIMITIVE tuples only.
-type WsConnector = Arc<
-    dyn Fn(String, u64, Sender<WsEvent>) -> Result<Sender<WsOut>, String> + Send + Sync,
->;
+type WsConnector =
+    Arc<dyn Fn(String, u64, Sender<WsEvent>) -> Result<Sender<WsOut>, String> + Send + Sync>;
 
 /// A JS execution result: the value rendered as a string (if any) plus any console output
 /// captured during execution.
@@ -315,12 +314,26 @@ fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
     fn is_void(tag: &str) -> bool {
         matches!(
             tag.to_ascii_lowercase().as_str(),
-            "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link"
-                | "meta" | "param" | "source" | "track" | "wbr"
+            "area"
+                | "base"
+                | "br"
+                | "col"
+                | "embed"
+                | "hr"
+                | "img"
+                | "input"
+                | "link"
+                | "meta"
+                | "param"
+                | "source"
+                | "track"
+                | "wbr"
         )
     }
     fn escape_text(s: &str) -> String {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
     fn escape_attr(s: &str) -> String {
         s.replace('&', "&amp;").replace('"', "&quot;")
@@ -569,7 +582,11 @@ fn parse_attr_cond(inner: &str) -> Option<AttrCond> {
     }
     if let Some(eq) = s.find('=') {
         // The operator is `=` optionally prefixed by one of ~ | ^ $ * (immediately before it).
-        let prev = if eq > 0 { s.as_bytes().get(eq - 1).copied() } else { None };
+        let prev = if eq > 0 {
+            s.as_bytes().get(eq - 1).copied()
+        } else {
+            None
+        };
         let (op, name_end) = match prev {
             Some(b'~') => (AttrMatchOp::Includes, eq - 1),
             Some(b'|') => (AttrMatchOp::DashMatch, eq - 1),
@@ -585,14 +602,25 @@ fn parse_attr_cond(inner: &str) -> Option<AttrCond> {
         let mut raw_val = s[eq + 1..].trim();
         // Optional trailing case-sensitivity flag (whitespace-separated `i`/`s`).
         let mut ci = false;
-        if let Some(v) = raw_val.strip_suffix(" i").or_else(|| raw_val.strip_suffix(" I")) {
+        if let Some(v) = raw_val
+            .strip_suffix(" i")
+            .or_else(|| raw_val.strip_suffix(" I"))
+        {
             raw_val = v.trim_end();
             ci = true;
-        } else if let Some(v) = raw_val.strip_suffix(" s").or_else(|| raw_val.strip_suffix(" S")) {
+        } else if let Some(v) = raw_val
+            .strip_suffix(" s")
+            .or_else(|| raw_val.strip_suffix(" S"))
+        {
             raw_val = v.trim_end();
         }
         let value = unquote_attr_value(raw_val);
-        Some(AttrCond { name: strip_attr_ns(name).to_ascii_lowercase(), op, value, ci })
+        Some(AttrCond {
+            name: strip_attr_ns(name).to_ascii_lowercase(),
+            op,
+            value,
+            ci,
+        })
     } else {
         Some(AttrCond {
             name: strip_attr_ns(s).to_ascii_lowercase(),
@@ -687,7 +715,8 @@ fn read_css_ident(bytes: &[char], mut i: usize) -> (String, usize) {
                 out.push(bytes[i]);
                 i += 1;
             }
-        } else if matches!(ch, '.' | '#' | '[' | ':' | '>' | '+' | '~' | ',') || ch.is_whitespace() {
+        } else if matches!(ch, '.' | '#' | '[' | ':' | '>' | '+' | '~' | ',') || ch.is_whitespace()
+        {
             break;
         } else {
             out.push(ch);
@@ -882,7 +911,11 @@ fn parse_complex(s: &str) -> Option<Vec<(Combinator, Compound)>> {
 
 /// Does `node` match the complex selector `chain` (matched right-to-left, with backtracking for the
 /// descendant and subsequent-sibling combinators)?
-fn matches_complex(doc: &dom::Document, node: dom::NodeId, chain: &[(Combinator, Compound)]) -> bool {
+fn matches_complex(
+    doc: &dom::Document,
+    node: dom::NodeId,
+    chain: &[(Combinator, Compound)],
+) -> bool {
     let n = chain.len();
     if n == 0 {
         return false;
@@ -929,12 +962,18 @@ fn matches_complex(doc: &dom::Document, node: dom::NodeId, chain: &[(Combinator,
 
 /// Collect every node matching any of the comma-separated selector groups, document order.
 fn query_selector_all(doc: &dom::Document, sel: &str) -> Vec<dom::NodeId> {
-    let groups: Vec<Vec<(Combinator, Compound)>> = sel.split(',').filter_map(parse_complex).collect();
+    let groups: Vec<Vec<(Combinator, Compound)>> =
+        sel.split(',').filter_map(parse_complex).collect();
     if groups.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
-    fn walk(doc: &dom::Document, node: dom::NodeId, groups: &[Vec<(Combinator, Compound)>], out: &mut Vec<dom::NodeId>) {
+    fn walk(
+        doc: &dom::Document,
+        node: dom::NodeId,
+        groups: &[Vec<(Combinator, Compound)>],
+        out: &mut Vec<dom::NodeId>,
+    ) {
         if matches!(doc.get(node).data, dom::NodeData::Element(_))
             && groups.iter().any(|g| matches_complex(doc, node, g))
         {
@@ -951,12 +990,18 @@ fn query_selector_all(doc: &dom::Document, sel: &str) -> Vec<dom::NodeId> {
 
 /// Like [`query_selector_all`] but scoped to the subtree under `root` (excluding `root` itself).
 fn query_within(doc: &dom::Document, root: dom::NodeId, sel: &str) -> Vec<dom::NodeId> {
-    let groups: Vec<Vec<(Combinator, Compound)>> = sel.split(',').filter_map(parse_complex).collect();
+    let groups: Vec<Vec<(Combinator, Compound)>> =
+        sel.split(',').filter_map(parse_complex).collect();
     let mut out = Vec::new();
     if groups.is_empty() {
         return out;
     }
-    fn walk(doc: &dom::Document, node: dom::NodeId, groups: &[Vec<(Combinator, Compound)>], out: &mut Vec<dom::NodeId>) {
+    fn walk(
+        doc: &dom::Document,
+        node: dom::NodeId,
+        groups: &[Vec<(Combinator, Compound)>],
+        out: &mut Vec<dom::NodeId>,
+    ) {
         if matches!(doc.get(node).data, dom::NodeData::Element(_))
             && groups.iter().any(|g| matches_complex(doc, node, g))
         {
@@ -975,7 +1020,12 @@ fn query_within(doc: &dom::Document, root: dom::NodeId, sel: &str) -> Vec<dom::N
 }
 
 /// Collect every element under `root` carrying ALL of `wanted` classes, document order.
-fn collect_by_class(doc: &dom::Document, root: dom::NodeId, wanted: &[String], out: &mut Vec<dom::NodeId>) {
+fn collect_by_class(
+    doc: &dom::Document,
+    root: dom::NodeId,
+    wanted: &[String],
+    out: &mut Vec<dom::NodeId>,
+) {
     if let dom::NodeData::Element(e) = &doc.get(root).data {
         if !wanted.is_empty() && wanted.iter().all(|w| e.classes().any(|c| c == w)) {
             out.push(root);
@@ -1010,7 +1060,11 @@ fn arg_str(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, i: i3
 }
 
 /// Read positional argument `i` as a node id (`usize`). Missing/NaN → None.
-fn arg_node(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, i: i32) -> Option<dom::NodeId> {
+fn arg_node(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+    i: i32,
+) -> Option<dom::NodeId> {
     if i >= args.length() {
         return None;
     }
@@ -1055,8 +1109,7 @@ fn js_str_array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     items: &[String],
 ) -> v8::Local<'s, v8::Value> {
-    let elements: Vec<v8::Local<v8::Value>> =
-        items.iter().map(|s| js_str(scope, s)).collect();
+    let elements: Vec<v8::Local<v8::Value>> = items.iter().map(|s| js_str(scope, s)).collect();
     v8::Array::new_with_elements(scope, &elements).into()
 }
 
@@ -1090,7 +1143,11 @@ fn prim_create_element(
     let tag = arg_str(scope, &args, 0);
     let state = host_state(scope);
     let id = state.doc.borrow_mut().alloc(
-        dom::NodeData::Element(dom::ElementData { tag, attrs: Default::default(), namespace: None }),
+        dom::NodeData::Element(dom::ElementData {
+            tag,
+            attrs: Default::default(),
+            namespace: None,
+        }),
         None,
     );
     rv.set_double(id.0 as f64);
@@ -1104,7 +1161,10 @@ fn prim_create_text(
 ) {
     let text = arg_str(scope, &args, 0);
     let state = host_state(scope);
-    let id = state.doc.borrow_mut().alloc(dom::NodeData::Text(text), None);
+    let id = state
+        .doc
+        .borrow_mut()
+        .alloc(dom::NodeData::Text(text), None);
     rv.set_double(id.0 as f64);
 }
 
@@ -1116,7 +1176,10 @@ fn prim_create_comment(
 ) {
     let text = arg_str(scope, &args, 0);
     let state = host_state(scope);
-    let id = state.doc.borrow_mut().alloc(dom::NodeData::Comment(text), None);
+    let id = state
+        .doc
+        .borrow_mut()
+        .alloc(dom::NodeData::Comment(text), None);
     rv.set_double(id.0 as f64);
 }
 
@@ -1127,7 +1190,10 @@ fn prim_create_document_fragment(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let state = host_state(scope);
-    let id = state.doc.borrow_mut().alloc(dom::NodeData::DocumentFragment, None);
+    let id = state
+        .doc
+        .borrow_mut()
+        .alloc(dom::NodeData::DocumentFragment, None);
     rv.set_double(id.0 as f64);
 }
 
@@ -1142,7 +1208,11 @@ fn prim_create_document_type(
     let system_id = arg_str(scope, &args, 2);
     let state = host_state(scope);
     let id = state.doc.borrow_mut().alloc(
-        dom::NodeData::DocumentType(dom::DoctypeData { name, public_id, system_id }),
+        dom::NodeData::DocumentType(dom::DoctypeData {
+            name,
+            public_id,
+            system_id,
+        }),
         None,
     );
     rv.set_double(id.0 as f64);
@@ -1183,13 +1253,13 @@ fn prim_doctype_info(
             let obj = v8::Object::new(scope);
             let k = v8::String::new(scope, "name").unwrap();
             let v = js_str(scope, &name);
-            obj.set(scope, k.into(), v.into());
+            obj.set(scope, k.into(), v);
             let k = v8::String::new(scope, "publicId").unwrap();
             let v = js_str(scope, &public_id);
-            obj.set(scope, k.into(), v.into());
+            obj.set(scope, k.into(), v);
             let k = v8::String::new(scope, "systemId").unwrap();
             let v = js_str(scope, &system_id);
-            obj.set(scope, k.into(), v.into());
+            obj.set(scope, k.into(), v);
             rv.set(obj.into());
         }
         None => rv.set_null(),
@@ -1334,7 +1404,11 @@ fn collect_author_sheets(
     // Resolve the document base URL (honoring `<base href>`) and publish it so the cascade resolves
     // relative `url(...)` in inline `style=""` attributes (which have no stylesheet of their own).
     let doc_base = document_base_url(doc, page_url);
-    style::set_document_base_url(if doc_base.is_empty() { None } else { Some(&doc_base) });
+    style::set_document_base_url(if doc_base.is_empty() {
+        None
+    } else {
+        Some(&doc_base)
+    });
 
     /// One author stylesheet in document order. `seq` is the node id (arena nodes are allocated in
     /// creation order), which determines the preferred set independent of final tree order. `base` is
@@ -1442,7 +1516,10 @@ fn collect_author_sheets(
 
 /// Fetch the CSS text behind a stylesheet `<link href>`. `data:` URLs are decoded directly (the
 /// `text/css` body after the comma, percent-decoded); anything else goes through the host GET fetcher.
-fn fetch_link_css(href: &str, fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>) -> Option<String> {
+fn fetch_link_css(
+    href: &str,
+    fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>,
+) -> Option<String> {
     if let Some(rest) = href.strip_prefix("data:") {
         let comma = rest.find(',')?;
         let (meta, data) = (&rest[..comma], &rest[comma + 1..]);
@@ -1454,7 +1531,12 @@ fn fetch_link_css(href: &str, fetcher: &Rc<dyn Fn(&str) -> Option<(String, Strin
     let (body, ctype) = fetcher(href)?;
     // A linked stylesheet whose response declares a non-`text/css` type isn't a CSS resource and
     // must not be applied (HTML "obtain a CSS style sheet" / CORB). An absent type stays lenient.
-    let essence = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let essence = ctype
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if essence.is_empty() || essence == "text/css" {
         Some(body)
     } else {
@@ -1528,7 +1610,11 @@ fn with_computed_style<R>(
             // Content width is resolved recursively (a nested iframe's % width is relative to the
             // outer iframe's content width); height uses the simpler CSS-or-attr-or-default form.
             let iw = iframe_content_width(state, &doc, m, iframe_id, 0);
-            let ih = m.get(&iframe_id).and_then(|cs| cs.height).or_else(|| attr_dim("height")).unwrap_or(150.0);
+            let ih = m
+                .get(&iframe_id)
+                .and_then(|cs| cs.height)
+                .or_else(|| attr_dim("height"))
+                .unwrap_or(150.0);
             let sheets = collect_facade_sheets(&doc, facade_root, &state.fetcher);
             let (sw, sh, sd) = style::viewport_metrics();
             style::set_viewport_metrics(iw, ih, sd);
@@ -1579,7 +1665,11 @@ fn iframe_content_width(
         return w;
     }
     if let dom::NodeData::Element(e) = &doc.get(iframe_id).data {
-        if let Some(w) = e.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok()) {
+        if let Some(w) = e
+            .attrs
+            .get("width")
+            .and_then(|v| v.trim().parse::<f32>().ok())
+        {
             return w;
         }
     }
@@ -1610,15 +1700,21 @@ fn resolve_facade_widths(
     avail_width: f32,
 ) {
     let content_w = if let Some(cs) = submap.get_mut(&id) {
-        match cs.width.or_else(|| cs.width_pct.map(|p| (avail_width * p).max(0.0))) {
+        match cs
+            .width
+            .or_else(|| cs.width_pct.map(|p| (avail_width * p).max(0.0)))
+        {
             Some(w) => {
                 cs.width = Some(w);
                 (w - cs.padding.left - cs.padding.right - cs.border.left - cs.border.right).max(0.0)
             }
             None => (avail_width
-                - cs.margin.left - cs.margin.right
-                - cs.padding.left - cs.padding.right
-                - cs.border.left - cs.border.right)
+                - cs.margin.left
+                - cs.margin.right
+                - cs.padding.left
+                - cs.padding.right
+                - cs.border.left
+                - cs.border.right)
                 .max(0.0),
         }
     } else {
@@ -1689,7 +1785,10 @@ fn with_cascade_map<R>(
         }
     }
     let cache = state.computed_cache.borrow();
-    let map = cache.as_ref().map(|(_, m)| m).expect("cascade just populated");
+    let map = cache
+        .as_ref()
+        .map(|(_, m)| m)
+        .expect("cascade just populated");
     let doc = state.doc.borrow();
     f(&doc, map)
 }
@@ -1717,7 +1816,10 @@ fn with_pseudo_style<R>(
         }
     }
     let cache = state.computed_cache.borrow();
-    let map = cache.as_ref().map(|(_, m)| m).expect("cascade just populated");
+    let map = cache
+        .as_ref()
+        .map(|(_, m)| m)
+        .expect("cascade just populated");
     let doc = state.doc.borrow();
     let element_style = map.get(&id);
     let pseudo = element_style.and_then(|es| {
@@ -1760,7 +1862,10 @@ fn resolved_inset_value(
     // used inset value needs layout. We compute it synchronously from specified geometry (the WPT
     // containers have explicit px sizes) — the engine-pushed used px (`used`) is a fallback for cases
     // where the static position can't be derived from specified geometry alone.
-    if matches!(cs.position, style::Position::Absolute | style::Position::Fixed) {
+    if matches!(
+        cs.position,
+        style::Position::Absolute | style::Position::Fixed
+    ) {
         let (spec, opposite) = match side {
             style::EdgeSide::Top => (cs.top_spec, cs.bottom_spec),
             style::EdgeSide::Bottom => (cs.bottom_spec, cs.top_spec),
@@ -1788,14 +1893,20 @@ fn resolved_inset_value(
             let cb_extent = containing_block_extent(doc, map, id, kind, want_height);
             let mb_size = if want_height {
                 cs.height.unwrap_or(0.0)
-                    + cs.padding.top + cs.padding.bottom
-                    + cs.border.top + cs.border.bottom
-                    + cs.margin.top + cs.margin.bottom
+                    + cs.padding.top
+                    + cs.padding.bottom
+                    + cs.border.top
+                    + cs.border.bottom
+                    + cs.margin.top
+                    + cs.margin.bottom
             } else {
                 cs.width.unwrap_or(0.0)
-                    + cs.padding.left + cs.padding.right
-                    + cs.border.left + cs.border.right
-                    + cs.margin.left + cs.margin.right
+                    + cs.padding.left
+                    + cs.padding.right
+                    + cs.border.left
+                    + cs.border.right
+                    + cs.margin.left
+                    + cs.margin.right
             };
             // Map the static position to the *containing block's* writing mode: a physical side that
             // is the cb's block- or inline-START takes the static offset directly; the opposite side
@@ -1827,12 +1938,20 @@ fn resolved_inset_value(
         style::Position::Sticky => {
             containing_block_extent(doc, map, id, ContainingBlock::StickyScrollport, want_height)
         }
-        style::Position::Absolute => {
-            containing_block_extent(doc, map, id, ContainingBlock::PositionedPadding, want_height)
-        }
-        style::Position::Fixed => {
-            containing_block_extent(doc, map, id, ContainingBlock::TransformedPadding, want_height)
-        }
+        style::Position::Absolute => containing_block_extent(
+            doc,
+            map,
+            id,
+            ContainingBlock::PositionedPadding,
+            want_height,
+        ),
+        style::Position::Fixed => containing_block_extent(
+            doc,
+            map,
+            id,
+            ContainingBlock::TransformedPadding,
+            want_height,
+        ),
         style::Position::Static => f32::NAN,
     };
     Some(cs.resolved_inset(side, false, basis))
@@ -1866,7 +1985,11 @@ fn containing_block_node(
         ContainingBlock::ParentContent => cur,
         ContainingBlock::PositionedPadding => {
             while let Some(a) = cur {
-                if map.get(&a).map(|acs| acs.position != style::Position::Static).unwrap_or(false) {
+                if map
+                    .get(&a)
+                    .map(|acs| acs.position != style::Position::Static)
+                    .unwrap_or(false)
+                {
                     return Some(a);
                 }
                 cur = doc.get(a).parent;
@@ -1875,7 +1998,11 @@ fn containing_block_node(
         }
         ContainingBlock::TransformedPadding => {
             while let Some(a) = cur {
-                if map.get(&a).map(|acs| acs.transform.is_some()).unwrap_or(false) {
+                if map
+                    .get(&a)
+                    .map(|acs| acs.transform.is_some())
+                    .unwrap_or(false)
+                {
                     return Some(a);
                 }
                 cur = doc.get(a).parent;
@@ -1884,7 +2011,11 @@ fn containing_block_node(
         }
         ContainingBlock::StickyScrollport => {
             while let Some(a) = cur {
-                if map.get(&a).map(|acs| acs.overflow_scrollport).unwrap_or(false) {
+                if map
+                    .get(&a)
+                    .map(|acs| acs.overflow_scrollport)
+                    .unwrap_or(false)
+                {
                     return Some(a);
                 }
                 cur = doc.get(a).parent;
@@ -2033,140 +2164,154 @@ fn prim_computed_style_prop(
     let name = arg_str(scope, &args, 1);
     let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 2));
     let state = host_state(scope);
-    let value = match (node, &pseudo) {
-        (None, _) | (_, style::GcsPseudo::Invalid) => String::new(),
-        (Some(n), style::GcsPseudo::Pseudo(key)) => with_pseudo_style(&state, n, key, |cs| {
-            cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
-        }),
-        (Some(n), style::GcsPseudo::Element) => {
-            // Inset longhands need the CSSOM resolved-value algorithm (position + containing
-            // block), which reads more than one element's style — handle them via the cascade map.
-            let inset_side = match name.as_str() {
-                "top" => Some(style::EdgeSide::Top),
-                "right" => Some(style::EdgeSide::Right),
-                "bottom" => Some(style::EdgeSide::Bottom),
-                "left" => Some(style::EdgeSide::Left),
-                _ => None,
-            };
-            // Margin longhands report the CSSOM *used* value: the engine pushes resolved margins
-            // (including `auto` centering / over-constrained boxes) keyed by node id.
-            let margin_idx = match name.as_str() {
-                "margin-top" => Some(0usize),
-                "margin-right" => Some(1),
-                "margin-bottom" => Some(2),
-                "margin-left" => Some(3),
-                _ => None,
-            };
-            // width/height report the CSSOM *used* (content-box px) value when the element has a box
-            // and the property applies — e.g. a percentage width the cascade couldn't resolve.
-            let size_is_width = match name.as_str() {
-                "width" => Some(true),
-                "height" => Some(false),
-                _ => None,
-            };
-            // min-width / min-height: auto resolves to 0px, except a box with a preferred aspect
-            // ratio or a flex/grid item keeps `auto`; a box-less element (no layout box) is 0px.
-            if matches!(name.as_str(), "min-width" | "min-height") {
-                with_cascade_map(&state, |doc, map| {
-                    let cs = match map.get(&n) {
-                        Some(c) => c,
-                        None => return String::new(),
-                    };
-                    let computed = cs.get_property(&name);
-                    if computed != "auto" {
-                        return computed;
-                    }
-                    // A box-less element (display:none, or inside one) generates no box → 0px.
-                    if cs.display_none || ancestor_display_none(doc, map, n) {
-                        return "0px".to_string();
-                    }
-                    let parent_flex_grid = doc
-                        .get(n)
-                        .parent
-                        .and_then(|p| map.get(&p))
-                        .map(|p| {
-                            matches!(
-                                p.display,
-                                style::Display::Flex
-                                    | style::Display::InlineFlex
-                                    | style::Display::Grid
-                                    | style::Display::InlineGrid
-                            )
-                        })
-                        .unwrap_or(false);
-                    if cs.aspect_ratio_set || parent_flex_grid {
-                        "auto".to_string()
-                    } else {
-                        "0px".to_string()
-                    }
-                })
-            } else if let Some(is_width) = size_is_width {
-                with_computed_style(&state, n, |cs| {
-                    let cs = match cs {
-                        Some(c) => c,
-                        None => return String::new(),
-                    };
-                    let computed = cs.get_property(&name);
-                    // A specified length is already the used value (and stays fresh between layouts);
-                    // only resolve `auto`/percentage via the laid-out box. width/height don't apply to
-                    // non-replaced inline boxes or display:none, where the computed value is reported.
-                    if computed != "auto"
-                        || cs.display_none
-                        || matches!(cs.display, style::Display::Inline)
-                    {
-                        return computed;
-                    }
-                    match state.layout_rects.borrow().get(&n.0) {
-                        Some(&(_, _, w, h)) => {
-                            let (b0, b1, p0, p1) = if is_width {
-                                (cs.border.left, cs.border.right, cs.padding.left, cs.padding.right)
-                            } else {
-                                (cs.border.top, cs.border.bottom, cs.padding.top, cs.padding.bottom)
-                            };
-                            let border_box = if is_width { w } else { h };
-                            style::serialize_px((border_box - b0 - b1 - p0 - p1).max(0.0))
-                        }
-                        None => computed,
-                    }
-                })
-            } else if let Some(idx) = margin_idx {
-                // Only an `auto` margin needs the engine's resolved used value; a specified margin's
-                // computed value is always current (and not stale between layouts). Falls back to the
-                // computed value if the engine hasn't pushed a used margin yet.
-                with_computed_style(&state, n, |cs| match cs {
-                    Some(cs) if cs.margin_auto[idx] => state
-                        .used_margins
-                        .borrow()
-                        .get(&n.0)
-                        .map(|&(t, r, b, l)| style::serialize_px([t, r, b, l][idx]))
-                        .unwrap_or_else(|| cs.get_property(&name)),
-                    Some(cs) => cs.get_property(&name),
-                    None => String::new(),
-                })
-            } else {
-                match inset_side {
-                Some(side) => {
-                    // The engine pushed this box's used inset values (px) keyed by node id; pick this
-                    // side. Used by the resolved-value algorithm for cases that need real layout
-                    // (absolute/fixed static position when both opposite insets are `auto`).
-                    let used = state.used_insets.borrow().get(&n.0).map(|&(t, r, b, l)| match side {
-                        style::EdgeSide::Top => t,
-                        style::EdgeSide::Right => r,
-                        style::EdgeSide::Bottom => b,
-                        style::EdgeSide::Left => l,
-                        style::EdgeSide::All => t,
-                    });
+    let value =
+        match (node, &pseudo) {
+            (None, _) | (_, style::GcsPseudo::Invalid) => String::new(),
+            (Some(n), style::GcsPseudo::Pseudo(key)) => with_pseudo_style(&state, n, key, |cs| {
+                cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
+            }),
+            (Some(n), style::GcsPseudo::Element) => {
+                // Inset longhands need the CSSOM resolved-value algorithm (position + containing
+                // block), which reads more than one element's style — handle them via the cascade map.
+                let inset_side = match name.as_str() {
+                    "top" => Some(style::EdgeSide::Top),
+                    "right" => Some(style::EdgeSide::Right),
+                    "bottom" => Some(style::EdgeSide::Bottom),
+                    "left" => Some(style::EdgeSide::Left),
+                    _ => None,
+                };
+                // Margin longhands report the CSSOM *used* value: the engine pushes resolved margins
+                // (including `auto` centering / over-constrained boxes) keyed by node id.
+                let margin_idx = match name.as_str() {
+                    "margin-top" => Some(0usize),
+                    "margin-right" => Some(1),
+                    "margin-bottom" => Some(2),
+                    "margin-left" => Some(3),
+                    _ => None,
+                };
+                // width/height report the CSSOM *used* (content-box px) value when the element has a box
+                // and the property applies — e.g. a percentage width the cascade couldn't resolve.
+                let size_is_width = match name.as_str() {
+                    "width" => Some(true),
+                    "height" => Some(false),
+                    _ => None,
+                };
+                // min-width / min-height: auto resolves to 0px, except a box with a preferred aspect
+                // ratio or a flex/grid item keeps `auto`; a box-less element (no layout box) is 0px.
+                if matches!(name.as_str(), "min-width" | "min-height") {
                     with_cascade_map(&state, |doc, map| {
-                        resolved_inset_value(doc, map, n, side, used).unwrap_or_default()
+                        let cs = match map.get(&n) {
+                            Some(c) => c,
+                            None => return String::new(),
+                        };
+                        let computed = cs.get_property(&name);
+                        if computed != "auto" {
+                            return computed;
+                        }
+                        // A box-less element (display:none, or inside one) generates no box → 0px.
+                        if cs.display_none || ancestor_display_none(doc, map, n) {
+                            return "0px".to_string();
+                        }
+                        let parent_flex_grid = doc
+                            .get(n)
+                            .parent
+                            .and_then(|p| map.get(&p))
+                            .map(|p| {
+                                matches!(
+                                    p.display,
+                                    style::Display::Flex
+                                        | style::Display::InlineFlex
+                                        | style::Display::Grid
+                                        | style::Display::InlineGrid
+                                )
+                            })
+                            .unwrap_or(false);
+                        if cs.aspect_ratio_set || parent_flex_grid {
+                            "auto".to_string()
+                        } else {
+                            "0px".to_string()
+                        }
                     })
-                }
-                None => with_computed_style(&state, n, |cs| {
-                    cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
-                }),
+                } else if let Some(is_width) = size_is_width {
+                    with_computed_style(&state, n, |cs| {
+                        let cs = match cs {
+                            Some(c) => c,
+                            None => return String::new(),
+                        };
+                        let computed = cs.get_property(&name);
+                        // A specified length is already the used value (and stays fresh between layouts);
+                        // only resolve `auto`/percentage via the laid-out box. width/height don't apply to
+                        // non-replaced inline boxes or display:none, where the computed value is reported.
+                        if computed != "auto"
+                            || cs.display_none
+                            || matches!(cs.display, style::Display::Inline)
+                        {
+                            return computed;
+                        }
+                        match state.layout_rects.borrow().get(&n.0) {
+                            Some(&(_, _, w, h)) => {
+                                let (b0, b1, p0, p1) = if is_width {
+                                    (
+                                        cs.border.left,
+                                        cs.border.right,
+                                        cs.padding.left,
+                                        cs.padding.right,
+                                    )
+                                } else {
+                                    (
+                                        cs.border.top,
+                                        cs.border.bottom,
+                                        cs.padding.top,
+                                        cs.padding.bottom,
+                                    )
+                                };
+                                let border_box = if is_width { w } else { h };
+                                style::serialize_px((border_box - b0 - b1 - p0 - p1).max(0.0))
+                            }
+                            None => computed,
+                        }
+                    })
+                } else if let Some(idx) = margin_idx {
+                    // Only an `auto` margin needs the engine's resolved used value; a specified margin's
+                    // computed value is always current (and not stale between layouts). Falls back to the
+                    // computed value if the engine hasn't pushed a used margin yet.
+                    with_computed_style(&state, n, |cs| match cs {
+                        Some(cs) if cs.margin_auto[idx] => state
+                            .used_margins
+                            .borrow()
+                            .get(&n.0)
+                            .map(|&(t, r, b, l)| style::serialize_px([t, r, b, l][idx]))
+                            .unwrap_or_else(|| cs.get_property(&name)),
+                        Some(cs) => cs.get_property(&name),
+                        None => String::new(),
+                    })
+                } else {
+                    match inset_side {
+                        Some(side) => {
+                            // The engine pushed this box's used inset values (px) keyed by node id; pick this
+                            // side. Used by the resolved-value algorithm for cases that need real layout
+                            // (absolute/fixed static position when both opposite insets are `auto`).
+                            let used =
+                                state.used_insets.borrow().get(&n.0).map(
+                                    |&(t, r, b, l)| match side {
+                                        style::EdgeSide::Top => t,
+                                        style::EdgeSide::Right => r,
+                                        style::EdgeSide::Bottom => b,
+                                        style::EdgeSide::Left => l,
+                                        style::EdgeSide::All => t,
+                                    },
+                                );
+                            with_cascade_map(&state, |doc, map| {
+                                resolved_inset_value(doc, map, n, side, used).unwrap_or_default()
+                            })
+                        }
+                        None => with_computed_style(&state, n, |cs| {
+                            cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
+                        }),
+                    }
                 }
             }
-        }
-    };
+        };
     let s = js_str(scope, &value);
     rv.set(s);
 }
@@ -2179,7 +2324,9 @@ fn computed_names_with_custom(cs: &style::ComputedStyle) -> Vec<String> {
     names.extend(cs.custom_props.keys().cloned());
     names.sort_by(|a, b| {
         // A leading `-` (vendor prefix / `--custom`) sorts after unprefixed; then lexicographic.
-        a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
+        a.starts_with('-')
+            .cmp(&b.starts_with('-'))
+            .then_with(|| a.cmp(b))
     });
     names
 }
@@ -2307,9 +2454,19 @@ fn storage_dir() -> std::path::PathBuf {
 fn storage_path(key: &str) -> std::path::PathBuf {
     let safe: String = key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let safe = if safe.is_empty() { "default".to_string() } else { safe };
+    let safe = if safe.is_empty() {
+        "default".to_string()
+    } else {
+        safe
+    };
     storage_dir().join(format!("{}.json", &safe[..safe.len().min(180)]))
 }
 
@@ -2415,9 +2572,13 @@ fn fill_random(buf: &mut [u8]) {
         }
     }
     use std::hash::{BuildHasher, Hasher};
-    let mut seed = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    let mut seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
     for b in buf.iter_mut() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *b = (seed >> 33) as u8;
     }
 }
@@ -2429,7 +2590,11 @@ fn prim_crypto_random(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let n = args.get(0).number_value(scope).unwrap_or(0.0);
-    let n = if n.is_finite() && n > 0.0 { (n as usize).min(1 << 20) } else { 0 };
+    let n = if n.is_finite() && n > 0.0 {
+        (n as usize).min(1 << 20)
+    } else {
+        0
+    };
     let mut buf = vec![0u8; n];
     fill_random(&mut buf);
     let arr = v8::Array::new(scope, n as i32);
@@ -2686,7 +2851,7 @@ fn prim_rect(
 /// string which JS decodes with the built-in `atob`. Used by `__canvasPixels` for `getImageData`.
 fn base64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -2694,8 +2859,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -2881,7 +3054,11 @@ fn prim_elem_metrics(
     // viewport's content box — approximated by the laid-out border box (`w`/`h`) — rather than the
     // cascade `width`/`height` (which are `auto` → 0 for an unsized root). Without this,
     // `documentElement.clientWidth` would read 0 and break viewport-bounds math (CSSOM-View tests).
-    let (cw, ch) = if is_root { (w, h) } else { client_box.unwrap_or((w, h)) };
+    let (cw, ch) = if is_root {
+        (w, h)
+    } else {
+        client_box.unwrap_or((w, h))
+    };
     put("ow", w);
     put("oh", h);
     put("cw", cw);
@@ -2901,7 +3078,9 @@ fn prim_text_content(
 ) {
     let node = arg_node(scope, &args, 0);
     let state = host_state(scope);
-    let s = node.map(|n| text_content(&state.doc.borrow(), n)).unwrap_or_default();
+    let s = node
+        .map(|n| text_content(&state.doc.borrow(), n))
+        .unwrap_or_default();
     let v = js_str(scope, &s);
     rv.set(v);
 }
@@ -2917,9 +3096,9 @@ fn prim_set_text_content(
     let state = host_state(scope);
     if let Some(n) = node {
         state.bump_dom_version(); // invalidate getComputedStyle cache
-        // For Text/Comment nodes, setting textContent/data is a `characterData` mutation; capture
-        // the old string value first (for `characterDataOldValue`). For elements it replaces the
-        // subtree (we don't emit a childList record for that simplification).
+                                  // For Text/Comment nodes, setting textContent/data is a `characterData` mutation; capture
+                                  // the old string value first (for `characterDataOldValue`). For elements it replaces the
+                                  // subtree (we don't emit a childList record for that simplification).
         let char_old = if state.observers_active.get() {
             match &state.doc.borrow().get(n).data {
                 dom::NodeData::Text(t) => Some(("characterData", t.clone())),
@@ -2951,7 +3130,9 @@ fn prim_inner_html(
 ) {
     let node = arg_node(scope, &args, 0);
     let state = host_state(scope);
-    let s = node.map(|n| inner_html(&state.doc.borrow(), n)).unwrap_or_default();
+    let s = node
+        .map(|n| inner_html(&state.doc.borrow(), n))
+        .unwrap_or_default();
     let v = js_str(scope, &s);
     rv.set(v);
 }
@@ -3150,7 +3331,9 @@ fn prim_title_text(
     let state = host_state(scope);
     let s = {
         let d = state.doc.borrow();
-        find_by_tag(&d, d.root(), "title").map(|n| text_content(&d, n)).unwrap_or_default()
+        find_by_tag(&d, d.root(), "title")
+            .map(|n| text_content(&d, n))
+            .unwrap_or_default()
     };
     let v = js_str(scope, &s);
     rv.set(v);
@@ -3230,8 +3413,7 @@ fn prim_request(
             _ => raw.clone(),
         }
     };
-    let envelope =
-        (host_state(scope).request_fetcher)(&method, &resolved, &body, &headers_json);
+    let envelope = (host_state(scope).request_fetcher)(&method, &resolved, &body, &headers_json);
     match envelope {
         Some(s) => {
             let v = js_str(scope, &s);
@@ -3482,9 +3664,24 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__createElement", prim_create_element);
     set_fn(scope, global, "__createText", prim_create_text);
     set_fn(scope, global, "__createComment", prim_create_comment);
-    set_fn(scope, global, "__createDocumentFragment", prim_create_document_fragment);
-    set_fn(scope, global, "__createDocumentType", prim_create_document_type);
-    set_fn(scope, global, "__createProcessingInstruction", prim_create_processing_instruction);
+    set_fn(
+        scope,
+        global,
+        "__createDocumentFragment",
+        prim_create_document_fragment,
+    );
+    set_fn(
+        scope,
+        global,
+        "__createDocumentType",
+        prim_create_document_type,
+    );
+    set_fn(
+        scope,
+        global,
+        "__createProcessingInstruction",
+        prim_create_processing_instruction,
+    );
     set_fn(scope, global, "__doctypeInfo", prim_doctype_info);
     set_fn(scope, global, "__piTarget", prim_pi_target);
     set_fn(scope, global, "__cloneNode", prim_clone_node);
@@ -3516,11 +3713,36 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__setInnerHTML", prim_set_inner_html);
     set_fn(scope, global, "__getElementById", prim_get_element_by_id);
     set_fn(scope, global, "__querySelectorAll", prim_query_selector_all);
-    set_fn(scope, global, "__querySelectorAllWithin", prim_query_selector_all_within);
-    set_fn(scope, global, "__getElementsByTagName", prim_get_elements_by_tag_name);
-    set_fn(scope, global, "__getElementsByTagNameWithin", prim_get_elements_by_tag_name_within);
-    set_fn(scope, global, "__getElementsByClassName", prim_get_elements_by_class_name);
-    set_fn(scope, global, "__documentElementId", prim_document_element_id);
+    set_fn(
+        scope,
+        global,
+        "__querySelectorAllWithin",
+        prim_query_selector_all_within,
+    );
+    set_fn(
+        scope,
+        global,
+        "__getElementsByTagName",
+        prim_get_elements_by_tag_name,
+    );
+    set_fn(
+        scope,
+        global,
+        "__getElementsByTagNameWithin",
+        prim_get_elements_by_tag_name_within,
+    );
+    set_fn(
+        scope,
+        global,
+        "__getElementsByClassName",
+        prim_get_elements_by_class_name,
+    );
+    set_fn(
+        scope,
+        global,
+        "__documentElementId",
+        prim_document_element_id,
+    );
     set_fn(scope, global, "__documentRootId", prim_document_root_id);
     set_fn(scope, global, "__bodyId", prim_body_id);
     set_fn(scope, global, "__headId", prim_head_id);
@@ -3534,8 +3756,18 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__wsClose", prim_ws_close);
     set_fn(scope, global, "__observersActive", prim_observers_active);
     set_fn(scope, global, "__drainMutations", prim_drain_mutations);
-    set_fn(scope, global, "__computedStyleProp", prim_computed_style_prop);
-    set_fn(scope, global, "__computedStyleNames", prim_computed_style_names);
+    set_fn(
+        scope,
+        global,
+        "__computedStyleProp",
+        prim_computed_style_prop,
+    );
+    set_fn(
+        scope,
+        global,
+        "__computedStyleNames",
+        prim_computed_style_names,
+    );
 }
 
 /// Compile+run a script in the current context, ignoring the result. Used for bootstraps where a
@@ -3634,7 +3866,11 @@ fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
     // Inject the live viewport metrics so the bootstrap can set window.innerWidth/innerHeight and
     // devicePixelRatio from the real values rather than hardcoded defaults.
     let (vw, vh, dpr) = device_metrics();
-    for (name, num) in [("__innerWidth", vw), ("__innerHeight", vh), ("__devicePixelRatio", dpr)] {
+    for (name, num) in [
+        ("__innerWidth", vw),
+        ("__innerHeight", vh),
+        ("__devicePixelRatio", dpr),
+    ] {
         let k = v8::String::new(scope, name).unwrap();
         let n = v8::Number::new(scope, num);
         global.set(scope, k.into(), n.into());
@@ -13764,7 +14000,17 @@ fn eval_source(scope: &mut v8::PinScope, source: &str, name: &str) -> EvalOutput
         };
         let resource = v8::String::new(tc, name).unwrap();
         let origin = v8::ScriptOrigin::new(
-            tc, resource.into(), 0, 0, false, 0, None, false, false, false, None,
+            tc,
+            resource.into(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            false,
+            false,
+            false,
+            None,
         );
         match v8::Script::compile(tc, code, Some(&origin)) {
             Some(script) => match script.run(tc) {
@@ -13790,8 +14036,16 @@ fn eval_source(scope: &mut v8::PinScope, source: &str, name: &str) -> EvalOutput
         .unwrap_or_default();
 
     match result {
-        Ok(value) => EvalOutput { value, console, error: None },
-        Err(error) => EvalOutput { value: None, console, error: Some(error) },
+        Ok(value) => EvalOutput {
+            value,
+            console,
+            error: None,
+        },
+        Err(error) => EvalOutput {
+            value: None,
+            console,
+            error: Some(error),
+        },
     }
 }
 
@@ -13865,7 +14119,11 @@ fn drain_event_loop(
             .unwrap_or(0);
         // While requests are outstanding we use the longer budget (so a network-bound page isn't
         // cut off); otherwise the short idle budget keeps idle ticks cheap.
-        let budget = if in_flight > 0 { network_budget } else { idle_budget };
+        let budget = if in_flight > 0 {
+            network_budget
+        } else {
+            idle_budget
+        };
         if iterations >= EVENT_LOOP_CAP || start.elapsed() >= budget {
             break;
         }
@@ -13946,10 +14204,8 @@ fn drain_event_loop(
 
     // Collect timer/microtask errors recorded JS-side.
     let mut extra: Vec<String> = Vec::new();
-    if let Some(joined) = eval_to_string(
-        scope,
-        "(globalThis.__timerErrors || []).join('\\u0000')",
-    ) {
+    if let Some(joined) = eval_to_string(scope, "(globalThis.__timerErrors || []).join('\\u0000')")
+    {
         for e in joined.split('\u{0}') {
             if !e.is_empty() {
                 extra.push(format!("⚠ {e}"));
@@ -13975,7 +14231,10 @@ fn drain_event_loop(
 
 /// Run `globalThis.__runDueTimers()` and return its boolean result (false if absent/empty).
 fn run_due_timers(scope: &mut v8::PinScope) -> bool {
-    eval_to_bool(scope, "(typeof __runDueTimers === 'function') && __runDueTimers()")
+    eval_to_bool(
+        scope,
+        "(typeof __runDueTimers === 'function') && __runDueTimers()",
+    )
 }
 
 /// Drain all currently-available background fetch completions (non-blocking `try_recv`) and settle
@@ -14015,7 +14274,7 @@ fn deliver_fetch_completion(scope: &mut v8::PinScope, completion: FetchCompletio
                 .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok());
             if let Some(func) = resolve_fn {
                 let id_arg = v8::Number::new(scope, id as f64).into();
-                let env_arg = js_str(scope, &envelope).into();
+                let env_arg = js_str(scope, &envelope);
                 v8::tc_scope!(let tc, scope);
                 let recv = global.into();
                 func.call(tc, recv, &[id_arg, env_arg]);
@@ -14065,7 +14324,7 @@ fn deliver_ws_event(scope: &mut v8::PinScope, id: u64, kind: u8, payload: &str) 
     if let Some(func) = func {
         let id_arg = v8::Number::new(scope, id as f64).into();
         let kind_arg = v8::Number::new(scope, kind as f64).into();
-        let payload_arg = js_str(scope, payload).into();
+        let payload_arg = js_str(scope, payload);
         v8::tc_scope!(let tc, scope);
         let recv = global.into();
         func.call(tc, recv, &[id_arg, kind_arg, payload_arg]);
@@ -14209,34 +14468,34 @@ pub fn run_with_dom(
         .name("js-eval-dom".to_string())
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
-            let result: (dom::Document, Vec<EvalOutput>) = (move || {
-            ensure_v8_initialized();
-            let shared: SharedDoc = Rc::new(RefCell::new(doc));
-            let mut isolate = new_guarded_isolate();
-            let mut results: Vec<EvalOutput> = Vec::with_capacity(sources.len());
-            {
-                v8::scope!(let handle_scope, &mut isolate);
-                let context = v8::Context::new(handle_scope, Default::default());
-                let scope = &mut v8::ContextScope::new(handle_scope, context);
-                let state = HostState::new(Rc::clone(&shared));
-                scope.get_current_context().set_slot(state);
-                install_browser_environment(scope, &url);
+            let result: (dom::Document, Vec<EvalOutput>) = {
+                ensure_v8_initialized();
+                let shared: SharedDoc = Rc::new(RefCell::new(doc));
+                let mut isolate = new_guarded_isolate();
+                let mut results: Vec<EvalOutput> = Vec::with_capacity(sources.len());
+                {
+                    v8::scope!(let handle_scope, &mut isolate);
+                    let context = v8::Context::new(handle_scope, Default::default());
+                    let scope = &mut v8::ContextScope::new(handle_scope, context);
+                    let state = HostState::new(Rc::clone(&shared));
+                    scope.get_current_context().set_slot(state);
+                    install_browser_environment(scope, &url);
 
-                for source in &sources {
-                    results.push(eval_source(scope, source, "<script>"));
+                    for source in &sources {
+                        results.push(eval_source(scope, source, "<script>"));
+                    }
+                    // run_with_dom installs no real fetcher, so no async fetches are ever started.
+                    drain_event_loop(scope, &mut results, None, None);
                 }
-                // run_with_dom installs no real fetcher, so no async fetches are ever started.
-                drain_event_loop(scope, &mut results, None, None);
-            }
-            // Recover the owned Document. Dropping the isolate releases the context (and HostState
-            // slot, which holds the only other Rc clone of `shared`), so `try_unwrap` succeeds.
-            drop(isolate);
-            let doc = match Rc::try_unwrap(shared) {
-                Ok(cell) => cell.into_inner(),
-                Err(rc) => rc.borrow().clone(),
+                // Recover the owned Document. Dropping the isolate releases the context (and HostState
+                // slot, which holds the only other Rc clone of `shared`), so `try_unwrap` succeeds.
+                drop(isolate);
+                let doc = match Rc::try_unwrap(shared) {
+                    Ok(cell) => cell.into_inner(),
+                    Err(rc) => rc.borrow().clone(),
+                };
+                (doc, results)
             };
-            (doc, results)
-            })();
             let _ = tx.send(result);
         });
 
@@ -14324,7 +14583,9 @@ impl ModuleRegistry {
             return None;
         }
         let fetched = (self.fetcher)(url)?.0;
-        self.sources.borrow_mut().insert(url.to_string(), fetched.clone());
+        self.sources
+            .borrow_mut()
+            .insert(url.to_string(), fetched.clone());
         Some(fetched)
     }
 }
@@ -14359,10 +14620,16 @@ fn compile_and_register<'s>(
     let mut src = v8::script_compiler::Source::new(code, Some(&origin));
     let module = v8::script_compiler::compile_module(scope, &mut src)?;
     let global = v8::Global::new(scope, module);
-    registry.compiled.borrow_mut().insert(url.to_string(), global);
+    registry
+        .compiled
+        .borrow_mut()
+        .insert(url.to_string(), global);
     // Record identity -> URL so the resolve/dynamic-import callbacks can recover this module's own
     // canonical URL when resolving its relative specifiers.
-    registry.identity_to_url.borrow_mut().insert(module.get_identity_hash().get() as i32, url.to_string());
+    registry
+        .identity_to_url
+        .borrow_mut()
+        .insert(module.get_identity_hash().get() as i32, url.to_string());
     Some(module)
 }
 
@@ -14406,7 +14673,7 @@ fn resolve_module_callback<'s>(
 ) -> Option<v8::Local<'s, v8::Module>> {
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
-    let referrer_identity = referrer.get_identity_hash().get() as i32;
+    let referrer_identity = referrer.get_identity_hash().get();
     let url = {
         let registry = scope.get_current_context().get_slot::<ModuleRegistry>()?;
         resolve_against_referrer(&registry, &spec, Some(referrer_identity))
@@ -14450,7 +14717,10 @@ extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
         }
     }
     if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
-        state.console.borrow_mut().push(format!("⚠ Unhandled rejection: {text}"));
+        state
+            .console
+            .borrow_mut()
+            .push(format!("⚠ Unhandled rejection: {text}"));
     }
 }
 
@@ -14556,15 +14826,13 @@ extern "C" fn initialize_import_meta_callback(
         let Some(registry) = scope.get_current_context().get_slot::<ModuleRegistry>() else {
             return;
         };
-        let identity = module.get_identity_hash().get() as i32;
+        let identity = module.get_identity_hash().get();
         let mapped = registry.identity_to_url.borrow().get(&identity).cloned();
         mapped.unwrap_or_else(|| registry.base_url.clone())
     };
 
     // import.meta.url = <canonical url>
-    if let (Some(key), Some(val)) =
-        (v8::String::new(scope, "url"), v8::String::new(scope, &url))
-    {
+    if let (Some(key), Some(val)) = (v8::String::new(scope, "url"), v8::String::new(scope, &url)) {
         meta.create_data_property(scope, key.into(), val.into());
     }
 
@@ -14635,7 +14903,8 @@ pub fn run_modules(
             // Populate `import.meta.url` for every module the first time it touches `import.meta`,
             // so relative `new URL(..., import.meta.url)` (e.g. browserscore's support-status.js
             // `fetch(new URL('./support-status.css', import.meta.url))`) resolves correctly.
-            isolate.set_host_initialize_import_meta_object_callback(initialize_import_meta_callback);
+            isolate
+                .set_host_initialize_import_meta_object_callback(initialize_import_meta_callback);
 
             let mut results: Vec<EvalOutput> = Vec::with_capacity(entries.len());
             {
@@ -14768,7 +15037,11 @@ fn run_one_entry(scope: &mut v8::PinScope, entry: &str) -> EvalOutput {
         .map(|s| std::mem::take(&mut *s.console.borrow_mut()))
         .unwrap_or_default();
 
-    EvalOutput { value: None, console, error }
+    EvalOutput {
+        value: None,
+        console,
+        error,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -14932,8 +15205,18 @@ impl Session {
                 // channel is dropped and the caller falls back to an empty snapshot.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     session_thread_main(
-                        doc, scripts, entries, modules, url, fetcher, request_fetcher,
-                        ws_connector, init_tx, cmd_rx, initial_rects, stats_thread,
+                        doc,
+                        scripts,
+                        entries,
+                        modules,
+                        url,
+                        fetcher,
+                        request_fetcher,
+                        ws_connector,
+                        init_tx,
+                        cmd_rx,
+                        initial_rects,
+                        stats_thread,
                     );
                 }));
             });
@@ -14942,7 +15225,11 @@ impl Session {
             Ok(h) => h,
             Err(e) => {
                 return (
-                    Session { tx: cmd_tx, handle: None, stats },
+                    Session {
+                        tx: cmd_tx,
+                        handle: None,
+                        stats,
+                    },
                     fallback,
                     vec![EvalOutput {
                         value: None,
@@ -14968,7 +15255,15 @@ impl Session {
             ),
         };
 
-        (Session { tx: cmd_tx, handle: Some(handle), stats }, snapshot, outputs)
+        (
+            Session {
+                tx: cmd_tx,
+                handle: Some(handle),
+                stats,
+            },
+            snapshot,
+            outputs,
+        )
     }
 
     /// Dispatch a synthetic bubbling event to `node_id`, drain the event loop, and return a fresh
@@ -14993,7 +15288,9 @@ impl Session {
         if self.tx.send(cmd).is_err() {
             return (dom::Document::new(), Vec::new());
         }
-        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        reply_rx
+            .recv()
+            .unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
     }
 
     /// Deliver a key press to `node_id`: fires `keydown`, mutates the focused text field's value
@@ -15015,7 +15312,9 @@ impl Session {
         if self.tx.send(cmd).is_err() {
             return (dom::Document::new(), Vec::new());
         }
-        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        reply_rx
+            .recv()
+            .unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
     }
 
     /// Push the engine's laid-out element rects (CSS px, document-absolute, top-origin) to the
@@ -15053,9 +15352,7 @@ impl Session {
     /// flag is already updated via [`set_color_scheme_dark`]; this just dispatches the JS events and
     /// drains the loop so any DOM mutations the handlers make are reflected.
     pub fn notify_color_scheme_changed(&self) -> (dom::Document, Vec<String>) {
-        self.eval_interact(
-            "(globalThis.__mediaChanged && globalThis.__mediaChanged())".to_string(),
-        )
+        self.eval_interact("(globalThis.__mediaChanged && globalThis.__mediaChanged())".to_string())
     }
 
     /// Evaluate an arbitrary JS source string against the live context, drain the event loop, and
@@ -15078,8 +15375,9 @@ impl Session {
     /// rasterize: `[{id,width,height,commands:[...]}, ...]`. Empty `[]` when no canvas has a
     /// context. The engine gates this on the DOM actually containing a `<canvas>`.
     pub fn canvas_lists(&self) -> String {
-        let (out, _doc, _console) =
-            self.eval_full("JSON.stringify((globalThis.__canvasLists||function(){return[]})())".to_string());
+        let (out, _doc, _console) = self.eval_full(
+            "JSON.stringify((globalThis.__canvasLists||function(){return[]})())".to_string(),
+        );
         out.value.unwrap_or_else(|| "[]".to_string())
     }
 
@@ -15094,7 +15392,14 @@ impl Session {
     fn eval_full(&self, source: String) -> (EvalOutput, dom::Document, Vec<String>) {
         let (reply_tx, reply_rx) =
             std::sync::mpsc::channel::<(EvalOutput, dom::Document, Vec<String>)>();
-        if self.tx.send(SessionCmd::Eval { source, reply: reply_tx }).is_err() {
+        if self
+            .tx
+            .send(SessionCmd::Eval {
+                source,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return (EvalOutput::default(), dom::Document::new(), Vec::new());
         }
         reply_rx
@@ -15155,7 +15460,11 @@ impl Session {
     /// Fire a synthetic **non-bubbling** event of `kind` on `node_id` (target only), drain the
     /// loop, and return a fresh DOM snapshot + console. Used for `focus`/`blur`/`mouseenter`/
     /// `mouseleave`.
-    pub fn fire_event_nonbubbling(&self, node_id: usize, kind: &str) -> (dom::Document, Vec<String>) {
+    pub fn fire_event_nonbubbling(
+        &self,
+        node_id: usize,
+        kind: &str,
+    ) -> (dom::Document, Vec<String>) {
         self.eval_interact(format!(
             "__dispatchSyntheticEventNonBubbling({}, {}, {{}})",
             node_id,
@@ -15211,7 +15520,8 @@ unsafe extern "C" fn near_heap_limit_cb(
 /// Create a V8 isolate with a bounded heap + the graceful-OOM guard, so a single page can't crash
 /// the process. The leaked `IsolateHandle` lives as long as the isolate (one per session).
 fn new_guarded_isolate() -> v8::OwnedIsolate {
-    let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, SESSION_HEAP_MAX));
+    let mut isolate =
+        v8::Isolate::new(v8::CreateParams::default().heap_limits(0, SESSION_HEAP_MAX));
     let handle = Box::into_raw(Box::new(isolate.thread_safe_handle()));
     isolate.add_near_heap_limit_callback(near_heap_limit_cb, handle as *mut std::ffi::c_void);
     isolate
@@ -15260,7 +15570,8 @@ fn session_thread_main(
         let scope = &mut v8::ContextScope::new(handle_scope, context);
 
         // Share one fetcher between the module loader and the JS `fetch()` primitive (as run_modules).
-        let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> = Rc::new(move |u: &str| fetcher(u));
+        let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> =
+            Rc::new(move |u: &str| fetcher(u));
         let state = HostState::with_fetcher(
             Rc::clone(&shared),
             Rc::clone(&fetcher),
@@ -15283,7 +15594,9 @@ fn session_thread_main(
         // Seed the engine-computed layout rects BEFORE scripts run, so synchronous
         // getBoundingClientRect / elementFromPoint / caret*FromPoint reads during page load see real
         // geometry (the rect table is otherwise empty until the engine's first post-load push).
-        if let Some((rects, naturals, insets, margins, scroll_y_css, doc_height_css)) = initial_rects {
+        if let Some((rects, naturals, insets, margins, scroll_y_css, doc_height_css)) =
+            initial_rects
+        {
             let state = host_state(scope);
             {
                 let mut map = state.layout_rects.borrow_mut();
@@ -15318,8 +15631,7 @@ fn session_thread_main(
         }
 
         // Run initial classic scripts in order, then the module graph, exactly as the load path.
-        let mut results: Vec<EvalOutput> =
-            Vec::with_capacity(scripts.len() + entries.len());
+        let mut results: Vec<EvalOutput> = Vec::with_capacity(scripts.len() + entries.len());
         for source in &scripts {
             results.push(eval_source(scope, source, "<script>"));
         }
@@ -15329,7 +15641,11 @@ fn session_thread_main(
         drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
         // Load drain done; switch the timer clock to real time so subsequent ticks/events run
         // setInterval/setTimeout/rAF over actual elapsed time.
-        eval_internal(scope, "if (typeof __enterRealtime === 'function') { __enterRealtime(); }", "<realtime>");
+        eval_internal(
+            scope,
+            "if (typeof __enterRealtime === 'function') { __enterRealtime(); }",
+            "<realtime>",
+        );
 
         // Send the initial snapshot back to Session::new's caller.
         let _ = init_tx.send((shared.borrow().clone(), results));
@@ -15340,7 +15656,13 @@ fn session_thread_main(
     for cmd in cmd_rx {
         let __cmd_t0 = std::time::Instant::now();
         match cmd {
-            SessionCmd::Dispatch { node_id, kind, x, y, reply } => {
+            SessionCmd::Dispatch {
+                node_id,
+                kind,
+                x,
+                y,
+                reply,
+            } => {
                 let ctx = context.clone();
                 v8::scope!(let handle_scope, &mut isolate);
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
@@ -15358,7 +15680,12 @@ fn session_thread_main(
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
-            SessionCmd::Key { node_id, key, code, reply } => {
+            SessionCmd::Key {
+                node_id,
+                key,
+                code,
+                reply,
+            } => {
                 let ctx = context.clone();
                 v8::scope!(let handle_scope, &mut isolate);
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
@@ -15380,7 +15707,11 @@ fn session_thread_main(
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![eval_source(scope, &source, "<interact>")];
-                let first = EvalOutput { value: results[0].value.clone(), error: results[0].error.clone(), console: Vec::new() };
+                let first = EvalOutput {
+                    value: results[0].value.clone(),
+                    error: results[0].error.clone(),
+                    console: Vec::new(),
+                };
                 drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((first, shared.borrow().clone(), console));
@@ -15391,7 +15722,8 @@ fn session_thread_main(
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![EvalOutput::default()];
-                let did_work = drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
+                let did_work =
+                    drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 // Only snapshot+report when something actually ran, so idle ticks are cheap.
                 if did_work {
                     let console = results.into_iter().flat_map(|r| r.console).collect();
@@ -15400,7 +15732,14 @@ fn session_thread_main(
                     let _ = reply.send(None);
                 }
             }
-            SessionCmd::SetRects { rects, naturals, insets, margins, scroll_y_css, doc_height_css } => {
+            SessionCmd::SetRects {
+                rects,
+                naturals,
+                insets,
+                margins,
+                scroll_y_css,
+                doc_height_css,
+            } => {
                 // Store on HostState (no JS run needed — just update the geometry tables). Re-enter
                 // the persistent context to reach the slot. Fire-and-forget: no reply.
                 let ctx = context.clone();
@@ -15453,8 +15792,13 @@ fn session_thread_main(
         }
         // Per-tab stats for the tab tooltip: active JS time this command (CPU proxy — the thread is
         // otherwise blocked on recv) + the V8 heap used size. Cheap, sampled once per command.
-        stats.cpu_ns.fetch_add(__cmd_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        stats.heap_bytes.store(isolate.get_heap_statistics().used_heap_size() as u64, Ordering::Relaxed);
+        stats
+            .cpu_ns
+            .fetch_add(__cmd_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        stats.heap_bytes.store(
+            isolate.get_heap_statistics().used_heap_size() as u64,
+            Ordering::Relaxed,
+        );
     }
     // Loop ended (Stop or sender dropped). Drop the isolate on its own thread.
     drop(context);
@@ -15543,7 +15887,6 @@ mod tests {
 
     /// Build `<html><head><title>..</title></head><body>..</body></html>` plus any extra
     /// body children, returning the doc and the body id.
-
     fn doc_with_body(title: &str) -> (dom::Document, dom::NodeId) {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -15571,7 +15914,10 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some(r#"<span class="hi">x</span>"#));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(r#"<span class="hi">x</span>"#)
+        );
     }
 
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
@@ -15606,7 +15952,10 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("InvalidCharacterError|5|true"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("InvalidCharacterError|5|true")
+        );
     }
 
     // --- HTML IDL attribute reflection ---------------------------------------------------------
@@ -15634,11 +15983,15 @@ mod tests {
                 e.setAttribute("tabindex", "5"); r.push(e.tabIndex); // 5
                 e.setAttribute("tabindex", "x"); r.push(e.tabIndex); // 0 (invalid)
                 r.join("|");
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("string||hi|yo|boolean|false|true|false|number|5|0"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("string||hi|yo|boolean|false|true|false|number|5|0")
+        );
     }
 
     #[test]
@@ -15655,7 +16008,8 @@ mod tests {
                 r.push(a.target);                       // "" (plain DOMString)
                 a.target = "_blank"; r.push(a.getAttribute("target")); // _blank
                 r.join("|");
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/base/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15678,11 +16032,15 @@ mod tests {
                 r.push(i.maxLength);                    // -1 (limited long default)
                 i.setAttribute("maxlength", "5"); r.push(i.maxLength); // 5
                 r.join("|");
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("text|text|email|boolean|true|-1|5"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("text|text|email|boolean|true|-1|5")
+        );
     }
 
     #[test]
@@ -15698,7 +16056,8 @@ mod tests {
                 c.setAttribute("colspan", "0"); r.push(c.colSpan); // 1 (clamped to min)
                 c.setAttribute("colspan", "x"); r.push(c.colSpan); // 1 (invalid -> default)
                 r.join("|");
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15710,9 +16069,11 @@ mod tests {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
             doc,
-            vec![r#"var e = document.createElementNS("http://www.w3.org/2000/svg", "svg:Rect");
+            vec![
+                r#"var e = document.createElementNS("http://www.w3.org/2000/svg", "svg:Rect");
                     [e.namespaceURI, e.prefix, e.localName, e.tagName, e.nodeName].join("|")"#
-                .to_string()],
+                    .to_string(),
+            ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15842,7 +16203,8 @@ mod tests {
                          Event.AT_TARGET === 2 && Event.BUBBLING_PHASE === 3;
                 e.preventDefault();
                 [ok, e.defaultPrevented, e.returnValue].join(",")
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15857,7 +16219,8 @@ mod tests {
             vec![r#"
                 var e = new CustomEvent("y", { detail: 42 });
                 [e.detail === 42, e instanceof Event, e instanceof CustomEvent].join(",")
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15873,7 +16236,8 @@ mod tests {
                 var e = new MouseEvent("click", { clientX: 5 });
                 [e.clientX === 5, e instanceof MouseEvent, e instanceof UIEvent,
                  e instanceof Event].join(",")
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15910,7 +16274,8 @@ mod tests {
                 var ret = document.dispatchEvent(ev);
                 [preType === "", ev.type === "ping", fired, ret,
                  ev instanceof Event].join(",")
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15927,7 +16292,8 @@ mod tests {
                 try { document.createEvent("nope"); }
                 catch (e) { name = e.name; }
                 name
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -15998,7 +16364,8 @@ mod tests {
                 document.addEventListener("zap", function (e) { phase = e.eventPhase; }, true);
                 c.dispatchEvent(new Event("zap", { bubbles: true }));
                 phase
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16027,7 +16394,8 @@ mod tests {
                 p.addEventListener("t", function () { reached++; });
                 k.dispatchEvent(new Event("t", { bubbles: true }));
                 reached
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16094,11 +16462,20 @@ mod tests {
         let (_doc, out) = run_with_dom(doc, vec![src.to_string()], "https://example.com/");
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let json = out[0].value.clone().unwrap_or_default();
-        assert!(json.contains("\"op\":\"fillRect\"") && json.contains("\"clip\""), "no clipped fill: {json}");
+        assert!(
+            json.contains("\"op\":\"fillRect\"") && json.contains("\"clip\""),
+            "no clipped fill: {json}"
+        );
         assert!(json.contains("\"dash\""), "no dash on stroke: {json}");
-        assert!(json.contains("\"op\":\"drawImage\""), "no drawImage cmd: {json}");
-        assert!(json.contains("\"op\":\"putImageData\""), "no putImageData cmd: {json}");
-        assert!(json.contains("getLineDash") == false); // sanity: no leaked fn names
+        assert!(
+            json.contains("\"op\":\"drawImage\""),
+            "no drawImage cmd: {json}"
+        );
+        assert!(
+            json.contains("\"op\":\"putImageData\""),
+            "no putImageData cmd: {json}"
+        );
+        assert!(!json.contains("getLineDash")); // sanity: no leaked fn names
     }
 
     /// getLineDash mirrors setLineDash; lineDashOffset round-trips; getImageData returns the engine
@@ -16156,7 +16533,8 @@ mod tests {
         let (mut doc, body) = doc_with_body("");
         let p = doc.append_element(body, "p");
         if let dom::NodeData::Element(e) = &mut doc.get_mut(p).data {
-            e.attrs.insert("style".to_string(), "font-size:18px".to_string());
+            e.attrs
+                .insert("style".to_string(), "font-size:18px".to_string());
         }
         let (_doc, out) = run_with_dom(
             doc,
@@ -16177,7 +16555,10 @@ mod tests {
         // <style> in <head>
         let head = doc.get(doc.get(body).parent.unwrap()).children[0]; // html -> head
         let style_el = doc.append_element(head, "style");
-        doc.append_child(style_el, dom::NodeData::Text(".x{display:flex}".to_string()));
+        doc.append_child(
+            style_el,
+            dom::NodeData::Text(".x{display:flex}".to_string()),
+        );
         let d = doc.append_element(body, "div");
         if let dom::NodeData::Element(e) = &mut doc.get_mut(d).data {
             e.attrs.insert("class".to_string(), "x".to_string());
@@ -16206,11 +16587,15 @@ mod tests {
                 el.style.right = "-0px";
                 el.style.backgroundImage = "url(http://localhost/)";
                 [el.style.top, el.style.left, el.style.right, el.style.backgroundImage].join("|");
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some(r#"0.5%|-0.1em|0px|url("http://localhost/")"#));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(r#"0.5%|-0.1em|0px|url("http://localhost/")"#)
+        );
     }
 
     #[test]
@@ -16226,7 +16611,8 @@ mod tests {
                 el.style.cssText = "position: static; top: 5px";
                 var cs = getComputedStyle(el);
                 [cs.top, cs.left].join("|");
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16241,7 +16627,10 @@ mod tests {
         let (mut doc, body) = doc_with_body("");
         let head = doc.get(doc.get(body).parent.unwrap()).children[0];
         let style_el = doc.append_element(head, "style");
-        doc.append_child(style_el, dom::NodeData::Text(".a { color: red }".to_string()));
+        doc.append_child(
+            style_el,
+            dom::NodeData::Text(".a { color: red }".to_string()),
+        );
         let (_doc, out) = run_with_dom(
             doc,
             vec![r#"
@@ -16254,11 +16643,15 @@ mod tests {
                 rule.selectorText = ":after";             // pseudo-class -> pseudo-element form
                 r.push(rule.selectorText);
                 r.join("|");
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some(".a|span > div|span > div|::after"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(".a|span > div|span > div|::after")
+        );
     }
 
     #[test]
@@ -16269,21 +16662,25 @@ mod tests {
         doc.append_element(body, "div");
         let (_doc, out) = run_with_dom(
             doc,
-            vec![
-                r#"var el = document.querySelectorAll('div')[0];
+            vec![r#"var el = document.querySelectorAll('div')[0];
                    var before = getComputedStyle(el).color;
                    el.style.color = 'rgb(1, 2, 3)';
                    var after = getComputedStyle(el).color;
                    before + '|' + after"#
-                    .to_string(),
-            ],
+                .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         // `before` is the inherited default; `after` is the freshly-set inline color.
         let v = out[0].value.as_deref().unwrap();
-        assert!(v.ends_with("|rgb(1, 2, 3)"), "expected new color after mutation, got {v}");
-        assert_ne!(v, "rgb(1, 2, 3)|rgb(1, 2, 3)", "before should differ from after");
+        assert!(
+            v.ends_with("|rgb(1, 2, 3)"),
+            "expected new color after mutation, got {v}"
+        );
+        assert_ne!(
+            v, "rgb(1, 2, 3)|rgb(1, 2, 3)",
+            "before should differ from after"
+        );
     }
 
     #[test]
@@ -16295,7 +16692,9 @@ mod tests {
         let style_el = doc.append_element(head, "style");
         doc.append_child(
             style_el,
-            dom::NodeData::Text("#x { color: rgb(0, 0, 1) } #x::before { color: red; content: \"x\" }".to_string()),
+            dom::NodeData::Text(
+                "#x { color: rgb(0, 0, 1) } #x::before { color: red; content: \"x\" }".to_string(),
+            ),
         );
         let el = doc.append_element(body, "div");
         if let dom::NodeData::Element(e) = &mut doc.get_mut(el).data {
@@ -16434,11 +16833,9 @@ mod tests {
         let (doc, _) = doc_with_body("");
         let (_d, out) = run_with_dom(
             doc,
-            vec![
-                "var s = document.createElement('div').style; \
+            vec!["var s = document.createElement('div').style; \
                  s.cssText = 'overflow-x: initial; overflow-y: initial'; s.cssText"
-                    .to_string(),
-            ],
+                .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16460,7 +16857,10 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("1|--a;b|value|--a\\;b: value;"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("1|--a;b|value|--a\\;b: value;")
+        );
     }
 
     #[test]
@@ -16468,12 +16868,10 @@ mod tests {
         let (doc, _) = doc_with_body("");
         let (_d, out) = run_with_dom(
             doc,
-            vec![
-                "var sheet = new CSSStyleSheet(); var m = sheet.media; \
+            vec!["var sheet = new CSSStyleSheet(); var m = sheet.media; \
                  m.appendMedium('screen'); m.appendMedium('print'); var a = m.mediaText; \
                  m.deleteMedium('screen'); [a, m.mediaText, m.length, m.item(0)].join('|')"
-                    .to_string(),
-            ],
+                .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16495,7 +16893,10 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some(":nth-child(3n)|:nth-child(2n)"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(":nth-child(3n)|:nth-child(2n)")
+        );
     }
 
     #[test]
@@ -16542,18 +16943,13 @@ mod tests {
         // replaceSync on a <style>'s live (non-constructed) sheet throws NotAllowedError.
         let (mut doc, body) = doc_with_body("");
         let style = doc.append_element(body, "style");
-        doc.append_child(
-            style,
-            dom::NodeData::Text(".a { color: red }".to_string()),
-        );
+        doc.append_child(style, dom::NodeData::Text(".a { color: red }".to_string()));
         let (_d, out) = run_with_dom(
             doc,
-            vec![
-                "var s = document.querySelector('style').sheet; \
+            vec!["var s = document.querySelector('style').sheet; \
                  var name = ''; try { s.replaceSync('.b{color:blue}'); name = 'no-throw'; } \
                  catch (e) { name = e.name; } name"
-                    .to_string(),
-            ],
+                .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16582,10 +16978,7 @@ mod tests {
         // non-constructed (live <style>) sheet is also accepted (csswg-drafts #10013, tentative).
         let (mut doc, body) = doc_with_body("");
         let style = doc.append_element(body, "style");
-        doc.append_child(
-            style,
-            dom::NodeData::Text(".a { color: red }".to_string()),
-        );
+        doc.append_child(style, dom::NodeData::Text(".a { color: red }".to_string()));
         let (_d, out) = run_with_dom(
             doc,
             vec![
@@ -16658,7 +17051,11 @@ mod tests {
     #[test]
     fn document_title_returns_title_text() {
         let (doc, _) = doc_with_body("My Page");
-        let (_doc, out) = run_with_dom(doc, vec!["document.title".to_string()], "https://example.com/");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec!["document.title".to_string()],
+            "https://example.com/",
+        );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("My Page"));
     }
@@ -16693,15 +17090,13 @@ mod tests {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(
             doc,
-            vec![
-                r#"var el = document.createElement("div");
+            vec![r#"var el = document.createElement("div");
                    el.innerHTML = '<div foo="bar">hi</div>';
                    [el.children.length,
                     el.children[0].tagName,
                     el.children[0].getAttribute("foo"),
                     el.children[0].textContent].join("|")"#
-                    .to_string(),
-            ],
+                .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16727,11 +17122,17 @@ mod tests {
     #[test]
     fn set_timeout_callback_runs_and_logs() {
         let (doc, _) = doc_with_body("");
-        let (_doc, out) =
-            run_with_dom(doc, vec![r#"setTimeout(() => console.log("tick"), 0);"#.to_string()], "https://example.com/");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"setTimeout(() => console.log("tick"), 0);"#.to_string()],
+            "https://example.com/",
+        );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
-        assert!(all.iter().any(|l| l == "tick"), "expected 'tick' in {all:?}");
+        assert!(
+            all.iter().any(|l| l == "tick"),
+            "expected 'tick' in {all:?}"
+        );
     }
 
     #[test]
@@ -16748,7 +17149,10 @@ mod tests {
         let fast = all.iter().position(|l| l == "fast");
         let slow = all.iter().position(|l| l == "slow");
         assert!(fast.is_some() && slow.is_some(), "got {all:?}");
-        assert!(fast < slow, "fast (10ms) must run before slow (50ms): {all:?}");
+        assert!(
+            fast < slow,
+            "fast (10ms) must run before slow (50ms): {all:?}"
+        );
     }
 
     #[test]
@@ -16756,13 +17160,18 @@ mod tests {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
             doc,
-            vec![r#"var id = setTimeout(() => console.log("nope"), 0); clearTimeout(id);"#
-                .to_string()],
+            vec![
+                r#"var id = setTimeout(() => console.log("nope"), 0); clearTimeout(id);"#
+                    .to_string(),
+            ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
-        assert!(!all.iter().any(|l| l == "nope"), "cancelled callback ran: {all:?}");
+        assert!(
+            !all.iter().any(|l| l == "nope"),
+            "cancelled callback ran: {all:?}"
+        );
     }
 
     #[test]
@@ -16784,7 +17193,10 @@ mod tests {
             1,
             "interval should fire exactly once per load drain: {all:?}"
         );
-        assert!(all.iter().any(|l| l == "tick1"), "interval should fire once: {all:?}");
+        assert!(
+            all.iter().any(|l| l == "tick1"),
+            "interval should fire once: {all:?}"
+        );
     }
 
     #[test]
@@ -16816,9 +17228,15 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
         // The later timer still ran despite the earlier one throwing.
-        assert!(all.iter().any(|l| l == "after"), "loop died on throw: {all:?}");
+        assert!(
+            all.iter().any(|l| l == "after"),
+            "loop died on throw: {all:?}"
+        );
         // The error surfaced (prefixed with the warning marker).
-        assert!(all.iter().any(|l| l.contains('⚠') && l.contains("boom")), "error not reported: {all:?}");
+        assert!(
+            all.iter().any(|l| l.contains('⚠') && l.contains("boom")),
+            "error not reported: {all:?}"
+        );
     }
 
     #[test]
@@ -16833,7 +17251,10 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
         assert!(all.iter().any(|l| l == "raf"), "rAF did not run: {all:?}");
-        assert!(!all.iter().any(|l| l == "cancelled"), "cancelAnimationFrame failed: {all:?}");
+        assert!(
+            !all.iter().any(|l| l == "cancelled"),
+            "cancelAnimationFrame failed: {all:?}"
+        );
     }
 
     #[test]
@@ -16867,7 +17288,8 @@ mod tests {
               r.push(e.lookupNamespaceURI(null));              // bazURI
               r.push(e.lookupPrefix('fooNamespace'));          // prefix
               r.join('|')
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16886,11 +17308,15 @@ mod tests {
               var dt = document.implementation.createDocumentType('html', 'pub', 'sys');
               [dt.name, dt.nodeName, dt.publicId, dt.systemId, dt.nodeType,
                String(dt.nodeValue), String(dt.textContent)].join('|')
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("html|html|pub|sys|10|null|null"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("html|html|pub|sys|10|null|null")
+        );
     }
 
     #[test]
@@ -16911,7 +17337,10 @@ mod tests {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(
             doc,
-            vec![r#"[CSS.escape(".foo#bar"), CSS.escape("0abc"), CSS.escape("-")].join('|')"#.to_string()],
+            vec![
+                r#"[CSS.escape(".foo#bar"), CSS.escape("0abc"), CSS.escape("-")].join('|')"#
+                    .to_string(),
+            ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16934,7 +17363,8 @@ mod tests {
               el2.setAttributeNode(a);
               [same, a.value, el2.getAttribute('foo'), a.ownerElement === el2,
                a === el2.getAttributeNode('foo')].join('|')
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -16953,11 +17383,15 @@ mod tests {
               var area = document.createElement('div');     // div has no relList
               [a.getAttribute('rel'), Object.prototype.toString.call(a.relList),
                (area.relList === undefined)].join('|')
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("noopener noreferrer|[object DOMTokenList]|true"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("noopener noreferrer|[object DOMTokenList]|true")
+        );
     }
 
     #[test]
@@ -16971,7 +17405,8 @@ mod tests {
               el.toggleAttribute('a'); el.toggleAttribute('b');
               el.setAttribute('a', 'thing'); el.toggleAttribute('c');
               el.getAttributeNames().join(',')
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -17135,7 +17570,10 @@ mod tests {
               typeof window.dispatchEvent, typeof document.removeEventListener].join(',')",
         );
         assert_eq!(out.error, None, "{out:?}");
-        assert_eq!(out.value.as_deref(), Some("function,function,function,function"));
+        assert_eq!(
+            out.value.as_deref(),
+            Some("function,function,function,function")
+        );
     }
 
     #[test]
@@ -17152,8 +17590,14 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
-        assert!(all.iter().any(|l| l == "dcl-fired"), "DOMContentLoaded did not fire: {all:?}");
-        assert!(all.iter().any(|l| l == "load-fired"), "load did not fire: {all:?}");
+        assert!(
+            all.iter().any(|l| l == "dcl-fired"),
+            "DOMContentLoaded did not fire: {all:?}"
+        );
+        assert!(
+            all.iter().any(|l| l == "load-fired"),
+            "load did not fire: {all:?}"
+        );
     }
 
     #[test]
@@ -17240,7 +17684,10 @@ mod tests {
              [r, recs.length, recs[0].type, recs[0].attributeName, recs[0].oldValue, el.getAttribute('class')].join('|')",
         );
         assert_eq!(out.error, None, "{out:?}");
-        assert_eq!(out.value.as_deref(), Some("true|1|attributes|class|a b c|a d c"));
+        assert_eq!(
+            out.value.as_deref(),
+            Some("true|1|attributes|class|a b c|a d c")
+        );
     }
 
     #[test]
@@ -17301,7 +17748,10 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         // toggle('a')->false 'b'; toggle('a')->true 'b a'; toggle('a',true)->true 'a b'; toggle('c',false)->false 'a b'
-        assert_eq!(out.value.as_deref(), Some("false|b|true|b a|true|a b|false|a b"));
+        assert_eq!(
+            out.value.as_deref(),
+            Some("false|b|true|b a|true|a b|false|a b")
+        );
     }
 
     #[test]
@@ -17316,7 +17766,10 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         // replace c->a dedups to 'a b'; replace c (absent)->d returns false, raw unchanged; replace a->c => 'c b'
-        assert_eq!(out.value.as_deref(), Some("true:a b|false:a a a  b|true:c b"));
+        assert_eq!(
+            out.value.as_deref(),
+            Some("true:a b|false:a a a  b|true:c b")
+        );
     }
 
     #[test]
@@ -17354,7 +17807,10 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         // InvalidCharacterError DOMException, code 5
-        assert_eq!(out.value.as_deref(), Some("true|InvalidCharacterError|5|true"));
+        assert_eq!(
+            out.value.as_deref(),
+            Some("true|InvalidCharacterError|5|true")
+        );
     }
 
     #[test]
@@ -17432,7 +17888,9 @@ mod tests {
         let (doc, body) = doc_with_body("");
         let (doc, out) = run_with_dom(
             doc,
-            vec![r#"document.body.style.display = "none"; document.body.style.display"#.to_string()],
+            vec![
+                r#"document.body.style.display = "none"; document.body.style.display"#.to_string(),
+            ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -17496,7 +17954,10 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("color: red; font-size: 10pt;"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("color: red; font-size: 10pt;")
+        );
         assert_eq!(out[1].value.as_deref(), Some("false"));
         // The body's style attribute reflects only the valid declarations.
         let style = attr_of(&doc, body, "style").unwrap_or_default();
@@ -17522,7 +17983,8 @@ mod tests {
                 el.style.zIndex = "10"; // same value -> no new record
                 var second = mo.takeRecords();
                 first.length + "|" + (first[0] && first[0].attributeName) + "|" + second.length
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -17541,7 +18003,10 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("red"));
         let style = attr_of(&doc, body, "style").unwrap_or_default();
-        assert!(style.contains("background-color: red"), "style attr was {style:?}");
+        assert!(
+            style.contains("background-color: red"),
+            "style attr was {style:?}"
+        );
     }
 
     #[test]
@@ -17552,7 +18017,8 @@ mod tests {
         let html = doc.append_element(root, "html");
         let body = doc.append_element(html, "body");
         if let dom::NodeData::Element(e) = &mut doc.get_mut(body).data {
-            e.attrs.insert("style".into(), "display: none; color: blue".into());
+            e.attrs
+                .insert("style".into(), "display: none; color: blue".into());
         }
         let (_doc, out) = run_with_dom(
             doc,
@@ -17804,14 +18270,19 @@ mod tests {
         let child = doc.append_element(body, "div");
         let (doc, out) = run_with_dom(
             doc,
-            vec![r#"var c = document.body.firstElementChild; c.style.display = "block"; c.tagName"#
-                .to_string()],
+            vec![
+                r#"var c = document.body.firstElementChild; c.style.display = "block"; c.tagName"#
+                    .to_string(),
+            ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("DIV"));
         let style = attr_of(&doc, child, "style").unwrap_or_default();
-        assert!(style.contains("display: block"), "child style attr was {style:?}");
+        assert!(
+            style.contains("display: block"),
+            "child style attr was {style:?}"
+        );
     }
 
     #[test]
@@ -17864,10 +18335,20 @@ mod tests {
         modules.insert(util, "export const v = 42;".to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
-        assert!(console.iter().any(|l| l == "got 42"), "console was {console:?}");
+        assert!(
+            console.iter().any(|l| l == "got 42"),
+            "console was {console:?}"
+        );
     }
 
     #[test]
@@ -17881,13 +18362,26 @@ mod tests {
             r#"import { hello } from "https://x/mid.js"; console.log(hello());"#.to_string(),
         );
         modules.insert(mid, r#"export * from "https://x/leaf.js";"#.to_string());
-        modules.insert(leaf, r#"export function hello() { return "chained"; }"#.to_string());
+        modules.insert(
+            leaf,
+            r#"export function hello() { return "chained"; }"#.to_string(),
+        );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
-        assert!(console.iter().any(|l| l == "chained"), "console was {console:?}");
+        assert!(
+            console.iter().any(|l| l == "chained"),
+            "console was {console:?}"
+        );
     }
 
     #[test]
@@ -17902,8 +18396,14 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) =
-            run_modules(doc, "https://x/", vec![entry.clone()], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry.clone()],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(
@@ -17929,9 +18429,19 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         // Must not panic; the entry's evaluation surfaces an error.
-        assert!(out.iter().any(|o| o.error.is_some()), "expected an error, got {out:?}");
+        assert!(
+            out.iter().any(|o| o.error.is_some()),
+            "expected an error, got {out:?}"
+        );
     }
 
     #[test]
@@ -17943,7 +18453,14 @@ mod tests {
         modules.insert(dep, r#"console.log("side effect ran");"#.to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(
@@ -17969,7 +18486,10 @@ mod tests {
         let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
             Arc::new(|method, u, _b, _h| {
                 assert_eq!(method, "GET");
-                assert_eq!(u, "https://x/data.json", "fetch should resolve relative URLs");
+                assert_eq!(
+                    u, "https://x/data.json",
+                    "fetch should resolve relative URLs"
+                );
                 Some(
                     r#"{"ok":true,"status":200,"statusText":"OK","url":"https://x/data.json","contentType":"application/json","body":"{\"score\": 99}"}"#
                         .to_string(),
@@ -17977,10 +18497,20 @@ mod tests {
             });
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), request_fetcher);
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            request_fetcher,
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
-        assert!(console.iter().any(|l| l == "got:99"), "console was {console:?}");
+        assert!(
+            console.iter().any(|l| l == "got:99"),
+            "console was {console:?}"
+        );
     }
 
     #[test]
@@ -17995,11 +18525,20 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(
-            console.iter().any(|l| l == "caught:TypeError:Failed to fetch"),
+            console
+                .iter()
+                .any(|l| l == "caught:TypeError:Failed to fetch"),
             "console was {console:?}"
         );
     }
@@ -18044,7 +18583,11 @@ mod tests {
             dom::NodeData::Element(e) => e.attrs.get("data-a").cloned(),
             _ => None,
         };
-        assert_eq!(got.as_deref(), Some("AA"), "data-a should be set by the resolved fetch");
+        assert_eq!(
+            got.as_deref(),
+            Some("AA"),
+            "data-a should be set by the resolved fetch"
+        );
     }
 
     #[test]
@@ -18092,7 +18635,11 @@ mod tests {
             dom::NodeData::Element(e) => e.attrs.get("data-all").cloned(),
             _ => None,
         };
-        assert_eq!(got.as_deref(), Some("a,b,c,d,e"), "all five fetches should resolve");
+        assert_eq!(
+            got.as_deref(),
+            Some("a,b,c,d,e"),
+            "all five fetches should resolve"
+        );
         // Concurrent: 5x100ms serialized would be >=500ms; concurrently it is ~100ms + overhead.
         assert!(
             elapsed < std::time::Duration::from_millis(400),
@@ -18130,7 +18677,9 @@ mod tests {
         );
         let console = all_console(&out);
         assert!(
-            console.iter().any(|l| l == "caught:TypeError:Failed to fetch"),
+            console
+                .iter()
+                .any(|l| l == "caught:TypeError:Failed to fetch"),
             "console was {console:?}"
         );
     }
@@ -18164,12 +18713,22 @@ mod tests {
             .to_string(),
         );
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.contains(&"get:1".to_string()), "{console:?}");
         assert!(console.contains(&"getAll:1,2".to_string()), "{console:?}");
-        assert!(console.contains(&"has:true,false".to_string()), "{console:?}");
+        assert!(
+            console.contains(&"has:true,false".to_string()),
+            "{console:?}"
+        );
         assert!(console.contains(&"set:9".to_string()), "{console:?}");
         assert!(console.contains(&"del:false".to_string()), "{console:?}");
         // After set("a","9") (collapses a to one entry at end) and delete("b"), only a=9 remains.
@@ -18206,7 +18765,14 @@ mod tests {
             .to_string(),
         );
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.contains(&"user:luna".to_string()), "{console:?}");
@@ -18247,11 +18813,20 @@ mod tests {
                 )
             });
         let (doc, _) = doc_with_body("");
-        let (_doc, out) =
-            run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), request_fetcher);
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            request_fetcher,
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
-        assert!(console.contains(&"resp:201:done".to_string()), "{console:?}");
+        assert!(
+            console.contains(&"resp:201:done".to_string()),
+            "{console:?}"
+        );
         let (method, body, headers) = seen.lock().unwrap().clone();
         assert_eq!(method, "POST", "method uppercased + forwarded");
         assert_eq!(body, "hello=world", "body forwarded");
@@ -18288,13 +18863,22 @@ mod tests {
                 )
             });
         let (doc, _) = doc_with_body("");
-        let (_doc, out) =
-            run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), request_fetcher);
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            request_fetcher,
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.contains(&"ok:ok".to_string()), "{console:?}");
         let (body, headers) = seen.lock().unwrap().clone();
-        assert_eq!(body, "name=ada%20lovelace&role=math", "urlencoded body: {body}");
+        assert_eq!(
+            body, "name=ada%20lovelace&role=math",
+            "urlencoded body: {body}"
+        );
         assert!(
             headers.to_lowercase().contains("x-www-form-urlencoded"),
             "content-type set: {headers}"
@@ -18315,10 +18899,20 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
-        assert!(console.iter().any(|l| l == "dims:0,0,0"), "console was {console:?}");
+        assert!(
+            console.iter().any(|l| l == "dims:0,0,0"),
+            "console was {console:?}"
+        );
     }
 
     #[test]
@@ -18328,14 +18922,25 @@ mod tests {
         let mut modules = std::collections::HashMap::new();
         modules.insert(
             entry.clone(),
-            r#"document.title = "from-module"; console.log("title:" + document.title);"#.to_string(),
+            r#"document.title = "from-module"; console.log("title:" + document.title);"#
+                .to_string(),
         );
 
         let (doc, _) = doc_with_body("orig");
-        let (doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let (doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            no_fetch(),
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
-        assert!(console.iter().any(|l| l == "title:from-module"), "console was {console:?}");
+        assert!(
+            console.iter().any(|l| l == "title:from-module"),
+            "console was {console:?}"
+        );
         // The mutation is visible in the returned document.
         let title = find_by_tag(&doc, doc.root(), "title").map(|n| text_content(&doc, n));
         assert_eq!(title.as_deref(), Some("from-module"));
@@ -18356,17 +18961,30 @@ mod tests {
 
         let fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send> = Box::new(|u: &str| {
             if u == "https://x/b.js" {
-                Some(("export const answer = 99;".to_string(), "text/javascript".to_string()))
+                Some((
+                    "export const answer = 99;".to_string(),
+                    "text/javascript".to_string(),
+                ))
             } else {
                 None
             }
         });
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, fetcher, no_request());
+        let (_doc, out) = run_modules(
+            doc,
+            "https://x/",
+            vec![entry],
+            modules,
+            fetcher,
+            no_request(),
+        );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
-        assert!(console.iter().any(|l| l == "dyn:99"), "console was {console:?}");
+        assert!(
+            console.iter().any(|l| l == "dyn:99"),
+            "console was {console:?}"
+        );
     }
 
     // --- DOM interface globals + element identity / expandos -----------------------------
@@ -18441,7 +19059,10 @@ mod tests {
              a.push(ss.cssRules.length, ss.cssRules[0].mark, ss.cssRules[1].mark); a.join('|')",
         );
         assert_eq!(out.error, None, "{out:?}");
-        assert_eq!(out.value.as_deref(), Some("3|#bar { margin: 10px; }|1|2|2|1|2"));
+        assert_eq!(
+            out.value.as_deref(),
+            Some("3|#bar { margin: 10px; }|1|2|2|1|2")
+        );
     }
 
     #[test]
@@ -18496,7 +19117,8 @@ mod tests {
                 var b = document.getElementById("t");
                 [a === b, b.__vnode && b.__vnode.stashed, b._vei,
                  document.body.firstElementChild === a].join("|")
-            "#.to_string()],
+            "#
+            .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -18533,7 +19155,10 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         // tagName preserves the given qualifiedName (non-HTML namespace); localName drops the prefix.
-        assert_eq!(out.value.as_deref(), Some("svg:path|true|path|function|true"));
+        assert_eq!(
+            out.value.as_deref(),
+            Some("svg:path|true|path|function|true")
+        );
     }
 
     // --- persistent Session ------------------------------------------------------------------
@@ -18587,22 +19212,33 @@ mod tests {
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
         // Ran at least once during load.
         let body0 = find_by_tag(&snapshot, snapshot.root(), "body").expect("body node");
-        let initial: i32 = attr_of(&snapshot, body0, "data-c").unwrap_or_default().parse().unwrap_or(0);
-        assert!(initial >= 1, "interval should run during load, got {initial}");
+        let initial: i32 = attr_of(&snapshot, body0, "data-c")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        assert!(
+            initial >= 1,
+            "interval should run during load, got {initial}"
+        );
 
         // After real time elapses, a tick fires it again (real-clock cadence) → count increases.
         std::thread::sleep(std::time::Duration::from_millis(80));
         let (after, _console) = session.tick().expect("interval should fire again on tick");
         let body = find_by_tag(&after, after.root(), "body").expect("body node");
-        let c: i32 = attr_of(&after, body, "data-c").unwrap_or_default().parse().unwrap_or(0);
-        assert!(c > initial, "interval should have fired again on tick: {initial} -> {c}");
+        let c: i32 = attr_of(&after, body, "data-c")
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        assert!(
+            c > initial,
+            "interval should have fired again on tick: {initial} -> {c}"
+        );
     }
 
     #[test]
     fn session_event_bubbles_to_ancestor() {
-        let doc = html::parse(
-            "<div id=parent><button id=child></button></div><span id=out>idle</span>",
-        );
+        let doc =
+            html::parse("<div id=parent><button id=child></button></div><span id=out>idle</span>");
         let (session, snapshot, outputs) = Session::new(
             doc,
             vec![r#"
@@ -18684,9 +19320,7 @@ mod tests {
 
     #[test]
     fn session_toggle_checkbox_flips_checked_and_fires_change() {
-        let doc = html::parse(
-            "<html><body><input id=c type=checkbox></body></html>",
-        );
+        let doc = html::parse("<html><body><input id=c type=checkbox></body></html>");
         let (session, snapshot, outputs) = Session::new(
             doc,
             vec![r#"
@@ -18712,16 +19346,25 @@ mod tests {
 
         let (after, _console) = session.toggle_checkbox(c.0);
         let cb = find_by_id(&after, after.root(), "c").expect("checkbox node");
-        assert!(attr_of(&after, cb, "checked").is_some(), "checkbox should be checked");
+        assert!(
+            attr_of(&after, cb, "checked").is_some(),
+            "checkbox should be checked"
+        );
         let body = find_by_tag(&after, after.root(), "body").expect("body node");
         assert_eq!(attr_of(&after, body, "data-changed").as_deref(), Some("on"));
 
         // Toggling again unchecks it (and the change handler sees the new state).
         let (after2, _c2) = session.toggle_checkbox(c.0);
         let cb2 = find_by_id(&after2, after2.root(), "c").expect("checkbox node");
-        assert!(attr_of(&after2, cb2, "checked").is_none(), "checkbox should be unchecked");
+        assert!(
+            attr_of(&after2, cb2, "checked").is_none(),
+            "checkbox should be unchecked"
+        );
         let body2 = find_by_tag(&after2, after2.root(), "body").expect("body node");
-        assert_eq!(attr_of(&after2, body2, "data-changed").as_deref(), Some("off"));
+        assert_eq!(
+            attr_of(&after2, body2, "data-changed").as_deref(),
+            Some("off")
+        );
     }
 
     #[test]
@@ -18754,8 +19397,14 @@ mod tests {
         let (after, _console) = session.toggle_checkbox(b.0);
         let aa = find_by_id(&after, after.root(), "a").expect("radio a");
         let bb = find_by_id(&after, after.root(), "b").expect("radio b");
-        assert!(attr_of(&after, bb, "checked").is_some(), "b should be checked");
-        assert!(attr_of(&after, aa, "checked").is_none(), "a should be unchecked");
+        assert!(
+            attr_of(&after, bb, "checked").is_some(),
+            "b should be checked"
+        );
+        assert!(
+            attr_of(&after, aa, "checked").is_none(),
+            "a should be unchecked"
+        );
     }
 
     #[test]
@@ -18788,9 +19437,7 @@ mod tests {
 
     #[test]
     fn session_nonbubbling_focus_does_not_reach_ancestor() {
-        let doc = html::parse(
-            "<html><body><div id=wrap><input id=f></div></body></html>",
-        );
+        let doc = html::parse("<html><body><div id=wrap><input id=f></div></body></html>");
         let (session, snapshot, outputs) = Session::new(
             doc,
             vec![r#"
@@ -18817,7 +19464,10 @@ mod tests {
         let (after, _console) = session.fire_event_nonbubbling(f.0, "focus");
         let body = find_by_tag(&after, after.root(), "body").expect("body node");
         // The target's focus handler ran...
-        assert_eq!(attr_of(&after, body, "data-target").as_deref(), Some("focused"));
+        assert_eq!(
+            attr_of(&after, body, "data-target").as_deref(),
+            Some("focused")
+        );
         // ...but the ancestor's did NOT (focus does not bubble).
         assert_eq!(attr_of(&after, body, "data-ancestor").as_deref(), None);
     }

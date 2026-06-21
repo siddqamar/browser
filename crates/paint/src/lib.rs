@@ -48,7 +48,12 @@ impl Framebuffer {
         for px in pixels.chunks_exact_mut(4) {
             px[3] = 255;
         }
-        Self { width, height, stride, pixels }
+        Self {
+            width,
+            height,
+            stride,
+            pixels,
+        }
     }
 
     /// Fill the whole buffer with a solid color.
@@ -89,7 +94,10 @@ impl Framebuffer {
             self.fill_rect(rect, c);
             return;
         }
-        let r = radius.min(rect.w as f32 / 2.0).min(rect.h as f32 / 2.0).max(0.0);
+        let r = radius
+            .min(rect.w as f32 / 2.0)
+            .min(rect.h as f32 / 2.0)
+            .max(0.0);
         if r <= 0.0 {
             self.fill_rect(rect, c);
             return;
@@ -146,7 +154,10 @@ impl Framebuffer {
                     continue;
                 }
                 let i = row + (x as usize) * 4;
-                let cc = Color { a: ((c.a as u16 * coverage as u16) / 255) as u8, ..c };
+                let cc = Color {
+                    a: ((c.a as u16 * coverage as u16) / 255) as u8,
+                    ..c
+                };
                 blend_over(&mut self.pixels[i..i + 4], cc);
             }
         }
@@ -255,7 +266,15 @@ mod tests {
     #[test]
     fn fill_rect_is_clipped_and_opaque() {
         let mut fb = Framebuffer::new(4, 4);
-        fb.fill_rect(Rect { x: -1, y: -1, w: 2, h: 2 }, Color::rgb(10, 20, 30));
+        fb.fill_rect(
+            Rect {
+                x: -1,
+                y: -1,
+                w: 2,
+                h: 2,
+            },
+            Color::rgb(10, 20, 30),
+        );
         // Pixel (0,0) should be painted; clipped negative region ignored.
         assert_eq!(&fb.pixels[0..4], &[10, 20, 30, 255]);
         // Pixel (2,2) untouched (still opaque black).
@@ -272,7 +291,17 @@ mod tests {
             255, 0, 0, 255, /* red   */ 0, 255, 0, 255, /* green */
             0, 0, 255, 255, /* blue  */ 255, 255, 255, 255, /* white */
         ];
-        fb.blit_rgba(Rect { x: 0, y: 0, w: 4, h: 4 }, &src, 2, 2);
+        fb.blit_rgba(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            &src,
+            2,
+            2,
+        );
         let px = |x: usize, y: usize| {
             let i = (y as u32 * fb.stride) as usize + x * 4;
             &fb.pixels[i..i + 4]
@@ -291,7 +320,17 @@ mod tests {
         // A 1x1 half-transparent white image blitted over the whole (black) buffer.
         let src = vec![255u8, 255, 255, 128];
         // Destination extends past the buffer; must be clipped without panicking.
-        fb.blit_rgba(Rect { x: 0, y: 0, w: 10, h: 10 }, &src, 1, 1);
+        fb.blit_rgba(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 10,
+            },
+            &src,
+            1,
+            1,
+        );
         // ~50% white over black.
         assert!(fb.pixels[0] > 120 && fb.pixels[0] < 135);
     }
@@ -302,7 +341,16 @@ mod tests {
         // quarter-circle (untouched black), while the center is fully filled.
         let mut fb = Framebuffer::new(16, 16);
         fb.clear(Color::BLACK);
-        fb.fill_round_rect(Rect { x: 0, y: 0, w: 16, h: 16 }, 8.0, Color::rgb(255, 0, 0));
+        fb.fill_round_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+            },
+            8.0,
+            Color::rgb(255, 0, 0),
+        );
         let px = |x: usize, y: usize| {
             let i = (y as u32 * fb.stride) as usize + x * 4;
             &fb.pixels[i..i + 4]
@@ -317,7 +365,16 @@ mod tests {
     fn round_rect_zero_radius_is_plain_fill() {
         let mut fb = Framebuffer::new(4, 4);
         fb.clear(Color::BLACK);
-        fb.fill_round_rect(Rect { x: 0, y: 0, w: 4, h: 4 }, 0.0, Color::rgb(10, 20, 30));
+        fb.fill_round_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            0.0,
+            Color::rgb(10, 20, 30),
+        );
         assert_eq!(&fb.pixels[0..4], &[10, 20, 30, 255]);
     }
 
@@ -327,8 +384,25 @@ mod tests {
         // the opacity-threading path, which pre-scales each fill's alpha).
         let mut fb = Framebuffer::new(1, 1);
         fb.clear(Color::BLACK);
-        fb.fill_rect(Rect { x: 0, y: 0, w: 1, h: 1 }, Color { r: 255, g: 255, b: 255, a: 128 });
-        assert!(fb.pixels[0] > 120 && fb.pixels[0] < 135, "got {}", fb.pixels[0]);
+        fb.fill_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            Color {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 128,
+            },
+        );
+        assert!(
+            fb.pixels[0] > 120 && fb.pixels[0] < 135,
+            "got {}",
+            fb.pixels[0]
+        );
     }
 
     #[test]

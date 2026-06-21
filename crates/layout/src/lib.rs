@@ -147,7 +147,10 @@ impl PaintStyle {
     /// The uniform corner radius (px); 0 when no `border-radius` is set (it lives in [`PaintExtras`]
     /// to keep the common `PaintStyle` small).
     pub fn border_radius(&self) -> f32 {
-        self.extras.as_deref().map(|e| e.border_radius).unwrap_or(0.0)
+        self.extras
+            .as_deref()
+            .map(|e| e.border_radius)
+            .unwrap_or(0.0)
     }
 }
 
@@ -268,15 +271,32 @@ pub fn layout_document(
     // the box tree + styles) can honor them without a new threaded parameter.
     capture_table_spans(doc);
     let mut root = LayoutBox::new(BoxContent::Block, PaintStyle::default(), None);
-    let bx_ctx = BuildCtx { styles, intrinsic_sizes, focused };
+    let bx_ctx = BuildCtx {
+        styles,
+        intrinsic_sizes,
+        focused,
+    };
     root.children = build_children(doc, doc.root(), &bx_ctx);
 
     // 2. The root is the viewport block. Lay it out against a containing block that is the
     //    viewport: origin (0,0), width = viewport_width.
-    let viewport = Rect { x: 0.0, y: 0.0, width: viewport_width, height: viewport_height };
-    let containing = Rect { x: 0.0, y: 0.0, width: viewport_width, height: 0.0 };
+    let viewport = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: viewport_width,
+        height: viewport_height,
+    };
+    let containing = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: viewport_width,
+        height: 0.0,
+    };
     // The initial containing block (for absolutes with no positioned ancestor) is the viewport.
-    let ctx = Ctx { positioned: viewport, viewport };
+    let ctx = Ctx {
+        positioned: viewport,
+        viewport,
+    };
     layout_block(&mut root, containing, ctx, styles, measurer);
     root
 }
@@ -296,7 +316,9 @@ fn explicit_width(
     boxx: &LayoutBox,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) -> Option<f32> {
-    boxx.node.and_then(|n| styles.get(&n)).and_then(|cs| cs.width)
+    boxx.node
+        .and_then(|n| styles.get(&n))
+        .and_then(|cs| cs.width)
 }
 
 /// The used content width: an explicit px `width`, or a percentage `width` resolved against the
@@ -306,9 +328,10 @@ fn resolved_width(
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     cb_width: f32,
 ) -> Option<f32> {
-    boxx.node
-        .and_then(|n| styles.get(&n))
-        .and_then(|cs| cs.width.or_else(|| cs.width_pct.map(|p| (cb_width * p).max(0.0))))
+    boxx.node.and_then(|n| styles.get(&n)).and_then(|cs| {
+        cs.width
+            .or_else(|| cs.width_pct.map(|p| (cb_width * p).max(0.0)))
+    })
 }
 
 /// The explicit content height set on a box's node (if any).
@@ -316,7 +339,9 @@ fn explicit_height(
     boxx: &LayoutBox,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) -> Option<f32> {
-    boxx.node.and_then(|n| styles.get(&n)).and_then(|cs| cs.height)
+    boxx.node
+        .and_then(|n| styles.get(&n))
+        .and_then(|cs| cs.height)
 }
 
 /// The computed style for a box's node, if any.
@@ -433,10 +458,7 @@ fn image_content_size(
 
 /// True if an Image box is block-level (computed display block/flex/grid, the legacy
 /// `display_block` flag, or out-of-flow). Otherwise the image is atomic inline-level.
-fn image_is_block(
-    boxx: &LayoutBox,
-    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
-) -> bool {
+fn image_is_block(boxx: &LayoutBox, styles: &HashMap<dom::NodeId, style::ComputedStyle>) -> bool {
     match style_of(boxx, styles) {
         None => false,
         Some(cs) => {
@@ -444,8 +466,10 @@ fn image_is_block(
                 cs.display,
                 style::Display::Block | style::Display::Flex | style::Display::Grid
             ) || (cs.display == style::Display::Inline && cs.display_block);
-            let out_of_flow =
-                matches!(cs.position, style::Position::Absolute | style::Position::Fixed);
+            let out_of_flow = matches!(
+                cs.position,
+                style::Position::Absolute | style::Position::Fixed
+            );
             block_display || out_of_flow
         }
     }
@@ -479,15 +503,17 @@ fn position_of(
     boxx: &LayoutBox,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) -> style::Position {
-    style_of(boxx, styles).map(|cs| cs.position).unwrap_or(style::Position::Static)
+    style_of(boxx, styles)
+        .map(|cs| cs.position)
+        .unwrap_or(style::Position::Static)
 }
 
 /// True if a box is taken out of normal flow (absolutely or fixed positioned).
-fn is_out_of_flow(
-    boxx: &LayoutBox,
-    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
-) -> bool {
-    matches!(position_of(boxx, styles), style::Position::Absolute | style::Position::Fixed)
+fn is_out_of_flow(boxx: &LayoutBox, styles: &HashMap<dom::NodeId, style::ComputedStyle>) -> bool {
+    matches!(
+        position_of(boxx, styles),
+        style::Position::Absolute | style::Position::Fixed
+    )
 }
 
 /// The text alignment of a box's node (defaults to Left).
@@ -531,7 +557,10 @@ fn textarea_text_content(doc: &dom::Document, id: dom::NodeId) -> String {
     }
     let mut s = String::new();
     gather(doc, id, &mut s);
-    s.strip_prefix("\r\n").or_else(|| s.strip_prefix('\n')).map(str::to_string).unwrap_or(s)
+    s.strip_prefix("\r\n")
+        .or_else(|| s.strip_prefix('\n'))
+        .map(str::to_string)
+        .unwrap_or(s)
 }
 
 /// The text a form control (`<input>` / `<textarea>`) should render inside its box, or `None`
@@ -547,7 +576,11 @@ fn input_display_text(el: &dom::ElementData, textarea_default: &str) -> Option<S
     if el.tag.eq_ignore_ascii_case("textarea") {
         // A textarea's value is its current `value` (set via JS) or, failing that, its text content
         // (the default value) — it has no `value` content attribute, so the text node is the source.
-        return Some(attr("value").map(str::to_string).unwrap_or_else(|| textarea_default.to_string()));
+        return Some(
+            attr("value")
+                .map(str::to_string)
+                .unwrap_or_else(|| textarea_default.to_string()),
+        );
     }
     if !el.tag.eq_ignore_ascii_case("input") {
         return None;
@@ -577,7 +610,10 @@ fn input_display_text(el: &dom::ElementData, textarea_default: &str) -> Option<S
     }
     // Date/time pickers: a bordered field showing the value, or a format placeholder. We don't
     // build a real picker — just visible text so the control reads as a field.
-    if matches!(ty.as_str(), "date" | "time" | "datetime-local" | "month" | "week") {
+    if matches!(
+        ty.as_str(),
+        "date" | "time" | "datetime-local" | "month" | "week"
+    ) {
         let placeholder = match ty.as_str() {
             "date" => "mm/dd/yyyy",
             "time" => "--:-- --",
@@ -587,7 +623,11 @@ fn input_display_text(el: &dom::ElementData, textarea_default: &str) -> Option<S
             _ => "",
         };
         let value = attr("value").unwrap_or("");
-        return Some(if value.is_empty() { placeholder.to_string() } else { value.to_string() });
+        return Some(if value.is_empty() {
+            placeholder.to_string()
+        } else {
+            value.to_string()
+        });
     }
     // File chooser: a "Choose File" button label followed by the chosen filename (or the
     // conventional "No file chosen"). The button chrome comes from the UA stylesheet border.
@@ -599,7 +639,9 @@ fn input_display_text(el: &dom::ElementData, textarea_default: &str) -> Option<S
 
 /// Parse a numeric attribute (`min`/`max`/`value`), returning `None` when absent/unparseable.
 fn num_attr(el: &dom::ElementData, name: &str) -> Option<f32> {
-    el.attrs.get(name).and_then(|v| v.trim().parse::<f32>().ok())
+    el.attrs
+        .get(name)
+        .and_then(|v| v.trim().parse::<f32>().ok())
 }
 
 /// Resolve an `<input type=range>`'s thumb position as a fraction (0..=1) of the track:
@@ -627,7 +669,11 @@ fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
             let d = |c: u8| u8::from_str_radix(&format!("{}{}", c as char, c as char), 16).ok();
             Some((d(bytes[0])?, d(bytes[1])?, d(bytes[2])?))
         }
-        6 => Some((hex(bytes[0], bytes[1])?, hex(bytes[2], bytes[3])?, hex(bytes[4], bytes[5])?)),
+        6 => Some((
+            hex(bytes[0], bytes[1])?,
+            hex(bytes[2], bytes[3])?,
+            hex(bytes[4], bytes[5])?,
+        )),
         _ => None,
     }
 }
@@ -639,8 +685,8 @@ fn bar_fraction(el: &dom::ElementData, is_progress: bool) -> Option<f32> {
     let max = num_attr(el, "max").unwrap_or(1.0).max(f32::EPSILON);
     match num_attr(el, "value") {
         Some(v) => Some((v / max).clamp(0.0, 1.0)),
-        None if is_progress => None,    // indeterminate progress bar
-        None => Some(0.0),              // a meter with no value reads as empty
+        None if is_progress => None, // indeterminate progress bar
+        None => Some(0.0),           // a meter with no value reads as empty
     }
 }
 
@@ -741,7 +787,11 @@ fn is_caret_field(el: &dom::ElementData) -> bool {
     if !el.tag.eq_ignore_ascii_case("input") {
         return false;
     }
-    let ty = el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let ty = el
+        .attrs
+        .get("type")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     matches!(
         ty.as_str(),
         "" | "text" | "search" | "email" | "url" | "tel" | "password" | "number"
@@ -791,7 +841,12 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
 
 /// Convert a `style::Edges` into a layout `Edges`.
 fn edges_of(e: style::Edges) -> Edges {
-    Edges { top: e.top, right: e.right, bottom: e.bottom, left: e.left }
+    Edges {
+        top: e.top,
+        right: e.right,
+        bottom: e.bottom,
+        left: e.left,
+    }
 }
 
 /// Immutable inputs threaded through the (mutually recursive) box-tree builder. Bundling them in
@@ -805,11 +860,7 @@ struct BuildCtx<'a> {
 
 /// Build the child boxes for `parent_id`'s children, wrapping runs of inline children in
 /// anonymous blocks when the parent also contains block children.
-fn build_children(
-    doc: &dom::Document,
-    parent_id: dom::NodeId,
-    bx: &BuildCtx,
-) -> Vec<LayoutBox> {
+fn build_children(doc: &dom::Document, parent_id: dom::NodeId, bx: &BuildCtx) -> Vec<LayoutBox> {
     let styles = bx.styles;
     // First, produce a flat list of child boxes (each tagged block vs inline).
     let mut flat: Vec<LayoutBox> = Vec::new();
@@ -877,7 +928,10 @@ fn build_replaced_or_control(
     intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
     focused: Option<dom::NodeId>,
 ) -> Option<LayoutBox> {
-    let out_of_flow = matches!(cs.position, style::Position::Absolute | style::Position::Fixed);
+    let out_of_flow = matches!(
+        cs.position,
+        style::Position::Absolute | style::Position::Fixed
+    );
     let block_display = matches!(
         cs.display,
         style::Display::Block | style::Display::Flex | style::Display::Grid
@@ -897,8 +951,14 @@ fn build_replaced_or_control(
         let is_img = el.tag.eq_ignore_ascii_case("img");
         let intrinsic = if is_canvas {
             // Prefer the explicit width/height attributes; fall back to the spec default 300x150.
-            let aw = el.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok());
-            let ah = el.attrs.get("height").and_then(|v| v.trim().parse::<f32>().ok());
+            let aw = el
+                .attrs
+                .get("width")
+                .and_then(|v| v.trim().parse::<f32>().ok());
+            let ah = el
+                .attrs
+                .get("height")
+                .and_then(|v| v.trim().parse::<f32>().ok());
             Some((aw.unwrap_or(300.0).max(1.0), ah.unwrap_or(150.0).max(1.0)))
         } else {
             intrinsic_sizes.get(&id).copied()
@@ -907,8 +967,14 @@ fn build_replaced_or_control(
         // CSS px). CSS still wins when present: only fill in a dimension the cascade left unset.
         let (mut css_w, mut css_h) = (cs.width, cs.height);
         if is_img {
-            let aw = el.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok());
-            let ah = el.attrs.get("height").and_then(|v| v.trim().parse::<f32>().ok());
+            let aw = el
+                .attrs
+                .get("width")
+                .and_then(|v| v.trim().parse::<f32>().ok());
+            let ah = el
+                .attrs
+                .get("height")
+                .and_then(|v| v.trim().parse::<f32>().ok());
             if css_w.is_none() {
                 css_w = aw;
             }
@@ -932,7 +998,8 @@ fn build_replaced_or_control(
                         bx.dimensions.margin = edges_of(cs.margin);
                         bx.dimensions.padding = edges_of(cs.padding);
                         bx.dimensions.border = edges_of(cs.border);
-                        bx.children.push(LayoutBox::new(BoxContent::Text(alt), aps, Some(id)));
+                        bx.children
+                            .push(LayoutBox::new(BoxContent::Text(alt), aps, Some(id)));
                         return Some(bx);
                     }
                 }
@@ -948,7 +1015,11 @@ fn build_replaced_or_control(
         return Some(bx);
     }
 
-    let content = if is_block { BoxContent::Block } else { BoxContent::Inline };
+    let content = if is_block {
+        BoxContent::Block
+    } else {
+        BoxContent::Inline
+    };
     let ps = paint_style_of(cs);
     let mut bx = LayoutBox::new(content, ps.clone(), Some(id));
     bx.dimensions.margin = edges_of(cs.margin);
@@ -960,17 +1031,24 @@ fn build_replaced_or_control(
     if el.tag.eq_ignore_ascii_case("progress") || el.tag.eq_ignore_ascii_case("meter") {
         let is_progress = el.tag.eq_ignore_ascii_case("progress");
         let kind = if is_progress {
-            WidgetKind::Progress { fraction: bar_fraction(el, true) }
+            WidgetKind::Progress {
+                fraction: bar_fraction(el, true),
+            }
         } else {
-            WidgetKind::Meter { fraction: bar_fraction(el, false).unwrap_or(0.0) }
+            WidgetKind::Meter {
+                fraction: bar_fraction(el, false).unwrap_or(0.0),
+            }
         };
         size_widget_box(&mut bx, cs, 160.0, 16.0);
         bx.content = BoxContent::Widget(kind);
         return Some(bx);
     }
 
-    let input_ty =
-        el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let input_ty = el
+        .attrs
+        .get("type")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     let is_input = el.tag.eq_ignore_ascii_case("input");
 
     // Checkbox / radio: a small (~13px) drawn box/circle reflecting the checked state. Drawn by the
@@ -990,7 +1068,9 @@ fn build_replaced_or_control(
     // <input type=range>: a horizontal slider (track + thumb) at the value's position.
     if is_input && input_ty == "range" {
         size_widget_box(&mut bx, cs, 129.0, 21.0);
-        bx.content = BoxContent::Widget(WidgetKind::Range { fraction: range_fraction(el) });
+        bx.content = BoxContent::Widget(WidgetKind::Range {
+            fraction: range_fraction(el),
+        });
         return Some(bx);
     }
 
@@ -1016,7 +1096,8 @@ fn build_replaced_or_control(
             sps.font_size = 13.0;
         }
         let text = format!("{label}  \u{25BE}"); // U+25BE ▾
-        bx.children.push(LayoutBox::new(BoxContent::Text(text), sps, Some(id)));
+        bx.children
+            .push(LayoutBox::new(BoxContent::Text(text), sps, Some(id)));
         return Some(bx);
     }
 
@@ -1032,17 +1113,33 @@ fn build_replaced_or_control(
         // placeholder only when there's no real value; browsers hide the placeholder while editing,
         // so suppress it and show just the caret. We can tell value from placeholder by checking
         // the raw `value` attribute.
-        let has_value = el.attrs.get("value").map(|v| !v.is_empty()).unwrap_or(false)
+        let has_value = el
+            .attrs
+            .get("value")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
             || el.tag.eq_ignore_ascii_case("textarea");
-        let show_text = if caret && !has_value { String::new() } else { label };
+        let show_text = if caret && !has_value {
+            String::new()
+        } else {
+            label
+        };
         if !show_text.is_empty() {
-            bx.children.push(LayoutBox::new(BoxContent::Text(show_text), ps.clone(), Some(id)));
+            bx.children.push(LayoutBox::new(
+                BoxContent::Text(show_text),
+                ps.clone(),
+                Some(id),
+            ));
         }
         if caret {
             // A thin vertical bar ≈ the cap height of the control's text, in the foreground color.
             // It flows inline (atomically) so it sits right after the value text (or at the start
             // of an empty field). Vertically centered on the line via a top margin.
-            let fs = if ps.font_size > 0.0 { ps.font_size } else { 16.0 };
+            let fs = if ps.font_size > 0.0 {
+                ps.font_size
+            } else {
+                16.0
+            };
             let cps = ps;
             let mut cbx = LayoutBox::new(BoxContent::Caret, cps.clone(), Some(id));
             let caret_h = (fs * 0.8).round().max(1.0); // ≈ cap height
@@ -1081,7 +1178,11 @@ fn build_pseudo_box(originating: dom::NodeId, cs: &style::ComputedStyle) -> Opti
         cs.display,
         style::Display::Block | style::Display::Flex | style::Display::Grid
     ) || (cs.display == style::Display::Inline && cs.display_block);
-    let content = if block_display { BoxContent::Block } else { BoxContent::Inline };
+    let content = if block_display {
+        BoxContent::Block
+    } else {
+        BoxContent::Inline
+    };
     let ps = paint_style_of(cs);
     // Anonymous: no node id (matches other anonymous boxes), so layout/paint never tries to read
     // a (nonexistent) style entry for it.
@@ -1092,7 +1193,11 @@ fn build_pseudo_box(originating: dom::NodeId, cs: &style::ComputedStyle) -> Opti
     if !content_str.is_empty() {
         // The text run carries the originating element's id so its paint style resolves the same
         // way ordinary text does if the box's own style isn't consulted directly.
-        bx.children.push(LayoutBox::new(BoxContent::Text(content_str), ps, Some(originating)));
+        bx.children.push(LayoutBox::new(
+            BoxContent::Text(content_str),
+            ps,
+            Some(originating),
+        ));
     }
     Some(bx)
 }
@@ -1100,12 +1205,7 @@ fn build_pseudo_box(originating: dom::NodeId, cs: &style::ComputedStyle) -> Opti
 /// Build the box (or boxes) for a single DOM node, pushing into `out`. May push nothing
 /// (hidden / non-rendered / empty text) or several (an inline element contributes its own
 /// box; its rendered text/children become that box's children).
-fn build_box(
-    doc: &dom::Document,
-    id: dom::NodeId,
-    bx_ctx: &BuildCtx,
-    out: &mut Vec<LayoutBox>,
-) {
+fn build_box(doc: &dom::Document, id: dom::NodeId, bx_ctx: &BuildCtx, out: &mut Vec<LayoutBox>) {
     let styles = bx_ctx.styles;
     let intrinsic_sizes = bx_ctx.intrinsic_sizes;
     let focused = bx_ctx.focused;
@@ -1149,7 +1249,11 @@ fn build_box(
             // <br>: a forced line break. Emit a LineBreak box (inline-level, no glyphs); inline
             // layout ends the current line and starts a new one when it sees it.
             if el.tag.eq_ignore_ascii_case("br") {
-                out.push(LayoutBox::new(BoxContent::LineBreak, paint_style_of(cs), Some(id)));
+                out.push(LayoutBox::new(
+                    BoxContent::LineBreak,
+                    paint_style_of(cs),
+                    Some(id),
+                ));
                 return;
             }
             // Replaced elements (<img>) and form controls (<input>/<textarea>) build a dedicated
@@ -1179,13 +1283,20 @@ fn build_box(
             // (Block/Flex/Grid) or is out-of-flow (Absolute/Fixed are treated as block-level
             // so they aren't merged into inline runs). Inline / inline-block / inline-flex /
             // inline-grid are inline-level.
-            let out_of_flow = matches!(cs.position, style::Position::Absolute | style::Position::Fixed);
+            let out_of_flow = matches!(
+                cs.position,
+                style::Position::Absolute | style::Position::Fixed
+            );
             // Honor the legacy `display_block` flag too, so styles constructed the old way (only
             // `display_block: true`, `display` left at its Inline default) still lay out as blocks.
             let block_display = is_block_level_display(cs.display)
                 || (cs.display == style::Display::Inline && cs.display_block);
             let is_block = out_of_flow || block_display;
-            let content = if is_block { BoxContent::Block } else { BoxContent::Inline };
+            let content = if is_block {
+                BoxContent::Block
+            } else {
+                BoxContent::Inline
+            };
             // Build children FIRST (the deep recursion happens here) so this element's large
             // `LayoutBox` is not alive on the stack during descent — keeps the recursive frame small.
             let mut children: Vec<LayoutBox> = Vec::new();
@@ -1252,7 +1363,11 @@ fn push_pre_text(
     while let Some(seg) = lines.next() {
         if !seg.is_empty() {
             let rendered = apply_text_transform(seg, transform);
-            out.push(LayoutBox::new(BoxContent::Text(rendered), ps.clone(), Some(id)));
+            out.push(LayoutBox::new(
+                BoxContent::Text(rendered),
+                ps.clone(),
+                Some(id),
+            ));
         }
         if lines.peek().is_some() {
             out.push(LayoutBox::new(BoxContent::LineBreak, ps.clone(), Some(id)));
@@ -1274,7 +1389,10 @@ fn push_li_marker(
         if mps.font_size <= 0.0 {
             mps.font_size = 16.0;
         }
-        children.insert(0, LayoutBox::new(BoxContent::Marker(marker.into()), mps, Some(id)));
+        children.insert(
+            0,
+            LayoutBox::new(BoxContent::Marker(marker.into()), mps, Some(id)),
+        );
     }
 }
 
@@ -1417,7 +1535,10 @@ fn collapse_whitespace(s: &str) -> String {
 /// so its locals don't enlarge the recursive `layout_block` stack frame.
 #[inline(never)]
 fn take_marker(boxx: &mut LayoutBox) -> Option<Box<LayoutBox>> {
-    if matches!(boxx.children.first().map(|c| &c.content), Some(BoxContent::Marker(_))) {
+    if matches!(
+        boxx.children.first().map(|c| &c.content),
+        Some(BoxContent::Marker(_))
+    ) {
         Some(Box::new(boxx.children.remove(0)))
     } else {
         None
@@ -1431,13 +1552,31 @@ fn take_marker(boxx: &mut LayoutBox) -> Option<Box<LayoutBox>> {
 /// deeply-recursive `layout_block` frame, so keeping it boxed avoids inflating that frame.
 #[inline(never)]
 #[allow(clippy::boxed_local)]
-fn place_marker(boxx: &mut LayoutBox, mut mb: Box<LayoutBox>, x: f32, y: f32, measurer: &dyn TextMeasurer) {
+fn place_marker(
+    boxx: &mut LayoutBox,
+    mut mb: Box<LayoutBox>,
+    x: f32,
+    y: f32,
+    measurer: &dyn TextMeasurer,
+) {
     if let BoxContent::Marker(text) = &mb.content {
-        let fs = if mb.style.font_size > 0.0 { mb.style.font_size } else { 16.0 };
+        let fs = if mb.style.font_size > 0.0 {
+            mb.style.font_size
+        } else {
+            16.0
+        };
         let mw = measurer.text_width(text, fs, mb.style.bold);
         let gap = (fs * 0.5).max(4.0);
-        let lh = mb.style.line_height.unwrap_or_else(|| measurer.line_height(fs));
-        mb.dimensions.content = Rect { x: (x - mw - gap).max(0.0), y, width: mw, height: lh };
+        let lh = mb
+            .style
+            .line_height
+            .unwrap_or_else(|| measurer.line_height(fs));
+        mb.dimensions.content = Rect {
+            x: (x - mw - gap).max(0.0),
+            y,
+            width: mw,
+            height: lh,
+        };
     }
     boxx.children.insert(0, *mb);
 }
@@ -1476,7 +1615,9 @@ fn resolve_block_margins(
     let border = boxx.dimensions.border;
     let padding = boxx.dimensions.padding;
     let mut margin = boxx.dimensions.margin;
-    let margin_auto = style_of(boxx, styles).map(|cs| cs.margin_auto).unwrap_or([false; 4]);
+    let margin_auto = style_of(boxx, styles)
+        .map(|cs| cs.margin_auto)
+        .unwrap_or([false; 4]);
     if has_explicit_width {
         let free = containing_width
             - content_width
@@ -1516,8 +1657,8 @@ fn layout_block(
 
     // Content width: containing content width minus this box's horizontal margin+border+padding,
     // unless an explicit width is set.
-    let horizontal = margin.left + margin.right + border.left + border.right + padding.left
-        + padding.right;
+    let horizontal =
+        margin.left + margin.right + border.left + border.right + padding.left + padding.right;
     let content_width = match explicit_w {
         Some(w) => w,
         None => (containing.width - horizontal).max(0.0),
@@ -1527,14 +1668,25 @@ fn layout_block(
 
     // Resolve `auto` horizontal margins now the used width is known (in a non-inlined helper so this
     // recursive frame stays small). Re-read the (possibly centered) margin for positioning.
-    resolve_block_margins(boxx, styles, containing.width, content_width, explicit_w.is_some());
+    resolve_block_margins(
+        boxx,
+        styles,
+        containing.width,
+        content_width,
+        explicit_w.is_some(),
+    );
     margin = boxx.dimensions.margin;
 
     // Position: content origin sits inside the containing block, offset by left edges.
     let x = containing.x + margin.left + border.left + padding.left;
     let y = containing.y + margin.top + border.top + padding.top;
 
-    boxx.dimensions.content = Rect { x, y, width: content_width, height: 0.0 };
+    boxx.dimensions.content = Rect {
+        x,
+        y,
+        width: content_width,
+        height: 0.0,
+    };
 
     // List-item marker: pull a leading `Marker` child out of normal flow so it doesn't flow into the
     // content as a word. Positioned (in `place_marker`) once content height is known. Boxed +
@@ -1545,7 +1697,10 @@ fn layout_block(
     // block for its absolutely-positioned descendants. Update the context's `positioned` rect to
     // this box's padding box for children.
     let child_ctx = if !matches!(position_of(boxx, styles), style::Position::Static) {
-        Ctx { positioned: boxx.dimensions.padding_box(), viewport: ctx.viewport }
+        Ctx {
+            positioned: boxx.dimensions.padding_box(),
+            viewport: ctx.viewport,
+        }
     } else {
         ctx
     };
@@ -1562,12 +1717,11 @@ fn layout_block(
         style::Display::Table => layout_table(boxx, child_ctx, styles, measurer),
         _ => {
             // Block / inline-block / (anonymous, root): normal block-or-inline formatting.
-            let any_block = boxx
-                .children
-                .iter()
-                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+            let any_block = boxx.children.iter().any(|c| {
+                matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
                     || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
-                        && image_is_block(c, styles)));
+                        && image_is_block(c, styles))
+            });
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -1594,7 +1748,10 @@ fn layout_block(
     // was resolved, so recompute the padding box here — otherwise `bottom`/`right` anchoring would
     // see a zero-height/zero-width containing block.
     let resolve_ctx = if !matches!(position_of(boxx, styles), style::Position::Static) {
-        Ctx { positioned: boxx.dimensions.padding_box(), viewport: child_ctx.viewport }
+        Ctx {
+            positioned: boxx.dimensions.padding_box(),
+            viewport: child_ctx.viewport,
+        }
     } else {
         child_ctx
     };
@@ -1623,7 +1780,12 @@ fn layout_block_children(
         // Each child's containing block is this box's content rect, but positioned so the
         // child stacks below previous siblings. We thread the running y via the containing
         // rect's y, and the child adds its own top margin/border/padding inside layout_block.
-        let containing = Rect { x: content.x, y: cursor_y, width: content.width, height: 0.0 };
+        let containing = Rect {
+            x: content.x,
+            y: cursor_y,
+            width: content.width,
+            height: 0.0,
+        };
         match &child.content {
             BoxContent::Block => layout_block(child, containing, ctx, styles, measurer),
             BoxContent::Image(_) | BoxContent::Widget(_) => layout_image_box(child, containing),
@@ -1697,8 +1859,8 @@ fn layout_out_of_flow(
     let mut margin = boxx.dimensions.margin;
     let border = boxx.dimensions.border;
     let padding = boxx.dimensions.padding;
-    let horizontal = margin.left + margin.right + border.left + border.right + padding.left
-        + padding.right;
+    let horizontal =
+        margin.left + margin.right + border.left + border.right + padding.left + padding.right;
 
     // Content width:
     //   * explicit `width` wins;
@@ -1725,7 +1887,13 @@ fn layout_out_of_flow(
     // auto margins stay 0 (the style crate already resolved them so).
     if let (Some(l), Some(r)) = (cs.left, cs.right) {
         if cs.width.is_some() && (cs.margin_auto[1] || cs.margin_auto[3]) {
-            let free = cb.width - l - r - content_width - border.left - border.right - padding.left
+            let free = cb.width
+                - l
+                - r
+                - content_width
+                - border.left
+                - border.right
+                - padding.left
                 - padding.right;
             distribute_auto_margins(&mut margin, cs.margin_auto, free);
             boxx.dimensions.margin = margin;
@@ -1752,10 +1920,18 @@ fn layout_out_of_flow(
 
     let x = border_left_x + margin.left + border.left + padding.left;
     let y = border_top_y + margin.top + border.top + padding.top;
-    boxx.dimensions.content = Rect { x, y, width: content_width, height: 0.0 };
+    boxx.dimensions.content = Rect {
+        x,
+        y,
+        width: content_width,
+        height: 0.0,
+    };
 
     // This box is itself positioned, so it's the containing block for its abs descendants.
-    let child_ctx = Ctx { positioned: boxx.dimensions.padding_box(), viewport: ctx.viewport };
+    let child_ctx = Ctx {
+        positioned: boxx.dimensions.padding_box(),
+        viewport: ctx.viewport,
+    };
 
     let display = display_of(boxx, styles);
     let content_height = match display {
@@ -1766,12 +1942,11 @@ fn layout_out_of_flow(
             layout_grid(boxx, child_ctx, styles, measurer)
         }
         _ => {
-            let any_block = boxx
-                .children
-                .iter()
-                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+            let any_block = boxx.children.iter().any(|c| {
+                matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
                     || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
-                        && image_is_block(c, styles)));
+                        && image_is_block(c, styles))
+            });
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -1789,8 +1964,15 @@ fn layout_out_of_flow(
     // If positioned by `bottom` (no `top`), re-anchor now that height is known.
     if cs.top.is_none() {
         if let Some(b) = cs.bottom {
-            let new_border_top = cb.y + cb.height - b - (final_height + margin.top + margin.bottom
-                + border.top + border.bottom + padding.top + padding.bottom);
+            let new_border_top = cb.y + cb.height
+                - b
+                - (final_height
+                    + margin.top
+                    + margin.bottom
+                    + border.top
+                    + border.bottom
+                    + padding.top
+                    + padding.bottom);
             let new_y = new_border_top + margin.top + border.top + padding.top;
             shift_subtree(boxx, 0.0, new_y - boxx.dimensions.content.y);
         }
@@ -1802,8 +1984,10 @@ fn layout_out_of_flow(
     // the box sits at its static position, so the used value is measured from the static origin
     // (the parent's content-box top-left) instead of the laid-out (cb-origin) position.
     let mb = boxx.dimensions.margin_box();
-    let (vert_auto, horiz_auto) =
-        ((cs.top.is_none() && cs.bottom.is_none()), (cs.left.is_none() && cs.right.is_none()));
+    let (vert_auto, horiz_auto) = (
+        (cs.top.is_none() && cs.bottom.is_none()),
+        (cs.left.is_none() && cs.right.is_none()),
+    );
     // Vertical: margin-box top relative to cb top (or static origin when both auto).
     let mb_top = if vert_auto { parent_content.y } else { mb.y };
     let mb_left = if horiz_auto { parent_content.x } else { mb.x };
@@ -1815,13 +1999,19 @@ fn layout_out_of_flow(
 
     // Recompute the containing block for nested absolutes now that this box's height (and any
     // `bottom` re-anchor shift) is final.
-    let resolve_ctx = Ctx { positioned: boxx.dimensions.padding_box(), viewport: ctx.viewport };
+    let resolve_ctx = Ctx {
+        positioned: boxx.dimensions.padding_box(),
+        viewport: ctx.viewport,
+    };
     resolve_out_of_flow(boxx, resolve_ctx, styles, measurer);
 }
 
 /// Apply a `position: relative` offset to `boxx` and its whole subtree by the resolved
 /// (left/right, top/bottom) insets, without affecting siblings.
-fn apply_relative_offset(boxx: &mut LayoutBox, styles: &HashMap<dom::NodeId, style::ComputedStyle>) {
+fn apply_relative_offset(
+    boxx: &mut LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) {
     let cs = match style_of(boxx, styles) {
         Some(cs) => cs,
         None => return,
@@ -1911,7 +2101,13 @@ fn intrinsic_width(
     if !words.is_empty() {
         let mut line_w = 0.0f32;
         for (i, w) in words.iter().enumerate() {
-            let ww = run_width(measurer, &w.text, w.style.font_size, w.style.bold, w.style.letter_spacing);
+            let ww = run_width(
+                measurer,
+                &w.text,
+                w.style.font_size,
+                w.style.bold,
+                w.style.letter_spacing,
+            );
             let sp = if i == 0 {
                 0.0
             } else {
@@ -2025,21 +2221,21 @@ fn layout_flex(
             fb
         } else if is_row {
             ccs.width.unwrap_or_else(|| {
-                (intrinsic_width(child, styles, measurer)
-                    - (p.left + p.right + b.left + b.right))
+                (intrinsic_width(child, styles, measurer) - (p.left + p.right + b.left + b.right))
                     .max(0.0)
             })
         } else {
-            ccs.height.unwrap_or_else(|| intrinsic_cross_height(child, styles, measurer))
+            ccs.height
+                .unwrap_or_else(|| intrinsic_cross_height(child, styles, measurer))
         };
         let base_main = base_content + main_edges;
         // Cross base size (content-box) for the item.
         let cross_content = if is_row {
-            ccs.height.unwrap_or_else(|| intrinsic_cross_height(child, styles, measurer))
+            ccs.height
+                .unwrap_or_else(|| intrinsic_cross_height(child, styles, measurer))
         } else {
             ccs.width.unwrap_or_else(|| {
-                (intrinsic_width(child, styles, measurer)
-                    - (p.left + p.right + b.left + b.right))
+                (intrinsic_width(child, styles, measurer) - (p.left + p.right + b.left + b.right))
                     .max(0.0)
             })
         };
@@ -2062,7 +2258,11 @@ fn layout_flex(
         let mut line: Vec<usize> = Vec::new();
         let mut used = 0.0f32;
         for (mi, m) in metas.iter().enumerate() {
-            let add = if line.is_empty() { m.hyp_main } else { main_gap + m.hyp_main };
+            let add = if line.is_empty() {
+                m.hyp_main
+            } else {
+                main_gap + m.hyp_main
+            };
             if !line.is_empty() && used + add > main_avail {
                 lines.push(std::mem::take(&mut line));
                 used = m.hyp_main;
@@ -2231,13 +2431,18 @@ fn layout_flex(
                 _ => this_cross,
             };
             let cross_off = match align {
-                style::AlignSelf::FlexStart | style::AlignSelf::Stretch
+                style::AlignSelf::FlexStart
+                | style::AlignSelf::Stretch
                 | style::AlignSelf::Baseline => 0.0,
                 style::AlignSelf::FlexEnd => line_cross - this_cross,
                 style::AlignSelf::Center => (line_cross - this_cross) / 2.0,
                 style::AlignSelf::Auto => 0.0,
             };
-            let cross_off = if matches!(align, style::AlignSelf::Stretch) { 0.0 } else { cross_off };
+            let cross_off = if matches!(align, style::AlignSelf::Stretch) {
+                0.0
+            } else {
+                cross_off
+            };
 
             // For column flex the main extent is the laid-out height (so the next item clears it).
             let main_extent = if is_row {
@@ -2281,7 +2486,12 @@ fn layout_flex(
                     (main_extent - meta.main_edges).max(0.0),
                 )
             };
-            child.dimensions.content = Rect { x: cx, y: cy, width: cw, height: ch };
+            child.dimensions.content = Rect {
+                x: cx,
+                y: cy,
+                width: cw,
+                height: ch,
+            };
 
             // Re-lay out contents at the final position so descendant boxes are correctly placed.
             layout_flex_item_contents(child, ctx, styles, measurer);
@@ -2314,7 +2524,8 @@ fn layout_flex(
         let mut max_bottom = content.y;
         for c in &boxx.children {
             if !is_out_of_flow(c, styles) {
-                max_bottom = max_bottom.max(c.dimensions.margin_box().y + c.dimensions.margin_box().height);
+                max_bottom =
+                    max_bottom.max(c.dimensions.margin_box().y + c.dimensions.margin_box().height);
             }
         }
         explicit_height(boxx, styles).unwrap_or((max_bottom - content.y).max(0.0))
@@ -2375,7 +2586,10 @@ fn layout_flex_item_contents(
     measurer: &dyn TextMeasurer,
 ) -> f32 {
     let child_ctx = if !matches!(position_of(boxx, styles), style::Position::Static) {
-        Ctx { positioned: boxx.dimensions.padding_box(), viewport: ctx.viewport }
+        Ctx {
+            positioned: boxx.dimensions.padding_box(),
+            viewport: ctx.viewport,
+        }
     } else {
         ctx
     };
@@ -2388,12 +2602,11 @@ fn layout_flex_item_contents(
             layout_grid(boxx, child_ctx, styles, measurer)
         }
         _ => {
-            let any_block = boxx
-                .children
-                .iter()
-                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+            let any_block = boxx.children.iter().any(|c| {
+                matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
                     || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
-                        && image_is_block(c, styles)));
+                        && image_is_block(c, styles))
+            });
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -2475,7 +2688,10 @@ fn table_span(cell: &LayoutBox, name: &str) -> usize {
         None => return 1,
     };
     TABLE_SPANS.with(|t| {
-        t.borrow().get(&node).map(|(c, r)| if name == "colspan" { *c } else { *r }).unwrap_or(1)
+        t.borrow()
+            .get(&node)
+            .map(|(c, r)| if name == "colspan" { *c } else { *r })
+            .unwrap_or(1)
     })
 }
 
@@ -2553,7 +2769,9 @@ fn collect_col_widths(
                 let group_w = style_of(child, styles).and_then(|cs| cs.width);
                 let mut had_col = false;
                 for col in &child.children {
-                    if style_of(col, styles).map(|cs| cs.display) == Some(style::Display::TableColumn) {
+                    if style_of(col, styles).map(|cs| cs.display)
+                        == Some(style::Display::TableColumn)
+                    {
                         had_col = true;
                         let w = style_of(col, styles).and_then(|cs| cs.width).or(group_w);
                         let span = col_span_attr(col).max(1);
@@ -2579,9 +2797,7 @@ fn col_span_attr(col: &LayoutBox) -> usize {
         Some(n) => n,
         None => return 1,
     };
-    TABLE_SPANS.with(|t| {
-        t.borrow().get(&node).map(|(c, _)| (*c).max(1)).unwrap_or(1)
-    })
+    TABLE_SPANS.with(|t| t.borrow().get(&node).map(|(c, _)| (*c).max(1)).unwrap_or(1))
 }
 
 /// Append the `<tr>` rows found inside a row-group box (`thead`/`tbody`/`tfoot`) to `out`.
@@ -2611,16 +2827,19 @@ fn extract_cells(
 /// The min-content width (px) of a cell: the widest single unbreakable word in its content
 /// (so a column never gets narrower than its longest word), plus the cell's own horizontal
 /// padding/border. Used as the lower bound for auto column sizing.
-fn cell_min_content_width(
-    boxx: &LayoutBox,
-    measurer: &dyn TextMeasurer,
-) -> f32 {
+fn cell_min_content_width(boxx: &LayoutBox, measurer: &dyn TextMeasurer) -> f32 {
     let mut words: Vec<InlineWord> = Vec::new();
     collect_inline_words(&boxx.children, &mut words);
     let mut max_word = 0.0f32;
     for w in &words {
         for token in w.text.split_whitespace() {
-            let ww = run_width(measurer, token, w.style.font_size, w.style.bold, w.style.letter_spacing);
+            let ww = run_width(
+                measurer,
+                token,
+                w.style.font_size,
+                w.style.bold,
+                w.style.letter_spacing,
+            );
             max_word = max_word.max(ww);
         }
     }
@@ -2663,7 +2882,11 @@ fn layout_table(
     // a single `spacing` scalar (0 when collapsed) through the column/row offset maths so the
     // geometry adapts; the painter reads `border_collapse` off each cell to draw single lines.
     let collapsed = table_cs.border_collapse == style::BorderCollapse::Collapse;
-    let spacing = if collapsed { 0.0 } else { table_cs.border_spacing.max(0.0) };
+    let spacing = if collapsed {
+        0.0
+    } else {
+        table_cs.border_spacing.max(0.0)
+    };
 
     // --- 1. Pull out captions (laid out above the grid) and collect rows of cells. ---
     // Captions are direct table children with display: table-caption.
@@ -2703,7 +2926,13 @@ fn layout_table(
                 }
             }
             col_count = col_count.max(c + colspan);
-            cells.push(TableCell { boxx: cell, col: c, row: r, colspan, rowspan });
+            cells.push(TableCell {
+                boxx: cell,
+                col: c,
+                row: r,
+                colspan,
+                rowspan,
+            });
             c += colspan;
         }
     }
@@ -2781,7 +3010,11 @@ fn layout_table(
         // Grow columns proportionally to fill the target width.
         let extra = target - sum_pref;
         for c in 0..col_count {
-            let share = if sum_pref > 0.0 { col_pref[c] / sum_pref } else { 1.0 / col_count as f32 };
+            let share = if sum_pref > 0.0 {
+                col_pref[c] / sum_pref
+            } else {
+                1.0 / col_count as f32
+            };
             col_w[c] = col_pref[c] + extra * share;
         }
     } else if target < sum_pref {
@@ -2791,7 +3024,11 @@ fn layout_table(
         if shrinkable > 0.0 && deficit > 0.0 {
             for c in 0..col_count {
                 let slack = col_pref[c] - col_min[c];
-                let take = if shrinkable > 0.0 { deficit * (slack / shrinkable) } else { 0.0 };
+                let take = if shrinkable > 0.0 {
+                    deficit * (slack / shrinkable)
+                } else {
+                    0.0
+                };
                 col_w[c] = (col_pref[c] - take).max(col_min[c]);
             }
         } else {
@@ -2835,7 +3072,9 @@ fn layout_table(
         cell.boxx.dimensions.content.width = cw;
         let laid = layout_flex_item_contents(&mut cell.boxx, ctx, styles, measurer);
         // Honor an explicit cell height as a floor.
-        let explicit_h = style_of(&cell.boxx, styles).and_then(|cs| cs.height).unwrap_or(0.0);
+        let explicit_h = style_of(&cell.boxx, styles)
+            .and_then(|cs| cs.height)
+            .unwrap_or(0.0);
         measured_h[i] = laid.max(explicit_h);
     }
 
@@ -2895,7 +3134,12 @@ fn layout_table(
         let ch = (cell_border_h - v_edges).max(0.0);
         let cx = content.x + col_x[start_c] + m.left + b.left + p.left;
         let cy = grid_top + row_y[start_r] + m.top + b.top + p.top;
-        cell.boxx.dimensions.content = Rect { x: cx, y: cy, width: cw, height: ch };
+        cell.boxx.dimensions.content = Rect {
+            x: cx,
+            y: cy,
+            width: cw,
+            height: ch,
+        };
         // Re-lay the content into the (now taller) cell box. vertical-align defaults to top, so
         // content starts at the cell's content-box top (a documented simplification — middle/bottom
         // are not implemented).
@@ -2936,7 +3180,12 @@ fn layout_table_captions(
 ) -> f32 {
     let mut y = content.y;
     for cap in captions.iter_mut() {
-        let containing = Rect { x: content.x, y, width: content.width, height: 0.0 };
+        let containing = Rect {
+            x: content.x,
+            y,
+            width: content.width,
+            height: 0.0,
+        };
         layout_block(cap, containing, ctx, styles, measurer);
         y += cap.dimensions.margin_box().height;
     }
@@ -3080,7 +3329,8 @@ fn layout_grid(
     // Column x offsets (cumulative + gaps).
     let mut col_x = vec![0.0f32; num_cols + 1];
     for c in 0..num_cols {
-        col_x[c + 1] = col_x[c] + col_widths[c] + if c + 1 < num_cols { cs.column_gap } else { 0.0 };
+        col_x[c + 1] =
+            col_x[c] + col_widths[c] + if c + 1 < num_cols { cs.column_gap } else { 0.0 };
     }
 
     // Measure each placed item's real content height by laying its contents out at its actual cell
@@ -3165,12 +3415,17 @@ fn layout_grid(
         let ch = ccs.height.unwrap_or((h - edges_v).max(0.0));
         let cx = cell_x + m.left + b.left + pad.left;
         let cy = cell_y + m.top + b.top + pad.top;
-        child.dimensions.content = Rect { x: cx, y: cy, width: cw, height: ch };
+        child.dimensions.content = Rect {
+            x: cx,
+            y: cy,
+            width: cw,
+            height: ch,
+        };
         layout_flex_item_contents(child, ctx, styles, measurer);
     }
 
-    let total_h: f32 = row_heights.iter().sum::<f32>()
-        + cs.row_gap * (used_rows.saturating_sub(1) as f32);
+    let total_h: f32 =
+        row_heights.iter().sum::<f32>() + cs.row_gap * (used_rows.saturating_sub(1) as f32);
     container_h.unwrap_or(total_h)
 }
 
@@ -3264,7 +3519,11 @@ fn resolve_row_heights(
             }
         }
         let remaining = (space - fixed).max(0.0);
-        let fr_unit = if fr_total > 0.0 { remaining / fr_total } else { 0.0 };
+        let fr_unit = if fr_total > 0.0 {
+            remaining / fr_total
+        } else {
+            0.0
+        };
         tracks
             .iter()
             .enumerate()
@@ -3360,7 +3619,11 @@ fn layout_inline_children(
         // A forced break (`<br>` / preserved `\n`) ends the current line unconditionally and starts
         // a fresh one — even when the line is empty (so consecutive breaks produce blank lines).
         if let InlineItem::Break { font_size } = &item {
-            let h = if line_h > 0.0 { line_h } else { measurer.line_height(*font_size) };
+            let h = if line_h > 0.0 {
+                line_h
+            } else {
+                measurer.line_height(*font_size)
+            };
             let fs = if max_fs > 0.0 { max_fs } else { *font_size };
             lines.push(PlacedLine {
                 items: std::mem::take(&mut cur),
@@ -3412,10 +3675,18 @@ fn layout_inline_children(
     let mut y = content.y;
     let mut total_h = 0.0f32;
     for line in &lines {
-        let line_font = if line.max_font_size > 0.0 { line.max_font_size } else { 16.0 };
+        let line_font = if line.max_font_size > 0.0 {
+            line.max_font_size
+        } else {
+            16.0
+        };
         // The line advance is the tallest item's preferred line-height (its computed
         // `line-height` if set, else the font metric — both already folded into `line.height`).
-        let lh = if line.height > 0.0 { line.height } else { measurer.line_height(line_font) };
+        let lh = if line.height > 0.0 {
+            line.height
+        } else {
+            measurer.line_height(line_font)
+        };
         // The emitted Text box's own height matches the line advance.
         let text_lh = lh;
         let line_x = match align {
@@ -3457,14 +3728,20 @@ fn layout_inline_children(
                 let measure_fs = if run_fs > 0.0 { run_fs } else { line_font };
                 let mut tb = LayoutBox::new(BoxContent::Text(text), r.style, r.node);
                 let w = run_width(measurer, &tb_text(&tb), measure_fs, false, ls);
-                tb.dimensions.content =
-                    Rect { x: line_x + r.start_off, y: y + voff, width: w, height: text_lh };
+                tb.dimensions.content = Rect {
+                    x: line_x + r.start_off,
+                    y: y + voff,
+                    width: w,
+                    height: text_lh,
+                };
                 out.push(tb);
             }
         };
         for (item, off) in &line.items {
             match item {
-                InlineItem::Word { text, style, node, .. } => {
+                InlineItem::Word {
+                    text, style, node, ..
+                } => {
                     match &mut run {
                         // Continue the current run only if the node matches.
                         Some(r) if r.node == *node => r.texts.push(text.clone()),
@@ -3507,7 +3784,13 @@ fn layout_inline_children(
 }
 
 /// Advance width of a text run including `letter-spacing` (added once per character).
-fn run_width(measurer: &dyn TextMeasurer, text: &str, px: f32, bold: bool, letter_spacing: f32) -> f32 {
+fn run_width(
+    measurer: &dyn TextMeasurer,
+    text: &str,
+    px: f32,
+    bold: bool,
+    letter_spacing: f32,
+) -> f32 {
     let base = measurer.text_width(text, px, bold);
     if letter_spacing != 0.0 {
         base + letter_spacing * text.chars().count() as f32
@@ -3539,7 +3822,12 @@ enum InlineItem {
     /// A word carrying the DOM node of its source text box (used for hit-testing). `leads_space` is
     /// whether an inter-word space precedes it on a line (true for normal words; false for a
     /// `white-space: pre` run, whose spaces are already inside `text`).
-    Word { text: String, style: PaintStyle, node: Option<dom::NodeId>, leads_space: bool },
+    Word {
+        text: String,
+        style: PaintStyle,
+        node: Option<dom::NodeId>,
+        leads_space: bool,
+    },
     /// An atomic box (inline-block / inline-flex / inline-grid) already laid out at a tentative
     /// origin; it advances the pen by its margin-box width and is repositioned on its line.
     Atomic(Box<LayoutBox>),
@@ -3553,16 +3841,31 @@ impl InlineItem {
     /// preferred line advance: the element's computed `line-height` if set, else the font metric.
     fn metrics(&self, measurer: &dyn TextMeasurer) -> (f32, f32, f32, bool) {
         match self {
-            InlineItem::Word { text, style, leads_space, .. } => {
-                let w = run_width(measurer, text, style.font_size, style.bold, style.letter_spacing);
-                let lh = style.line_height.unwrap_or_else(|| measurer.line_height(style.font_size));
+            InlineItem::Word {
+                text,
+                style,
+                leads_space,
+                ..
+            } => {
+                let w = run_width(
+                    measurer,
+                    text,
+                    style.font_size,
+                    style.bold,
+                    style.letter_spacing,
+                );
+                let lh = style
+                    .line_height
+                    .unwrap_or_else(|| measurer.line_height(style.font_size));
                 (w, style.font_size, lh, *leads_space)
             }
             InlineItem::Atomic(b) => {
                 let mb = b.dimensions.margin_box();
                 (mb.width, b.style.font_size, mb.height, false)
             }
-            InlineItem::Break { font_size } => (0.0, *font_size, measurer.line_height(*font_size), false),
+            InlineItem::Break { font_size } => {
+                (0.0, *font_size, measurer.line_height(*font_size), false)
+            }
         }
     }
 }
@@ -3602,7 +3905,12 @@ fn collect_inline_items(
             // applies.
             let m = child.dimensions.margin;
             let iw = intrinsic_width(&child, styles, measurer) + m.left + m.right;
-            let containing = Rect { x: 0.0, y: 0.0, width: iw, height: 0.0 };
+            let containing = Rect {
+                x: 0.0,
+                y: 0.0,
+                width: iw,
+                height: 0.0,
+            };
             layout_block(&mut child, containing, ctx, styles, measurer);
             out.push(InlineItem::Atomic(Box::new(child)));
             continue;
@@ -3636,7 +3944,9 @@ fn collect_inline_items(
                 }
             }
             BoxContent::LineBreak => {
-                out.push(InlineItem::Break { font_size: child.style.font_size });
+                out.push(InlineItem::Break {
+                    font_size: child.style.font_size,
+                });
             }
             BoxContent::Inline => {
                 collect_inline_items(child.children, ctx, styles, measurer, out);
@@ -3645,7 +3955,12 @@ fn collect_inline_items(
                 // An atomic inline image: position its (pre-sized) content box at a tentative
                 // origin so its margin box is well-formed, then emit it as an atomic item. It
                 // advances the line by its margin-box width and is repositioned on its line.
-                let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+                let containing = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                };
                 layout_image_box(&mut child, containing);
                 out.push(InlineItem::Atomic(Box::new(child)));
             }
@@ -3653,7 +3968,12 @@ fn collect_inline_items(
                 // The focused-field caret: an atomic, pre-sized thin bar. Like an image, give it a
                 // well-formed margin box at a tentative origin, then flow it inline so it sits
                 // right after the value text (its top margin centers it on the line).
-                let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+                let containing = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                };
                 layout_image_box(&mut child, containing);
                 out.push(InlineItem::Atomic(Box::new(child)));
             }
@@ -3661,7 +3981,12 @@ fn collect_inline_items(
                 // A drawn form widget: pre-sized (content set at build time), replaced-like. Treat
                 // it as an atomic inline box (like an image) so it advances the line by its
                 // border-box width and is repositioned on its line.
-                let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+                let containing = Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                };
                 layout_image_box(&mut child, containing);
                 out.push(InlineItem::Atomic(Box::new(child)));
             }
@@ -3713,7 +4038,10 @@ mod tests {
     /// Build a styled document: returns the doc plus the computed-style map. `setup` populates
     /// the DOM and returns nothing; styles are supplied directly per node id.
     fn block_style(display_block: bool) -> style::ComputedStyle {
-        style::ComputedStyle { display_block, ..Default::default() }
+        style::ComputedStyle {
+            display_block,
+            ..Default::default()
+        }
     }
 
     /// Find the first descendant box (DFS) matching `pred`.
@@ -3771,8 +4099,14 @@ mod tests {
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let texts = collect_text_box_list(&root_box);
-        let first = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "first")).unwrap();
-        let second = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "second")).unwrap();
+        let first = texts
+            .iter()
+            .find(|b| matches!(&b.content, BoxContent::Text(t) if t == "first"))
+            .unwrap();
+        let second = texts
+            .iter()
+            .find(|b| matches!(&b.content, BoxContent::Text(t) if t == "second"))
+            .unwrap();
         // The <br> forces "second" onto the next line: strictly greater y.
         assert!(
             second.dimensions.content.y > first.dimensions.content.y,
@@ -3807,13 +4141,27 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let texts = collect_text_box_list(&root_box);
         // Two runs: "a   b" (line 1) and "c" (line 2).
-        let l1 = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "a   b")).expect("first pre line preserved with 3 spaces");
-        let l2 = texts.iter().find(|b| matches!(&b.content, BoxContent::Text(t) if t == "c")).expect("second pre line after the newline");
+        let l1 = texts
+            .iter()
+            .find(|b| matches!(&b.content, BoxContent::Text(t) if t == "a   b"))
+            .expect("first pre line preserved with 3 spaces");
+        let l2 = texts
+            .iter()
+            .find(|b| matches!(&b.content, BoxContent::Text(t) if t == "c"))
+            .expect("second pre line after the newline");
         // The newline put them on different lines.
-        assert!(l2.dimensions.content.y > l1.dimensions.content.y, "newline should drop 'c' to a new line");
+        assert!(
+            l2.dimensions.content.y > l1.dimensions.content.y,
+            "newline should drop 'c' to a new line"
+        );
         // The first run's width reflects the preserved spaces: "a   b" = 5 chars at 0.6*16.
         let expected = Stub.text_width("a   b", 16.0, false);
-        assert!((l1.dimensions.content.width - expected).abs() < 0.01, "width {} != {}", l1.dimensions.content.width, expected);
+        assert!(
+            (l1.dimensions.content.width - expected).abs() < 0.01,
+            "width {} != {}",
+            l1.dimensions.content.width,
+            expected
+        );
     }
 
     #[test]
@@ -3838,14 +4186,25 @@ mod tests {
         // ul: disc markers; padding-left 40 like the UA sheet.
         let mut ul_s = block_style(true);
         ul_s.list_style_type = style::ListStyleType::Disc;
-        ul_s.padding = style::Edges { left: 40.0, ..Default::default() };
+        ul_s.padding = style::Edges {
+            left: 40.0,
+            ..Default::default()
+        };
         styles.insert(ul, ul_s);
         // ol: decimal markers (li inherit list_style_type).
         let mut ol_s = block_style(true);
         ol_s.list_style_type = style::ListStyleType::Decimal;
-        ol_s.padding = style::Edges { left: 40.0, ..Default::default() };
+        ol_s.padding = style::Edges {
+            left: 40.0,
+            ..Default::default()
+        };
         styles.insert(ol, ol_s);
-        for (id, lst) in [(li1, style::ListStyleType::Disc), (li2, style::ListStyleType::Disc), (oli1, style::ListStyleType::Decimal), (oli2, style::ListStyleType::Decimal)] {
+        for (id, lst) in [
+            (li1, style::ListStyleType::Disc),
+            (li2, style::ListStyleType::Disc),
+            (oli1, style::ListStyleType::Decimal),
+            (oli2, style::ListStyleType::Decimal),
+        ] {
             let mut s = block_style(true);
             s.list_style_type = lst;
             styles.insert(id, s);
@@ -3864,12 +4223,27 @@ mod tests {
         let mut ms = Vec::new();
         markers(&root_box, &mut ms);
         // Two bullets (•) for the ul, then "1." and "2." for the ol.
-        assert!(ms.iter().filter(|m| *m == "\u{2022}").count() == 2, "expected two disc bullets, got {ms:?}");
-        assert!(ms.contains(&"1.".to_string()) && ms.contains(&"2.".to_string()), "expected 1. and 2. ol markers, got {ms:?}");
+        assert!(
+            ms.iter().filter(|m| *m == "\u{2022}").count() == 2,
+            "expected two disc bullets, got {ms:?}"
+        );
+        assert!(
+            ms.contains(&"1.".to_string()) && ms.contains(&"2.".to_string()),
+            "expected 1. and 2. ol markers, got {ms:?}"
+        );
         // The first ul li's marker sits to the LEFT of the li content (in the 40px padding).
-        let li1_box = find_box(&root_box, &|x| x.node == Some(li1) && matches!(x.content, BoxContent::Block)).unwrap();
-        let marker_box = find_box(&root_box, &|x| matches!(x.content, BoxContent::Marker(_)) && x.node == Some(li1)).unwrap();
-        assert!(marker_box.dimensions.content.x < li1_box.dimensions.content.x, "marker should be left of li content");
+        let li1_box = find_box(&root_box, &|x| {
+            x.node == Some(li1) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap();
+        let marker_box = find_box(&root_box, &|x| {
+            matches!(x.content, BoxContent::Marker(_)) && x.node == Some(li1)
+        })
+        .unwrap();
+        assert!(
+            marker_box.dimensions.content.x < li1_box.dimensions.content.x,
+            "marker should be left of li content"
+        );
     }
 
     #[test]
@@ -3883,8 +4257,22 @@ mod tests {
 
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
-        styles.insert(a, style::ComputedStyle { display_block: true, height: Some(30.0), ..Default::default() });
-        styles.insert(b, style::ComputedStyle { display_block: true, height: Some(50.0), ..Default::default() });
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(30.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(50.0),
+                ..Default::default()
+            },
+        );
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
@@ -3926,7 +4314,7 @@ mod tests {
         // border box = content expanded by padding (5) + border (2): origin shifts by 7.
         let bb = abox.dimensions.border_box();
         assert_eq!(bb.x, 10.0); // content.x 17 - padding 5 - border 2
-        // margin box origin is at the containing origin.
+                                // margin box origin is at the containing origin.
         let mb = abox.dimensions.margin_box();
         assert_eq!(mb.x, 0.0);
         assert_eq!(mb.y, 0.0);
@@ -4064,8 +4452,11 @@ mod tests {
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
-        assert!((pbox.dimensions.content.height - 40.0).abs() < 0.01,
-            "expected line advance 40, got {}", pbox.dimensions.content.height);
+        assert!(
+            (pbox.dimensions.content.height - 40.0).abs() < 0.01,
+            "expected line advance 40, got {}",
+            pbox.dimensions.content.height
+        );
     }
 
     #[test]
@@ -4077,7 +4468,14 @@ mod tests {
 
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
-        styles.insert(a, style::ComputedStyle { display_block: true, width: Some(200.0), ..Default::default() });
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                width: Some(200.0),
+                ..Default::default()
+            },
+        );
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
@@ -4131,8 +4529,9 @@ mod tests {
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
 
         // Some emitted Text box must carry the <a>'s text node.
-        let carries_a_text =
-            count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)) && x.node == Some(a_text));
+        let carries_a_text = count_boxes(pbox, &|x| {
+            matches!(x.content, BoxContent::Text(_)) && x.node == Some(a_text)
+        });
         assert!(
             carries_a_text >= 1,
             "expected at least one Text box carrying the <a>'s text node id"
@@ -4170,10 +4569,14 @@ mod tests {
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
         styles.insert(p, block_style(true));
-        let mut sup_cs = style::ComputedStyle::default();
-        sup_cs.vertical_align = style::VerticalAlign::Super;
-        let mut sub_cs = style::ComputedStyle::default();
-        sub_cs.vertical_align = style::VerticalAlign::Sub;
+        let sup_cs = style::ComputedStyle {
+            vertical_align: style::VerticalAlign::Super,
+            ..Default::default()
+        };
+        let sub_cs = style::ComputedStyle {
+            vertical_align: style::VerticalAlign::Sub,
+            ..Default::default()
+        };
         styles.insert(sup, sup_cs);
         styles.insert(sub, sub_cs);
 
@@ -4181,22 +4584,32 @@ mod tests {
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
 
         let y_of = |node: dom::NodeId| -> f32 {
-            find_box(pbox, &|x| matches!(x.content, BoxContent::Text(_)) && x.node == Some(node))
-                .unwrap()
-                .dimensions
-                .content
-                .y
+            find_box(pbox, &|x| {
+                matches!(x.content, BoxContent::Text(_)) && x.node == Some(node)
+            })
+            .unwrap()
+            .dimensions
+            .content
+            .y
         };
-        let base_y =
-            find_box(pbox, &|x| matches!(&x.content, BoxContent::Text(t) if t == "base"))
-                .unwrap()
-                .dimensions
-                .content
-                .y;
+        let base_y = find_box(
+            pbox,
+            &|x| matches!(&x.content, BoxContent::Text(t) if t == "base"),
+        )
+        .unwrap()
+        .dimensions
+        .content
+        .y;
         let sup_y = y_of(sup_text);
         let sub_y = y_of(sub_text);
-        assert!(sup_y < base_y, "sup run ({sup_y}) should sit above base ({base_y})");
-        assert!(sub_y > base_y, "sub run ({sub_y}) should sit below base ({base_y})");
+        assert!(
+            sup_y < base_y,
+            "sup run ({sup_y}) should sit above base ({base_y})"
+        );
+        assert!(
+            sub_y > base_y,
+            "sub run ({sub_y}) should sit below base ({base_y})"
+        );
     }
 
     /// Collect references to all `Text` boxes in a subtree (DFS).
@@ -4224,7 +4637,14 @@ mod tests {
 
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
-        styles.insert(hidden, style::ComputedStyle { display_block: true, display_none: true, ..Default::default() });
+        styles.insert(
+            hidden,
+            style::ComputedStyle {
+                display_block: true,
+                display_none: true,
+                ..Default::default()
+            },
+        );
         styles.insert(shown, block_style(true));
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
@@ -4270,9 +4690,24 @@ mod tests {
     #[test]
     fn border_box_expands_content_by_padding_and_border() {
         let d = Dimensions {
-            content: Rect { x: 10.0, y: 10.0, width: 100.0, height: 20.0 },
-            padding: Edges { top: 5.0, right: 5.0, bottom: 5.0, left: 5.0 },
-            border: Edges { top: 2.0, right: 2.0, bottom: 2.0, left: 2.0 },
+            content: Rect {
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: 20.0,
+            },
+            padding: Edges {
+                top: 5.0,
+                right: 5.0,
+                bottom: 5.0,
+                left: 5.0,
+            },
+            border: Edges {
+                top: 2.0,
+                right: 2.0,
+                bottom: 2.0,
+                left: 2.0,
+            },
             margin: Edges::default(),
         };
         let b = d.border_box();
@@ -4336,7 +4771,10 @@ mod tests {
         // Last item's right edge flush with the container's right content edge.
         let last_right = dbox.dimensions.content.x + dbox.dimensions.content.width;
         let cont_right = cbox.dimensions.content.x + 300.0;
-        assert!((last_right - cont_right).abs() < 0.01, "last_right={last_right} cont_right={cont_right}");
+        assert!(
+            (last_right - cont_right).abs() < 0.01,
+            "last_right={last_right} cont_right={cont_right}"
+        );
     }
 
     #[test]
@@ -4382,8 +4820,11 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         // free = 300 - 50 - 50 - 0(basis) = 200, all goes to b.
-        assert!((bbox.dimensions.content.width - 200.0).abs() < 0.01,
-            "got {}", bbox.dimensions.content.width);
+        assert!(
+            (bbox.dimensions.content.width - 200.0).abs() < 0.01,
+            "got {}",
+            bbox.dimensions.content.width
+        );
     }
 
     #[test]
@@ -4453,8 +4894,12 @@ mod tests {
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         // Centered: a.y should be container.y + (100 - 20)/2 = +40.
         let expected_y = cbox.dimensions.content.y + 40.0;
-        assert!((abox.dimensions.content.y - expected_y).abs() < 0.01,
-            "a.y={} expected {}", abox.dimensions.content.y, expected_y);
+        assert!(
+            (abox.dimensions.content.y - expected_y).abs() < 0.01,
+            "a.y={} expected {}",
+            abox.dimensions.content.y,
+            expected_y
+        );
     }
 
     #[test]
@@ -4499,8 +4944,18 @@ mod tests {
         let pad = pbox.dimensions.padding_box();
         // Child border-box origin = parent padding-box + (left, top).
         let cb = cbox.dimensions.border_box();
-        assert!((cb.x - (pad.x + 20.0)).abs() < 0.01, "cb.x={} pad.x={}", cb.x, pad.x);
-        assert!((cb.y - (pad.y + 10.0)).abs() < 0.01, "cb.y={} pad.y={}", cb.y, pad.y);
+        assert!(
+            (cb.x - (pad.x + 20.0)).abs() < 0.01,
+            "cb.x={} pad.x={}",
+            cb.x,
+            pad.x
+        );
+        assert!(
+            (cb.y - (pad.y + 10.0)).abs() < 0.01,
+            "cb.y={} pad.y={}",
+            cb.y,
+            pad.y
+        );
     }
 
     #[test]
@@ -4580,15 +5035,34 @@ mod tests {
         let bb = cbox.dimensions.border_box();
 
         // Shrink-to-fit: NOT full width. "HI" = 2*16*0.6 = 19.2 content + 8 padding = 27.2 border box.
-        assert!(bb.width < pad.width, "corner border-box width {} should be < parent padding box {}",
-            bb.width, pad.width);
-        assert!((bb.width - 27.2).abs() < 0.5, "corner border-box width = {}", bb.width);
+        assert!(
+            bb.width < pad.width,
+            "corner border-box width {} should be < parent padding box {}",
+            bb.width,
+            pad.width
+        );
+        assert!(
+            (bb.width - 27.2).abs() < 0.5,
+            "corner border-box width = {}",
+            bb.width
+        );
 
         // Right edge anchored 6px from the parent's padding-box right edge.
         let right_gap = (pad.x + pad.width) - (bb.x + bb.width);
-        assert!((right_gap - 6.0).abs() < 0.01, "right gap = {} (bb.x={} bb.w={})", right_gap, bb.x, bb.width);
+        assert!(
+            (right_gap - 6.0).abs() < 0.01,
+            "right gap = {} (bb.x={} bb.w={})",
+            right_gap,
+            bb.x,
+            bb.width
+        );
         // Top edge anchored 6px from the parent's padding-box top edge.
-        assert!((bb.y - (pad.y + 6.0)).abs() < 0.01, "bb.y={} pad.y={}", bb.y, pad.y);
+        assert!(
+            (bb.y - (pad.y + 6.0)).abs() < 0.01,
+            "bb.y={} pad.y={}",
+            bb.y,
+            pad.y
+        );
     }
 
     #[test]
@@ -4633,8 +5107,17 @@ mod tests {
         let bb = cbox.dimensions.border_box();
         // Border-box bottom edge sits 8px above the parent padding-box bottom edge.
         let bottom_gap = (pad.y + pad.height) - (bb.y + bb.height);
-        assert!((bottom_gap - 8.0).abs() < 0.01, "bottom gap = {}", bottom_gap);
-        assert!((bb.x - (pad.x + 5.0)).abs() < 0.01, "bb.x={} pad.x={}", bb.x, pad.x);
+        assert!(
+            (bottom_gap - 8.0).abs() < 0.01,
+            "bottom gap = {}",
+            bottom_gap
+        );
+        assert!(
+            (bb.x - (pad.x + 5.0)).abs() < 0.01,
+            "bb.x={} pad.x={}",
+            bb.x,
+            pad.x
+        );
     }
 
     #[test]
@@ -4661,7 +5144,11 @@ mod tests {
         );
         styles.insert(
             b,
-            style::ComputedStyle { display_block: true, height: Some(40.0), ..Default::default() },
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(40.0),
+                ..Default::default()
+            },
         );
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
@@ -4671,7 +5158,11 @@ mod tests {
         assert!((abox.dimensions.content.x - 25.0).abs() < 0.01);
         assert!((abox.dimensions.content.y - 5.0).abs() < 0.01);
         // b is unaffected: stacks below a's in-flow position (y=30), not the shifted one.
-        assert!((bbox.dimensions.content.y - 30.0).abs() < 0.01, "b.y={}", bbox.dimensions.content.y);
+        assert!(
+            (bbox.dimensions.content.y - 30.0).abs() < 0.01,
+            "b.y={}",
+            bbox.dimensions.content.y
+        );
     }
 
     #[test]
@@ -4691,15 +5182,21 @@ mod tests {
         styles.insert(p, block_style(true));
         styles.insert(
             ib,
-            style::ComputedStyle { display: style::Display::InlineBlock, ..Default::default() },
+            style::ComputedStyle {
+                display: style::Display::InlineBlock,
+                ..Default::default()
+            },
         );
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         // The inline-block becomes an atomic box (node == ib) sitting in the line.
         let ibbox = find_box(&root_box, &|x| x.node == Some(ib)).unwrap();
         // Intrinsic width = "XY" = 2 chars * 16 * 0.6 = 19.2.
-        assert!((ibbox.dimensions.content.width - 19.2).abs() < 0.1,
-            "ib width = {}", ibbox.dimensions.content.width);
+        assert!(
+            (ibbox.dimensions.content.width - 19.2).abs() < 0.1,
+            "ib width = {}",
+            ibbox.dimensions.content.width
+        );
         // It sits to the right of the leading "ab" word (x > content origin 0).
         assert!(ibbox.dimensions.content.x > 0.0);
     }
@@ -4733,7 +5230,11 @@ mod tests {
         for &id in &[a, b, c] {
             styles.insert(
                 id,
-                style::ComputedStyle { display_block: true, height: Some(20.0), ..Default::default() },
+                style::ComputedStyle {
+                    display_block: true,
+                    height: Some(20.0),
+                    ..Default::default()
+                },
             );
         }
 
@@ -4745,7 +5246,11 @@ mod tests {
         assert!((abox.dimensions.content.width - 100.0).abs() < 0.01);
         assert!((bbox.dimensions.content.width - 100.0).abs() < 0.01);
         // Columns laid out left-to-right at x = 0, 100, 200 (relative to grid origin).
-        let gx = find_box(&root_box, &|x| x.node == Some(g)).unwrap().dimensions.content.x;
+        let gx = find_box(&root_box, &|x| x.node == Some(g))
+            .unwrap()
+            .dimensions
+            .content
+            .x;
         assert!((abox.dimensions.content.x - gx).abs() < 0.01);
         assert!((bbox.dimensions.content.x - (gx + 100.0)).abs() < 0.01);
         assert!((cbox.dimensions.content.x - (gx + 200.0)).abs() < 0.01);
@@ -4760,7 +5265,10 @@ mod tests {
         let root = doc.root();
         let body = doc.append_element(root, "body");
         let p = doc.append_element(body, "p");
-        doc.append_child(p, dom::NodeData::Text("one two three four five six seven".into()));
+        doc.append_child(
+            p,
+            dom::NodeData::Text("one two three four five six seven".into()),
+        );
         let sib = doc.append_element(body, "div");
 
         let mut styles = HashMap::new();
@@ -4768,7 +5276,11 @@ mod tests {
         styles.insert(p, block_style(true)); // font_size 16 default
         styles.insert(
             sib,
-            style::ComputedStyle { display_block: true, height: Some(10.0), ..Default::default() },
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(10.0),
+                ..Default::default()
+            },
         );
 
         // Narrow width forces the paragraph to wrap to several lines.
@@ -4777,7 +5289,10 @@ mod tests {
         let sbox = find_box(&root_box, &|x| x.node == Some(sib)).unwrap();
 
         let lines = count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)));
-        assert!(lines > 1, "expected the paragraph to wrap, got {lines} line(s)");
+        assert!(
+            lines > 1,
+            "expected the paragraph to wrap, got {lines} line(s)"
+        );
         let p_bottom = pbox.dimensions.margin_box().y + pbox.dimensions.margin_box().height;
         assert!(
             sbox.dimensions.content.y >= p_bottom - 0.01,
@@ -4822,10 +5337,19 @@ mod tests {
 
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
-        styles.insert(input, style::ComputedStyle { width: Some(120.0), ..Default::default() });
+        styles.insert(
+            input,
+            style::ComputedStyle {
+                width: Some(120.0),
+                ..Default::default()
+            },
+        );
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
-        let txt = find_box(&root_box, &|x| matches!(&x.content, BoxContent::Text(s) if s == "hello"));
+        let txt = find_box(
+            &root_box,
+            &|x| matches!(&x.content, BoxContent::Text(s) if s == "hello"),
+        );
         let txt = txt.expect("input value must render as a Text box");
         // The rendered text traces back to the input element.
         assert_eq!(txt.node, Some(input));
@@ -4843,7 +5367,10 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(
             img,
-            style::ComputedStyle { width: Some(200.0), ..Default::default() },
+            style::ComputedStyle {
+                width: Some(200.0),
+                ..Default::default()
+            },
         );
 
         let mut intrinsic = HashMap::new();
@@ -4852,8 +5379,11 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
         let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
         assert_eq!(ibox.dimensions.content.width, 200.0);
-        assert!((ibox.dimensions.content.height - 100.0).abs() < 0.01,
-            "aspect-preserved height = {}", ibox.dimensions.content.height);
+        assert!(
+            (ibox.dimensions.content.height - 100.0).abs() < 0.01,
+            "aspect-preserved height = {}",
+            ibox.dimensions.content.height
+        );
     }
 
     #[test]
@@ -4867,7 +5397,11 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(
             img,
-            style::ComputedStyle { width: Some(40.0), height: Some(30.0), ..Default::default() },
+            style::ComputedStyle {
+                width: Some(40.0),
+                height: Some(30.0),
+                ..Default::default()
+            },
         );
 
         // Intrinsic provided but explicit CSS wins.
@@ -4893,11 +5427,19 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(
             img,
-            style::ComputedStyle { display: style::Display::Block, display_block: true, ..Default::default() },
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                ..Default::default()
+            },
         );
         styles.insert(
             sib,
-            style::ComputedStyle { display_block: true, height: Some(10.0), ..Default::default() },
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(10.0),
+                ..Default::default()
+            },
         );
 
         let mut intrinsic = HashMap::new();
@@ -4908,8 +5450,11 @@ mod tests {
         let sbox = find_box(&root_box, &|x| x.node == Some(sib)).unwrap();
         assert_eq!(ibox.dimensions.content.height, 50.0);
         // Sibling stacks below the image's 50px-tall margin box.
-        assert!((sbox.dimensions.content.y - 50.0).abs() < 0.01,
-            "sibling y = {} (should clear the 50px image)", sbox.dimensions.content.y);
+        assert!(
+            (sbox.dimensions.content.y - 50.0).abs() < 0.01,
+            "sibling y = {} (should clear the 50px image)",
+            sbox.dimensions.content.y
+        );
     }
 
     #[test]
@@ -4935,7 +5480,11 @@ mod tests {
         let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
         assert_eq!(ibox.dimensions.content.width, 20.0);
         // Sits to the right of the leading "ab" word.
-        assert!(ibox.dimensions.content.x > 0.0, "image x = {}", ibox.dimensions.content.x);
+        assert!(
+            ibox.dimensions.content.x > 0.0,
+            "image x = {}",
+            ibox.dimensions.content.x
+        );
     }
 
     #[test]
@@ -5013,7 +5562,10 @@ mod tests {
         }
         // Each item should actually have a non-zero height (the (792,275) zero-height bug).
         for (i, bx) in boxes.iter().enumerate() {
-            assert!(bx.dimensions.content.height > 0.0, "item {i} has zero height");
+            assert!(
+                bx.dimensions.content.height > 0.0,
+                "item {i} has zero height"
+            );
         }
         // Container height >= sum of item heights + gaps between them.
         let expected_min = sum_h + 8.0 * 2.0;
@@ -5034,7 +5586,11 @@ mod tests {
 
     /// Does any text run in the subtree contain `needle`?
     fn has_text(b: &LayoutBox, needle: &str) -> bool {
-        find_box(b, &|x| matches!(&x.content, BoxContent::Text(s) if s.contains(needle))).is_some()
+        find_box(
+            b,
+            &|x| matches!(&x.content, BoxContent::Text(s) if s.contains(needle)),
+        )
+        .is_some()
     }
 
     #[test]
@@ -5054,7 +5610,10 @@ mod tests {
         let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
         // The checkbox is a drawn Widget; checked state is carried on the Widget content.
         assert!(
-            matches!(ibox.content, BoxContent::Widget(WidgetKind::Checkbox { checked: true })),
+            matches!(
+                ibox.content,
+                BoxContent::Widget(WidgetKind::Checkbox { checked: true })
+            ),
             "expected a checked Checkbox widget, got {:?}",
             ibox.content
         );
@@ -5077,7 +5636,10 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
         assert!(
-            matches!(ibox.content, BoxContent::Widget(WidgetKind::Checkbox { checked: false })),
+            matches!(
+                ibox.content,
+                BoxContent::Widget(WidgetKind::Checkbox { checked: false })
+            ),
             "expected an unchecked Checkbox widget, got {:?}",
             ibox.content
         );
@@ -5109,11 +5671,7 @@ mod tests {
         (doc, select, body)
     }
 
-    fn layout_select(
-        doc: &dom::Document,
-        select: dom::NodeId,
-        body: dom::NodeId,
-    ) -> LayoutBox {
+    fn layout_select(doc: &dom::Document, select: dom::NodeId, body: dom::NodeId) -> LayoutBox {
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
         styles.insert(select, style::ComputedStyle::default());
@@ -5128,7 +5686,11 @@ mod tests {
     fn select_renders_selected_option_as_dropdown() {
         // Three options, the 2nd is `selected`.
         let (doc, select, body) = build_select(
-            &[(None, "First", false), (None, "Second", true), (None, "Third", false)],
+            &[
+                (None, "First", false),
+                (None, "Second", true),
+                (None, "Third", false),
+            ],
             None,
         );
         let root_box = layout_select(&doc, select, body);
@@ -5154,7 +5716,10 @@ mod tests {
         );
         let root_box = layout_select(&doc, select, body);
         let sbox = find_box(&root_box, &|x| x.node == Some(select)).unwrap();
-        assert!(has_text(sbox, "Cherry"), "value=c should select the Cherry option");
+        assert!(
+            has_text(sbox, "Cherry"),
+            "value=c should select the Cherry option"
+        );
         assert!(!has_text(sbox, "Apple"));
         assert!(!has_text(sbox, "Banana"));
     }
@@ -5163,7 +5728,11 @@ mod tests {
     fn select_defaults_to_first_option() {
         // No `selected`, no `value` → first option shows.
         let (doc, select, body) = build_select(
-            &[(None, "One", false), (None, "Two", false), (None, "Three", false)],
+            &[
+                (None, "One", false),
+                (None, "Two", false),
+                (None, "Three", false),
+            ],
             None,
         );
         let root_box = layout_select(&doc, select, body);
@@ -5178,7 +5747,11 @@ mod tests {
         // The <option> DOM subtree must be suppressed: no Text box should carry an option node id,
         // and the unselected options' text must not appear anywhere in the layout tree.
         let (doc, select, body) = build_select(
-            &[(None, "Alpha", true), (None, "Beta", false), (None, "Gamma", false)],
+            &[
+                (None, "Alpha", true),
+                (None, "Beta", false),
+                (None, "Gamma", false),
+            ],
             None,
         );
         let option_ids: Vec<dom::NodeId> = doc.get(select).children.clone();
@@ -5190,8 +5763,14 @@ mod tests {
                 "an <option> produced its own box (should be suppressed)"
             );
         }
-        assert!(!has_text(&root_box, "Beta"), "unselected option text leaked into layout");
-        assert!(!has_text(&root_box, "Gamma"), "unselected option text leaked into layout");
+        assert!(
+            !has_text(&root_box, "Beta"),
+            "unselected option text leaked into layout"
+        );
+        assert!(
+            !has_text(&root_box, "Gamma"),
+            "unselected option text leaked into layout"
+        );
     }
 
     #[test]
@@ -5209,13 +5788,30 @@ mod tests {
 
         // Focused: the value text is "hi" (no pipe glyph) plus a separate caret bar box. The caret
         // is laid out as a sibling of the value run (both owned by the input), so search the tree.
-        let root_box =
-            layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), Some(input));
-        assert!(has_text(&root_box, "hi"), "focused input should still show its value");
-        assert!(!has_text(&root_box, "|"), "caret must be a bar, not a pipe glyph");
+        let root_box = layout_document(
+            &doc,
+            &styles,
+            800.0,
+            600.0,
+            &Stub,
+            &HashMap::new(),
+            Some(input),
+        );
+        assert!(
+            has_text(&root_box, "hi"),
+            "focused input should still show its value"
+        );
+        assert!(
+            !has_text(&root_box, "|"),
+            "caret must be a bar, not a pipe glyph"
+        );
         let caret = find_box(&root_box, &|x| matches!(x.content, BoxContent::Caret))
             .expect("focused input should have a caret bar box");
-        assert_eq!(caret.node, Some(input), "caret belongs to the focused input");
+        assert_eq!(
+            caret.node,
+            Some(input),
+            "caret belongs to the focused input"
+        );
         assert!(
             caret.dimensions.content.width > 0.0 && caret.dimensions.content.height > 0.0,
             "caret bar has nonzero size"
@@ -5223,8 +5819,14 @@ mod tests {
 
         // Not focused: no caret box, no pipe.
         let root_box2 = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
-        assert!(has_text(&root_box2, "hi"), "unfocused input still shows its value");
-        assert!(!has_text(&root_box2, "|"), "unfocused input must not show a caret");
+        assert!(
+            has_text(&root_box2, "hi"),
+            "unfocused input still shows its value"
+        );
+        assert!(
+            !has_text(&root_box2, "|"),
+            "unfocused input must not show a caret"
+        );
         assert_eq!(
             count_boxes(&root_box2, &|x| matches!(x.content, BoxContent::Caret)),
             0,
@@ -5246,8 +5848,15 @@ mod tests {
         styles.insert(input, style::ComputedStyle::default());
 
         // Focused + empty: a caret bar, and the placeholder is hidden (as in real browsers).
-        let root_box =
-            layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), Some(input));
+        let root_box = layout_document(
+            &doc,
+            &styles,
+            800.0,
+            600.0,
+            &Stub,
+            &HashMap::new(),
+            Some(input),
+        );
         assert!(
             count_boxes(&root_box, &|x| matches!(x.content, BoxContent::Caret)) >= 1,
             "empty focused input should show a caret bar"
@@ -5260,7 +5869,10 @@ mod tests {
         // Unfocused + empty: the placeholder shows and there's no caret.
         let root_box2 = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let ibox2 = find_box(&root_box2, &|x| x.node == Some(input)).unwrap();
-        assert!(has_text(ibox2, "Search"), "unfocused empty input keeps its placeholder");
+        assert!(
+            has_text(ibox2, "Search"),
+            "unfocused empty input keeps its placeholder"
+        );
         assert_eq!(
             count_boxes(ibox2, &|x| matches!(x.content, BoxContent::Caret)),
             0,
@@ -5272,11 +5884,14 @@ mod tests {
 
     /// A pseudo computed style carrying a content string (inline by default).
     fn pseudo_style(content: &str) -> style::ComputedStyle {
-        style::ComputedStyle { content: Some(content.to_string()), ..Default::default() }
+        style::ComputedStyle {
+            content: Some(content.to_string()),
+            ..Default::default()
+        }
     }
 
     /// The first child of the box for `node` whose text equals `s` and its index among children.
-    fn child_text_at<'a>(b: &'a LayoutBox) -> Vec<&'a str> {
+    fn child_text_at(b: &LayoutBox) -> Vec<&str> {
         b.children
             .iter()
             .filter_map(|c| match &c.content {
@@ -5355,7 +5970,10 @@ mod tests {
         let joined = texts.join(" ");
         let hi_pos = joined.find("hi").unwrap();
         let world_pos = joined.find("world").unwrap();
-        assert!(hi_pos < world_pos, "::after text must follow the element's own text");
+        assert!(
+            hi_pos < world_pos,
+            "::after text must follow the element's own text"
+        );
     }
 
     #[test]
@@ -5463,7 +6081,10 @@ mod tests {
 
     /// A computed style with a given `display` value (everything else default).
     fn disp(d: style::Display) -> style::ComputedStyle {
-        style::ComputedStyle { display: d, ..Default::default() }
+        style::ComputedStyle {
+            display: d,
+            ..Default::default()
+        }
     }
 
     /// Build a `tr`-of-cells row under `parent`, returning the cell node ids. `cell_tag` is `td`/`th`.
@@ -5503,18 +6124,37 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(table, disp(style::Display::Table));
 
-        let mut rows: Vec<Vec<dom::NodeId>> = Vec::new();
-        rows.push(build_row(&mut doc, &mut styles, table, "td", &["aa", "bbbb", "c"]));
-        rows.push(build_row(&mut doc, &mut styles, table, "td", &["dddddd", "e", "ff"]));
-        rows.push(build_row(&mut doc, &mut styles, table, "td", &["g", "hh", "iii"]));
+        let mut rows: Vec<Vec<dom::NodeId>> = vec![build_row(
+            &mut doc,
+            &mut styles,
+            table,
+            "td",
+            &["aa", "bbbb", "c"],
+        )];
+        rows.push(build_row(
+            &mut doc,
+            &mut styles,
+            table,
+            "td",
+            &["dddddd", "e", "ff"],
+        ));
+        rows.push(build_row(
+            &mut doc,
+            &mut styles,
+            table,
+            "td",
+            &["g", "hh", "iii"],
+        ));
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
 
         let cell_rect = |n: dom::NodeId| {
-            find_box(&root_box, &|x| x.node == Some(n) && matches!(x.content, BoxContent::Block))
-                .unwrap()
-                .dimensions
-                .border_box()
+            find_box(&root_box, &|x| {
+                x.node == Some(n) && matches!(x.content, BoxContent::Block)
+            })
+            .unwrap()
+            .dimensions
+            .border_box()
         };
 
         // Columns: x + width match down each column.
@@ -5522,8 +6162,16 @@ mod tests {
             let r0 = cell_rect(rows[0][col]);
             for row in 1..3 {
                 let r = cell_rect(rows[row][col]);
-                assert!((r.x - r0.x).abs() < 0.01, "col {col} x mismatch: {} vs {}", r.x, r0.x);
-                assert!((r.width - r0.width).abs() < 0.01, "col {col} width mismatch");
+                assert!(
+                    (r.x - r0.x).abs() < 0.01,
+                    "col {col} x mismatch: {} vs {}",
+                    r.x,
+                    r0.x
+                );
+                assert!(
+                    (r.width - r0.width).abs() < 0.01,
+                    "col {col} width mismatch"
+                );
             }
         }
         // Rows: y matches across each row.
@@ -5531,7 +6179,12 @@ mod tests {
             let r0 = cell_rect(rows[row][0]);
             for col in 1..3 {
                 let r = cell_rect(rows[row][col]);
-                assert!((r.y - r0.y).abs() < 0.01, "row {row} y mismatch: {} vs {}", r.y, r0.y);
+                assert!(
+                    (r.y - r0.y).abs() < 0.01,
+                    "row {row} y mismatch: {} vs {}",
+                    r.y,
+                    r0.y
+                );
             }
         }
         // Column 0's width is driven by its widest cell ("dddddd").
@@ -5570,8 +6223,16 @@ mod tests {
             );
         }
         // Header sits above the body rows.
-        let hy = find_box(&root_box, &|x| x.node == Some(h[0])).unwrap().dimensions.content.y;
-        let by = find_box(&root_box, &|x| x.node == Some(r1[0])).unwrap().dimensions.content.y;
+        let hy = find_box(&root_box, &|x| x.node == Some(h[0]))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
+        let by = find_box(&root_box, &|x| x.node == Some(r1[0]))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
         assert!(hy < by, "thead row ({hy}) above tbody row ({by})");
     }
 
@@ -5591,7 +6252,10 @@ mod tests {
         }
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
-        let cell = find_box(&root_box, &|x| x.node == Some(h[0]) && matches!(x.content, BoxContent::Block)).unwrap();
+        let cell = find_box(&root_box, &|x| {
+            x.node == Some(h[0]) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap();
         // The cell's text run is bold.
         let text = find_box(cell, &|x| matches!(x.content, BoxContent::Text(_))).unwrap();
         assert!(text.style.bold, "th text should be bold");
@@ -5600,8 +6264,14 @@ mod tests {
         let tr = text.dimensions.content;
         let left_gap = tr.x - cell_box.x;
         let right_gap = (cell_box.x + cell_box.width) - (tr.x + tr.width);
-        assert!(left_gap > 0.5, "expected left padding from centering, got {left_gap}");
-        assert!((left_gap - right_gap).abs() < 1.0, "text not centered: L={left_gap} R={right_gap}");
+        assert!(
+            left_gap > 0.5,
+            "expected left padding from centering, got {left_gap}"
+        );
+        assert!(
+            (left_gap - right_gap).abs() < 1.0,
+            "text not centered: L={left_gap} R={right_gap}"
+        );
     }
 
     #[test]
@@ -5630,14 +6300,37 @@ mod tests {
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
 
-        let c0 = find_box(&root_box, &|x| x.node == Some(r1[0]) && matches!(x.content, BoxContent::Block)).unwrap().dimensions.border_box();
-        let c1 = find_box(&root_box, &|x| x.node == Some(r1[1]) && matches!(x.content, BoxContent::Block)).unwrap().dimensions.border_box();
-        let span = find_box(&root_box, &|x| x.node == Some(wide) && matches!(x.content, BoxContent::Block)).unwrap().dimensions.border_box();
+        let c0 = find_box(&root_box, &|x| {
+            x.node == Some(r1[0]) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap()
+        .dimensions
+        .border_box();
+        let c1 = find_box(&root_box, &|x| {
+            x.node == Some(r1[1]) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap()
+        .dimensions
+        .border_box();
+        let span = find_box(&root_box, &|x| {
+            x.node == Some(wide) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap()
+        .dimensions
+        .border_box();
 
         // The spanning cell's border box covers both columns: from col0.x to col1's right edge.
-        assert!((span.x - c0.x).abs() < 0.5, "spanning cell starts at col0 x");
+        assert!(
+            (span.x - c0.x).abs() < 0.5,
+            "spanning cell starts at col0 x"
+        );
         let two_col_w = c0.width + c1.width;
-        assert!((span.width - two_col_w).abs() < 0.5, "colspan=2 width {} != {}", span.width, two_col_w);
+        assert!(
+            (span.width - two_col_w).abs() < 0.5,
+            "colspan=2 width {} != {}",
+            span.width,
+            two_col_w
+        );
     }
 
     #[test]
@@ -5658,7 +6351,10 @@ mod tests {
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let cap_box = find_box(&root_box, &|x| x.node == Some(caption)).unwrap();
-        let cell_box = find_box(&root_box, &|x| x.node == Some(r1[0]) && matches!(x.content, BoxContent::Block)).unwrap();
+        let cell_box = find_box(&root_box, &|x| {
+            x.node == Some(r1[0]) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap();
         assert!(
             cap_box.dimensions.content.y < cell_box.dimensions.content.y,
             "caption ({}) should sit above the first cell ({})",
@@ -5685,15 +6381,28 @@ mod tests {
         styles.insert(tr, disp(style::Display::TableRow));
         let cell = doc.append_element(tr, "td");
         styles.insert(cell, disp(style::Display::TableCell));
-        doc.append_child(cell, dom::NodeData::Text("one two three four five six".into()));
+        doc.append_child(
+            cell,
+            dom::NodeData::Text("one two three four five six".into()),
+        );
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
-        let cell_box = find_box(&root_box, &|x| x.node == Some(cell) && matches!(x.content, BoxContent::Block)).unwrap();
+        let cell_box = find_box(&root_box, &|x| {
+            x.node == Some(cell) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap();
         // More than one line box of text => wrapped.
         let lines = collect_text_boxes(cell_box);
-        assert!(lines.len() > 1, "cell content should wrap to multiple lines, got {}", lines.len());
+        assert!(
+            lines.len() > 1,
+            "cell content should wrap to multiple lines, got {}",
+            lines.len()
+        );
         // The cell content width should not exceed the (narrow) column.
-        assert!(cell_box.dimensions.content.width <= 60.0 + 0.5, "cell wider than column");
+        assert!(
+            cell_box.dimensions.content.width <= 60.0 + 0.5,
+            "cell wider than column"
+        );
     }
 
     #[test]
@@ -5714,24 +6423,39 @@ mod tests {
         // Give each cell a 1px border (the collapsed line) — inherits collapse from the table.
         for &c in &cells {
             if let Some(cs) = styles.get_mut(&c) {
-                cs.border = style::Edges { top: 1.0, right: 1.0, bottom: 1.0, left: 1.0 };
+                cs.border = style::Edges {
+                    top: 1.0,
+                    right: 1.0,
+                    bottom: 1.0,
+                    left: 1.0,
+                };
                 cs.border_collapse = style::BorderCollapse::Collapse;
             }
         }
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let bx = |n: dom::NodeId| {
-            find_box(&root_box, &|x| x.node == Some(n) && matches!(x.content, BoxContent::Block))
-                .unwrap()
-                .dimensions
-                .border_box()
+            find_box(&root_box, &|x| {
+                x.node == Some(n) && matches!(x.content, BoxContent::Block)
+            })
+            .unwrap()
+            .dimensions
+            .border_box()
         };
         let c0 = bx(cells[0]);
         let c1 = bx(cells[1]);
         let c2 = bx(cells[2]);
         // Flush: next cell's x == previous cell's right edge.
-        assert!((c1.x - (c0.x + c0.width)).abs() < 0.01, "cell1 not flush with cell0: {} vs {}", c1.x, c0.x + c0.width);
-        assert!((c2.x - (c1.x + c1.width)).abs() < 0.01, "cell2 not flush with cell1");
+        assert!(
+            (c1.x - (c0.x + c0.width)).abs() < 0.01,
+            "cell1 not flush with cell0: {} vs {}",
+            c1.x,
+            c0.x + c0.width
+        );
+        assert!(
+            (c2.x - (c1.x + c1.width)).abs() < 0.01,
+            "cell2 not flush with cell1"
+        );
     }
 
     #[test]
@@ -5750,18 +6474,29 @@ mod tests {
         let cells = build_row(&mut doc, &mut styles, table, "td", &["aa", "bb"]);
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let bx = |n: dom::NodeId| {
-            find_box(&root_box, &|x| x.node == Some(n) && matches!(x.content, BoxContent::Block))
-                .unwrap()
-                .dimensions
-                .border_box()
+            find_box(&root_box, &|x| {
+                x.node == Some(n) && matches!(x.content, BoxContent::Block)
+            })
+            .unwrap()
+            .dimensions
+            .border_box()
         };
         let c0 = bx(cells[0]);
         let c1 = bx(cells[1]);
         let gap = c1.x - (c0.x + c0.width);
-        assert!((gap - 10.0).abs() < 0.5, "expected 10px border-spacing gap, got {gap}");
+        assert!(
+            (gap - 10.0).abs() < 0.5,
+            "expected 10px border-spacing gap, got {gap}"
+        );
         // And the cells are offset from the table content left by the leading spacing.
-        let table_box = find_box(&root_box, &|x| x.node == Some(table)).unwrap().dimensions.content;
-        assert!((c0.x - (table_box.x + 10.0)).abs() < 0.5, "first cell not offset by leading spacing");
+        let table_box = find_box(&root_box, &|x| x.node == Some(table))
+            .unwrap()
+            .dimensions
+            .content;
+        assert!(
+            (c0.x - (table_box.x + 10.0)).abs() < 0.5,
+            "first cell not offset by leading spacing"
+        );
     }
 
     #[test]
@@ -5781,7 +6516,10 @@ mod tests {
             cs.width = Some(200.0);
         }
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
-        let c0 = find_box(&root_box, &|x| x.node == Some(cells[0]) && matches!(x.content, BoxContent::Block)).unwrap();
+        let c0 = find_box(&root_box, &|x| {
+            x.node == Some(cells[0]) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap();
         assert!(
             (c0.dimensions.content.width - 200.0).abs() < 1.0,
             "explicit cell width not honored: {}",
@@ -5815,15 +6553,19 @@ mod tests {
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let bx = |n: dom::NodeId| {
-            find_box(&root_box, &|x| x.node == Some(n) && matches!(x.content, BoxContent::Block))
-                .unwrap()
-                .dimensions
-                .border_box()
+            find_box(&root_box, &|x| {
+                x.node == Some(n) && matches!(x.content, BoxContent::Block)
+            })
+            .unwrap()
+            .dimensions
+            .border_box()
         };
         let w0 = bx(cells[0]).width;
         let w1 = bx(cells[1]).width;
-        assert!((w0 - 150.0).abs() < 1.5, "col0 width should be 150, got {w0}");
+        assert!(
+            (w0 - 150.0).abs() < 1.5,
+            "col0 width should be 150, got {w0}"
+        );
         assert!((w1 - 50.0).abs() < 1.5, "col1 width should be 50, got {w1}");
     }
 }
-

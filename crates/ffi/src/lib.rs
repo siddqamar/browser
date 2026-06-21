@@ -39,7 +39,12 @@ pub struct Framebuffer {
 
 impl Framebuffer {
     fn empty() -> Self {
-        Framebuffer { pixels: std::ptr::null(), width: 0, height: 0, stride: 0 }
+        Framebuffer {
+            pixels: std::ptr::null(),
+            width: 0,
+            height: 0,
+            stride: 0,
+        }
     }
 }
 
@@ -141,10 +146,7 @@ pub unsafe extern "C" fn browser_engine_load_url(engine: *mut Engine, url: *cons
     };
     // Streaming runs page scripts + a user-supplied frame callback; never let a panic cross the C
     // boundary (it would abort the app). Treat a panic as a load failure.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.load_url(s))) {
-        Ok(code) => code,
-        Err(_) => -1,
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.load_url(s))).unwrap_or(-1)
 }
 
 /// Scroll the page by `dy` device pixels (positive scrolls content up / toward the end).
@@ -187,7 +189,9 @@ pub unsafe extern "C" fn browser_engine_cpu_ns(engine: *mut Engine) -> u64 {
 /// `engine` must be a valid handle from [`browser_engine_new`].
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_title(engine: *mut Engine) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
     match e.inner.title().and_then(|s| CString::new(s).ok()) {
         Some(cstr) => {
             let ptr = cstr.as_ptr();
@@ -208,7 +212,9 @@ pub unsafe extern "C" fn browser_engine_title(engine: *mut Engine) -> *const c_c
 /// `engine` must be a valid handle from [`browser_engine_new`].
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_render(engine: *mut Engine) -> Framebuffer {
-    let Some(e) = engine.as_mut() else { return Framebuffer::empty() };
+    let Some(e) = engine.as_mut() else {
+        return Framebuffer::empty();
+    };
     // Panic backstop: a panic must NEVER cross this C boundary (it would abort the whole app).
     // Heavy/hostile pages can drive the engine into edge cases; on a render panic we return an
     // empty framebuffer and keep the app alive rather than crashing.
@@ -242,7 +248,9 @@ pub unsafe extern "C" fn browser_engine_link_at(
     x: f32,
     y: f32,
 ) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
     match e.inner.link_at(x, y).and_then(|s| CString::new(s).ok()) {
         Some(cstr) => {
             let ptr = cstr.as_ptr();
@@ -268,7 +276,9 @@ pub unsafe extern "C" fn browser_engine_link_at(
 pub unsafe extern "C" fn browser_engine_dispatch_click(engine: *mut Engine, x: f32, y: f32) -> i32 {
     let Some(e) = engine.as_mut() else { return 0 };
     // Page JS is arbitrary; never let a panic cross the C boundary (it would abort the app).
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_click(x, y))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.inner.dispatch_click(x, y)
+    })) {
         Ok(true) => 1,
         _ => 0,
     }
@@ -282,7 +292,11 @@ pub unsafe extern "C" fn browser_engine_dispatch_click(engine: *mut Engine, x: f
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_has_text_focus(engine: *mut Engine) -> i32 {
     let Some(e) = engine.as_mut() else { return 0 };
-    if e.inner.has_text_focus() { 1 } else { 0 }
+    if e.inner.has_text_focus() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Deliver a key press to the focused text field's page JS. `key` is the DOM key value
@@ -299,9 +313,21 @@ pub unsafe extern "C" fn browser_engine_dispatch_key(
     code: *const c_char,
 ) -> i32 {
     let Some(e) = engine.as_mut() else { return 0 };
-    let key = if key.is_null() { return 0 } else { std::ffi::CStr::from_ptr(key).to_string_lossy().into_owned() };
-    let code = if code.is_null() { String::new() } else { std::ffi::CStr::from_ptr(code).to_string_lossy().into_owned() };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_key(&key, &code))) {
+    let key = if key.is_null() {
+        return 0;
+    } else {
+        std::ffi::CStr::from_ptr(key).to_string_lossy().into_owned()
+    };
+    let code = if code.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(code)
+            .to_string_lossy()
+            .into_owned()
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.inner.dispatch_key(&key, &code)
+    })) {
         Ok(true) => 1,
         _ => 0,
     }
@@ -349,13 +375,16 @@ pub unsafe extern "C" fn browser_engine_console_eval(
     engine: *mut Engine,
     code: *const c_char,
 ) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
     if code.is_null() {
         return std::ptr::null();
     }
     let code = CStr::from_ptr(code).to_string_lossy().into_owned();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.console_eval(&code)))
-        .unwrap_or_else(|_| "Uncaught Error: evaluation panicked".to_string());
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.console_eval(&code)))
+            .unwrap_or_else(|_| "Uncaught Error: evaluation panicked".to_string());
     match CString::new(result) {
         Ok(cstr) => {
             let ptr = cstr.as_ptr();
@@ -373,7 +402,9 @@ pub unsafe extern "C" fn browser_engine_console_eval(
 /// `engine` must be a valid handle from [`browser_engine_new`].
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_console_text(engine: *mut Engine) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
     let text = e.inner.console_lines().join("\n");
     match CString::new(text) {
         Ok(cstr) => {
@@ -392,7 +423,9 @@ pub unsafe extern "C" fn browser_engine_console_text(engine: *mut Engine) -> *co
 /// `engine` must be a valid handle from [`browser_engine_new`].
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_network_log(engine: *mut Engine) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
     match CString::new(e.inner.network_log_json()) {
         Ok(cstr) => {
             let ptr = cstr.as_ptr();
@@ -420,7 +453,9 @@ pub unsafe extern "C" fn browser_engine_dispatch_mouse(
         return 0;
     }
     let kind = CStr::from_ptr(kind).to_string_lossy().into_owned();
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_mouse(&kind, x, y))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.inner.dispatch_mouse(&kind, x, y)
+    })) {
         Ok(true) => 1,
         _ => 0,
     }
@@ -459,15 +494,18 @@ pub unsafe extern "C" fn browser_engine_select_at(
     x: f32,
     y: f32,
 ) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
-    let hit = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.select_at(x, y))) {
-        Ok(h) => h,
-        Err(_) => None,
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
     };
+    let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.select_at(x, y)))
+        .unwrap_or_default();
     match hit {
         Some(h) => {
-            let opts: Vec<String> =
-                h.options.iter().map(|o| format!("\"{}\"", json_escape(o))).collect();
+            let opts: Vec<String> = h
+                .options
+                .iter()
+                .map(|o| format!("\"{}\"", json_escape(o)))
+                .collect();
             let json = format!(
                 "{{\"id\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"selected\":{},\"options\":[{}]}}",
                 h.node_id, h.x, h.y, h.width, h.height, h.selected, opts.join(",")
@@ -521,7 +559,9 @@ pub unsafe extern "C" fn browser_engine_set_select_index(
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_selection_start(engine: *mut Engine, x: f32, y: f32) {
     let Some(e) = engine.as_mut() else { return };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.selection_start(x, y)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.inner.selection_start(x, y)
+    }));
 }
 
 /// Extend the active text selection's focus to framebuffer device-pixel `(x, y)` (viewport-relative,
@@ -532,7 +572,9 @@ pub unsafe extern "C" fn browser_engine_selection_start(engine: *mut Engine, x: 
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_selection_extend(engine: *mut Engine, x: f32, y: f32) {
     let Some(e) = engine.as_mut() else { return };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.selection_extend(x, y)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.inner.selection_extend(x, y)
+    }));
 }
 
 /// Clear any active text selection.
@@ -566,7 +608,9 @@ pub unsafe extern "C" fn browser_engine_has_selection(engine: *mut Engine) -> i3
 /// `engine` must be a valid handle from [`browser_engine_new`].
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_selected_text(engine: *mut Engine) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
     let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.selected_text()))
         .unwrap_or_default();
     if text.is_empty() {
@@ -595,7 +639,9 @@ pub unsafe extern "C" fn browser_engine_selected_text(engine: *mut Engine) -> *c
 /// `engine` must be a valid handle from [`browser_engine_new`].
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_dom_tree(engine: *mut Engine) -> *const c_char {
-    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
     let json = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dom_tree_json()))
         .unwrap_or_else(|_| "{}".to_string());
     match CString::new(json) {
@@ -635,6 +681,12 @@ pub unsafe extern "C" fn browser_engine_node_at_point(engine: *mut Engine, x: f3
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_set_inspect_node(engine: *mut Engine, node_id: i64) {
     let Some(e) = engine.as_mut() else { return };
-    let node = if node_id < 0 { None } else { Some(node_id as usize) };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.set_inspect_node(node)));
+    let node = if node_id < 0 {
+        None
+    } else {
+        Some(node_id as usize)
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.inner.set_inspect_node(node)
+    }));
 }

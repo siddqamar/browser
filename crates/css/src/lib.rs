@@ -86,7 +86,11 @@ fn parse_inner(css: &str, base_url: Option<&str>) -> Stylesheet {
         }
     }
     let (property_rules, namespace_rules) = extract_top_level_at_rules(&bytes);
-    Stylesheet { rules, property_rules, namespace_rules }
+    Stylesheet {
+        rules,
+        property_rules,
+        namespace_rules,
+    }
 }
 
 /// Scan the (comment-stripped) source for the `@property` and `@namespace` at-rules the cascade
@@ -102,7 +106,9 @@ fn extract_top_level_at_rules(bytes: &[char]) -> (Vec<PropertyRule>, Vec<Namespa
             '@' => {
                 let name_start = pos + 1;
                 let mut i = name_start;
-                while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_') {
+                while i < end
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_')
+                {
                     i += 1;
                 }
                 let name: String = bytes[name_start..i].iter().collect();
@@ -134,7 +140,11 @@ fn extract_top_level_at_rules(bytes: &[char]) -> (Vec<PropertyRule>, Vec<Namespa
                         props.push(parse_property_body(&pname, &body));
                     }
                 }
-                pos = if body_end < end { body_end + 1 } else { body_end };
+                pos = if body_end < end {
+                    body_end + 1
+                } else {
+                    body_end
+                };
             }
             '"' => pos = skip_string(bytes, pos, end, '"'),
             '\'' => pos = skip_string(bytes, pos, end, '\''),
@@ -163,7 +173,10 @@ fn parse_namespace_prelude(prelude: &str) -> Option<NamespaceRule> {
         None => ("", p),
     };
     let uri = strip_url_or_string(uri_part)?;
-    Some(NamespaceRule { prefix: prefix.to_string(), uri })
+    Some(NamespaceRule {
+        prefix: prefix.to_string(),
+        uri,
+    })
 }
 
 /// Strip a `url(...)` wrapper or string quotes to get the raw URI.
@@ -171,7 +184,9 @@ fn strip_url_or_string(s: &str) -> Option<String> {
     let s = s.trim();
     if let Some(inner) = s.strip_prefix("url(").and_then(|r| r.strip_suffix(')')) {
         let inner = inner.trim();
-        let inner = inner.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+        let inner = inner
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
             .or_else(|| inner.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
             .unwrap_or(inner);
         return Some(inner.trim().to_string());
@@ -182,17 +197,26 @@ fn strip_url_or_string(s: &str) -> Option<String> {
     if let Some(inner) = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
         return Some(inner.to_string());
     }
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// Parse the descriptor body of an `@property --x { … }` rule.
 fn parse_property_body(name: &str, body: &str) -> PropertyRule {
-    let mut rule = PropertyRule { name: name.to_string(), ..Default::default() };
+    let mut rule = PropertyRule {
+        name: name.to_string(),
+        ..Default::default()
+    };
     for (k, v) in parse_declarations(body) {
         match k.as_str() {
             "syntax" => {
                 let v = v.trim();
-                let v = v.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+                let v = v
+                    .strip_prefix('"')
+                    .and_then(|r| r.strip_suffix('"'))
                     .or_else(|| v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
                     .unwrap_or(v);
                 rule.syntax = v.trim().to_string();
@@ -285,13 +309,19 @@ fn parse_rules(
         // Read the declaration block body up to the matching `}` (balanced).
         let body_start = pos;
         let body_end = scan_balanced_block_end(bytes, pos, end);
-        pos = if body_end < end { body_end + 1 } else { body_end };
+        pos = if body_end < end {
+            body_end + 1
+        } else {
+            body_end
+        };
 
         let selectors = parse_selector_list(&prelude);
         if !selectors.is_empty() {
             // The body may contain BOTH declarations and nested rule blocks (CSS Nesting). Parse
             // it splitting the two, then flatten nested rules against this rule's selectors.
-            parse_rule_body(bytes, body_start, body_end, &selectors, media, container, out);
+            parse_rule_body(
+                bytes, body_start, body_end, &selectors, media, container, out,
+            );
         }
     }
 }
@@ -389,13 +419,25 @@ fn parse_rule_body(
                 pos += 1;
                 let nbody_start = pos;
                 let nbody_end = scan_balanced_block_end(bytes, pos, end);
-                pos = if nbody_end < end { nbody_end + 1 } else { nbody_end };
+                pos = if nbody_end < end {
+                    nbody_end + 1
+                } else {
+                    nbody_end
+                };
 
                 let nested_sel = parse_selector_list(&prelude);
                 if !nested_sel.is_empty() {
                     let combined = combine_selectors(parent_selectors, &nested_sel);
                     // Recurse: the nested body may itself interleave declarations / nesting.
-                    parse_rule_body(bytes, nbody_start, nbody_end, &combined, media, container, out);
+                    parse_rule_body(
+                        bytes,
+                        nbody_start,
+                        nbody_end,
+                        &combined,
+                        media,
+                        container,
+                        out,
+                    );
                 }
             }
             _ => unreachable!(),
@@ -421,7 +463,10 @@ fn parse_nested_at_rule(
     while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_') {
         i += 1;
     }
-    let name: String = bytes[name_start..i].iter().collect::<String>().to_ascii_lowercase();
+    let name: String = bytes[name_start..i]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
 
     let prelude_start = i;
     let prelude_end = scan_to_block_or_semi(bytes, i, end);
@@ -434,22 +479,50 @@ fn parse_nested_at_rule(
 
     let body_start = prelude_end + 1;
     let body_end = scan_balanced_block_end(bytes, body_start, end);
-    let next = if body_end < end { body_end + 1 } else { body_end };
+    let next = if body_end < end {
+        body_end + 1
+    } else {
+        body_end
+    };
     let prelude: String = bytes[prelude_start..prelude_end].iter().collect();
     let prelude = prelude.trim();
 
     match name.as_str() {
         "media" => {
             let combined = combine_query(media, prelude);
-            parse_rule_body(bytes, body_start, body_end, parent_selectors, Some(&combined), container, out);
+            parse_rule_body(
+                bytes,
+                body_start,
+                body_end,
+                parent_selectors,
+                Some(&combined),
+                container,
+                out,
+            );
         }
         "container" => {
             let cond = strip_container_name(prelude);
             let combined = combine_query(container, &cond);
-            parse_rule_body(bytes, body_start, body_end, parent_selectors, media, Some(&combined), out);
+            parse_rule_body(
+                bytes,
+                body_start,
+                body_end,
+                parent_selectors,
+                media,
+                Some(&combined),
+                out,
+            );
         }
         "supports" => {
-            parse_rule_body(bytes, body_start, body_end, parent_selectors, media, container, out);
+            parse_rule_body(
+                bytes,
+                body_start,
+                body_end,
+                parent_selectors,
+                media,
+                container,
+                out,
+            );
         }
         _ => {}
     }
@@ -561,12 +634,15 @@ pub fn extract_imports(css: &str) -> Vec<String> {
             // Read the at-rule name.
             let mut i = pos + 1;
             let name_start = i;
-            while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_')
+            while i < end
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_')
             {
                 i += 1;
             }
-            let name: String =
-                bytes[name_start..i].iter().collect::<String>().to_ascii_lowercase();
+            let name: String = bytes[name_start..i]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
             let prelude_end = scan_to_block_or_semi(bytes, i, end);
             if name == "import" && prelude_end < end && bytes[prelude_end] == ';' {
                 let prelude: String = bytes[i..prelude_end].iter().collect();
@@ -583,7 +659,11 @@ pub fn extract_imports(css: &str) -> Vec<String> {
             } else {
                 // Block at-rule: skip its balanced body so nested `@import`s aren't surfaced.
                 let body_end = scan_balanced_block_end(bytes, prelude_end + 1, end);
-                pos = if body_end < end { body_end + 1 } else { body_end };
+                pos = if body_end < end {
+                    body_end + 1
+                } else {
+                    body_end
+                };
             }
             continue;
         }
@@ -595,7 +675,11 @@ pub fn extract_imports(css: &str) -> Vec<String> {
         match bytes[pos] {
             '{' => {
                 let body_end = scan_balanced_block_end(bytes, pos + 1, end);
-                pos = if body_end < end { body_end + 1 } else { body_end };
+                pos = if body_end < end {
+                    body_end + 1
+                } else {
+                    body_end
+                };
             }
             _ => pos += 1, // `;` or stray `}`
         }
@@ -654,9 +738,7 @@ fn parse_at_rule(
     // Read the at-rule name (the identifier after `@`).
     let mut i = start + 1;
     let name_start = i;
-    while i < end
-        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_')
-    {
+    while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_') {
         i += 1;
     }
     let name: String = bytes[name_start..i].iter().collect();
@@ -678,7 +760,11 @@ fn parse_at_rule(
     // Block at-rule. Locate the balanced block body.
     let body_start = prelude_end + 1;
     let body_end = scan_balanced_block_end(bytes, body_start, end);
-    let next = if body_end < end { body_end + 1 } else { body_end };
+    let next = if body_end < end {
+        body_end + 1
+    } else {
+        body_end
+    };
 
     let prelude: String = bytes[prelude_start..prelude_end].iter().collect();
     let prelude = prelude.trim();
@@ -1023,7 +1109,10 @@ mod tests {
         assert_eq!(sheet.rules[0].media, None);
         assert_eq!(sheet.rules[1].selectors, vec!["p"]);
         assert_eq!(sheet.rules[1].media.as_deref(), Some("(max-width: 600px)"));
-        assert_eq!(sheet.rules[1].declarations, vec![("color".to_string(), "green".to_string())]);
+        assert_eq!(
+            sheet.rules[1].declarations,
+            vec![("color".to_string(), "green".to_string())]
+        );
         assert_eq!(sheet.rules[2].selectors, vec!["h1"]);
         assert_eq!(sheet.rules[2].media, None);
     }
@@ -1034,7 +1123,10 @@ mod tests {
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].selectors, vec![".a"]);
         assert_eq!(sheet.rules[0].media, None);
-        assert_eq!(sheet.rules[0].declarations, vec![("color".to_string(), "#f00".to_string())]);
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![("color".to_string(), "#f00".to_string())]
+        );
     }
 
     #[test]
@@ -1064,9 +1156,15 @@ mod tests {
         let sheet = parse("@container (min-width: 400px) { .a { color: red } }");
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].selectors, vec![".a"]);
-        assert_eq!(sheet.rules[0].container.as_deref(), Some("(min-width: 400px)"));
+        assert_eq!(
+            sheet.rules[0].container.as_deref(),
+            Some("(min-width: 400px)")
+        );
         assert_eq!(sheet.rules[0].media, None);
-        assert_eq!(sheet.rules[0].declarations, vec![("color".to_string(), "red".to_string())]);
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![("color".to_string(), "red".to_string())]
+        );
     }
 
     #[test]
@@ -1074,7 +1172,10 @@ mod tests {
         let sheet = parse("@container sidebar (min-width: 400px) { .a { color: blue } }");
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].selectors, vec![".a"]);
-        assert_eq!(sheet.rules[0].container.as_deref(), Some("(min-width: 400px)"));
+        assert_eq!(
+            sheet.rules[0].container.as_deref(),
+            Some("(min-width: 400px)")
+        );
     }
 
     #[test]
@@ -1085,7 +1186,10 @@ mod tests {
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].selectors, vec![".c"]);
         assert_eq!(sheet.rules[0].media.as_deref(), Some("(min-width: 640px)"));
-        assert_eq!(sheet.rules[0].container.as_deref(), Some("(max-width: 700px)"));
+        assert_eq!(
+            sheet.rules[0].container.as_deref(),
+            Some("(max-width: 700px)")
+        );
     }
 
     #[test]
@@ -1095,8 +1199,14 @@ mod tests {
         assert_eq!(sheet.rules[0].selectors, vec![".a"]);
         assert_eq!(sheet.rules[0].container, None);
         assert_eq!(sheet.rules[1].selectors, vec![".a"]);
-        assert_eq!(sheet.rules[1].container.as_deref(), Some("(min-width: 300px)"));
-        assert_eq!(sheet.rules[1].declarations, vec![("color".to_string(), "blue".to_string())]);
+        assert_eq!(
+            sheet.rules[1].container.as_deref(),
+            Some("(min-width: 300px)")
+        );
+        assert_eq!(
+            sheet.rules[1].declarations,
+            vec![("color".to_string(), "blue".to_string())]
+        );
     }
 
     #[test]
@@ -1128,8 +1238,14 @@ mod tests {
         }";
         let sheet = parse(css);
         // Should surface .x, .y::before, .z, and .w without panicking.
-        assert!(sheet.rules.iter().any(|r| r.selectors.iter().any(|s| s == ".x")));
-        assert!(sheet.rules.iter().any(|r| r.selectors.iter().any(|s| s == ".z")));
+        assert!(sheet
+            .rules
+            .iter()
+            .any(|r| r.selectors.iter().any(|s| s == ".x")));
+        assert!(sheet
+            .rules
+            .iter()
+            .any(|r| r.selectors.iter().any(|s| s == ".z")));
         assert!(sheet
             .rules
             .iter()
@@ -1151,7 +1267,10 @@ mod tests {
         );
         assert_eq!(sheet.rules.len(), 2);
         for r in &sheet.rules {
-            assert_eq!(r.base_url.as_deref(), Some("https://example.com/css/app.css"));
+            assert_eq!(
+                r.base_url.as_deref(),
+                Some("https://example.com/css/app.css")
+            );
         }
         // Plain `parse` leaves the base unset.
         assert!(parse("a { color: red }").rules[0].base_url.is_none());
@@ -1218,9 +1337,15 @@ mod tests {
         let sheet = parse(".a { color: red; &:hover { color: blue } }");
         assert_eq!(sheet.rules.len(), 2);
         assert_eq!(sheet.rules[0].selectors, vec![".a"]);
-        assert_eq!(sheet.rules[0].declarations, vec![("color".to_string(), "red".to_string())]);
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![("color".to_string(), "red".to_string())]
+        );
         assert_eq!(sheet.rules[1].selectors, vec![".a:hover"]);
-        assert_eq!(sheet.rules[1].declarations, vec![("color".to_string(), "blue".to_string())]);
+        assert_eq!(
+            sheet.rules[1].declarations,
+            vec![("color".to_string(), "blue".to_string())]
+        );
     }
 
     #[test]
@@ -1228,7 +1353,10 @@ mod tests {
         let sheet = parse(".a { .b { color: green } }");
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].selectors, vec![".a .b"]);
-        assert_eq!(sheet.rules[0].declarations, vec![("color".to_string(), "green".to_string())]);
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![("color".to_string(), "green".to_string())]
+        );
     }
 
     #[test]
@@ -1256,7 +1384,10 @@ mod tests {
         assert_eq!(sheet.rules[0].media, None);
         assert_eq!(sheet.rules[1].selectors, vec![".a"]);
         assert_eq!(sheet.rules[1].media.as_deref(), Some("(min-width: 600px)"));
-        assert_eq!(sheet.rules[1].declarations, vec![("color".to_string(), "blue".to_string())]);
+        assert_eq!(
+            sheet.rules[1].declarations,
+            vec![("color".to_string(), "blue".to_string())]
+        );
     }
 
     #[test]

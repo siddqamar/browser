@@ -8,3 +8,6 @@ license.workspace = true
 engine = { path = "../engine" }
 base64 = "0.22"
 image = "0.25"
+
+[lints]
+workspace = true

@@ -132,7 +132,11 @@ impl Document {
     /// Allocate a node (without linking it as anyone's child) and return its id.
     pub fn alloc(&mut self, data: NodeData, parent: Option<NodeId>) -> NodeId {
         let id = NodeId(self.nodes.len());
-        self.nodes.push(Node { data, parent, children: Vec::new() });
+        self.nodes.push(Node {
+            data,
+            parent,
+            children: Vec::new(),
+        });
         id
     }
 
@@ -147,7 +151,11 @@ impl Document {
     pub fn append_element(&mut self, parent: NodeId, tag: &str) -> NodeId {
         self.append_child(
             parent,
-            NodeData::Element(ElementData { tag: tag.to_string(), attrs: Default::default(), namespace: None }),
+            NodeData::Element(ElementData {
+                tag: tag.to_string(),
+                attrs: Default::default(),
+                namespace: None,
+            }),
         )
     }
 }
