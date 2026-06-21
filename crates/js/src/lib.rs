@@ -4920,20 +4920,25 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       return null;
     });
 
-    // Navigation accessors (return fresh wrappers; the enrich layer canonicalizes them).
+    // Navigation accessors. Identity-stable lookup for related nodes: __nodeFor returns the CANONICAL (cached) wrapper,
+    // so node.parentNode / childNodes[i] / firstChild / siblings are === across repeated accesses
+    // and === the wrapper other code holds for the same node. Plain wrap() mints a fresh object
+    // each call, which breaks identity comparisons — e.g. the WPT idiom
+    // `while (node.parentNode.childNodes[i] != node) i++` never matches and spins forever.
+    function nf(x) { if (typeof x !== "number" || x < 0) { return null; } return globalThis.__nodeFor ? globalThis.__nodeFor(x) : wrap(x); }
     function childList(elementsOnly) {
       var kids = __children(id); var out = [];
       for (var i = 0; i < kids.length; i++) {
-        if (!elementsOnly || __nodeType(kids[i]) === 1) { out.push(wrap(kids[i])); }
+        if (!elementsOnly || __nodeType(kids[i]) === 1) { out.push(nf(kids[i])); }
       }
       return out;
     }
     Object.defineProperty(el, "children", { get: function () { return childList(true); }, enumerable: true, configurable: true });
     Object.defineProperty(el, "childNodes", { get: function () { return childList(false); }, enumerable: true, configurable: true });
-    Object.defineProperty(el, "parentNode", { get: function () { return wrap(__parent(id)); }, enumerable: true, configurable: true });
-    Object.defineProperty(el, "parentElement", { get: function () { var p = __parent(id); return (p >= 0 && __nodeType(p) === 1) ? wrap(p) : (p >= 0 ? wrap(p) : null); }, enumerable: true, configurable: true });
-    Object.defineProperty(el, "firstChild", { get: function () { var k = __children(id); return k.length ? wrap(k[0]) : null; }, enumerable: true, configurable: true });
-    Object.defineProperty(el, "lastChild", { get: function () { var k = __children(id); return k.length ? wrap(k[k.length - 1]) : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "parentNode", { get: function () { return nf(__parent(id)); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "parentElement", { get: function () { var p = __parent(id); return p >= 0 ? nf(p) : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "firstChild", { get: function () { var k = __children(id); return k.length ? nf(k[0]) : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "lastChild", { get: function () { var k = __children(id); return k.length ? nf(k[k.length - 1]) : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "firstElementChild", { get: function () { var c = childList(true); return c.length ? c[0] : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "lastElementChild", { get: function () { var c = childList(true); return c.length ? c[c.length - 1] : null; }, enumerable: true, configurable: true });
 
@@ -4945,7 +4950,7 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       while (true) {
         if (next) { i++; if (i >= sibs.length) { return null; } }
         else { i--; if (i < 0) { return null; } }
-        if (!elementOnly || __nodeType(sibs[i]) === 1) { return wrap(sibs[i]); }
+        if (!elementOnly || __nodeType(sibs[i]) === 1) { return nf(sibs[i]); }
       }
     }
     Object.defineProperty(el, "nextSibling", { get: function () { return sibling(true, false); }, enumerable: true, configurable: true });
@@ -4958,7 +4963,13 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     def(el, "lookupPrefix", function (ns) { return nodeLookupPrefix(id, ns); });
     def(el, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(id, ns); });
 
-    return el;
+    // Return the CANONICAL wrapper for this node so identity is stable: every wrap(id) — whether
+    // from createElement, a traversal getter, or __nodeFor — yields the same object for one node.
+    // Without this each call mints a distinct object, breaking `===` and the WPT identity loops
+    // (`while (node.parentNode.childNodes[i] != node) i++`). canon caches before enriching, so the
+    // re-entrant lookup during enrichment is safe. Guarded because __canonNode (and its cache) is
+    // installed after wrap is defined; the few wraps before then are re-canonicalized on next access.
+    return globalThis.__canonNode ? globalThis.__canonNode(el) : el;
   }
   def(globalThis, "__wrapNode", wrap);
 
@@ -17821,10 +17832,14 @@ mod tests {
 
     #[test]
     fn crypto_get_random_values_fills_nonzero() {
+        // Assert the buffer was filled with randomness, not left zeroed. We check that *some* byte
+        // is nonzero rather than *every* byte: with a correct RNG any single byte is zero ~1/256 of
+        // the time, so `every` over 4 bytes flakes ~1.5% of runs. `some` over 64 bytes only fails
+        // if the fill never happened (P(all zero) ≈ (1/256)^64), so it still catches a regression.
         let out = env_eval(
             "https://example.com/",
-            "var a = new Uint8Array(4); crypto.getRandomValues(a); \
-             a.every(function (x) { return x !== 0; })",
+            "var a = new Uint8Array(64); crypto.getRandomValues(a); \
+             a.some(function (x) { return x !== 0; })",
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("true"));
