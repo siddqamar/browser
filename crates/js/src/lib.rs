@@ -4823,7 +4823,11 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     if (String(data).indexOf("?>") >= 0) {
       throw new globalThis.DOMException("The data must not contain '?>'.", "InvalidCharacterError");
     }
-    return wrap(__createProcessingInstruction(t, String(data)));
+    var __pi = wrap(__createProcessingInstruction(t, String(data)));
+    // Canonicalize (cache the wrapper) so navigation preserves node identity, and graft on methods.
+    try { __pi = globalThis.__canonNode(__pi); } catch (e) {}
+    try { globalThis.__addPartialMethods(__pi); } catch (e) {}
+    return __pi;
   });
   def(document, "createDocumentType", function (qualifiedName, publicId, systemId) {
     return globalThis.__createDocumentTypeNode(String(qualifiedName),
@@ -9040,6 +9044,52 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   def(globalThis, "__applyReflection", applyReflection);
 
+  // Parse an HTML string into a DocumentFragment for the partial-update methods (appendHTML etc.).
+  // `safe` strips <script>s (the safe, sanitizing variants); a `sanitizer.removeElements` option
+  // drops those elements too. Scripts are never executed here (the fragment isn't connected).
+  globalThis.__htmlPartialFragment = function (html, safe, opts) {
+    var div = document.createElement("div");
+    div.innerHTML = (html == null ? "" : String(html));
+    var dropAll = function (sel) {
+      var els = Array.prototype.slice.call(div.querySelectorAll(sel));
+      for (var i = 0; i < els.length; i++) { if (els[i].remove) { els[i].remove(); } }
+    };
+    if (safe) { dropAll("script"); }
+    var rem = opts && opts.sanitizer && opts.sanitizer.removeElements;
+    if (rem && rem.length) { for (var j = 0; j < rem.length; j++) { try { dropAll(rem[j]); } catch (e) {} } }
+    var frag = document.createDocumentFragment();
+    while (div.firstChild) { frag.appendChild(div.firstChild); }
+    return frag;
+  };
+
+  // Attach the declarative partial-update methods ({append,prepend,before,after,replaceWith}HTML
+  // [Unsafe]) to a node. Parent-position methods route through a <template>'s content.
+  globalThis.__addPartialMethods = function (el) {
+    var defs = [["append", 1], ["prepend", 1], ["before", 0], ["after", 0], ["replaceWith", 0]];
+    for (var pi = 0; pi < defs.length; pi++) {
+      (function (base, isParent) {
+        [["HTML", true], ["HTMLUnsafe", false]].forEach(function (sfx) {
+          var nm = base + sfx[0];
+          if (typeof el[nm] === "function") { return; }
+          Object.defineProperty(el, nm, { configurable: true, writable: true, enumerable: false, value: function (html, opts) {
+            var frag = globalThis.__htmlPartialFragment(html, sfx[1], opts);
+            if (isParent) {
+              var dest = this.content || this;
+              if (base === "append") { dest.appendChild(frag); }
+              else { dest.insertBefore(frag, dest.firstChild || null); }
+            } else {
+              var p = this.parentNode;
+              if (!p) { return; }
+              if (base === "before") { p.insertBefore(frag, this); }
+              else if (base === "after") { p.insertBefore(frag, this.nextSibling); }
+              else { p.insertBefore(frag, this); p.removeChild(this); }
+            }
+          } });
+        });
+      })(defs[pi][0], defs[pi][1]);
+    }
+  };
+
   // Deep structural node equality (DOM `isEqualNode`): same type and type-specific data, equal
   // attribute sets (order-independent, by namespace+localName+value), and pairwise-equal children.
   globalThis.__nodesEqual = function (a, b) {
@@ -9502,6 +9552,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (typeof el.click !== "function") { def(el, "click", fn); }
     if (typeof el.cloneNode !== "function") { def(el, "cloneNode", function () { return this; }); }
     if (typeof el.isEqualNode !== "function") { def(el, "isEqualNode", function (other) { return globalThis.__nodesEqual(this, other); }); }
+    // Declarative partial-update methods (WICG): {append,prepend,before,after,replaceWith}HTML[Unsafe].
+    globalThis.__addPartialMethods(el);
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
     if (!("nodeType" in el)) { def(el, "nodeType", 1); }
     if (!("ownerDocument" in el)) {
@@ -9657,12 +9709,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // `parent.insertBefore(...)` throw (`parent` === null) during a component update.
   if (typeof document.createTextNode !== "function") {
     def(document, "createTextNode", function (data) {
-      return __wrapNode(__createText(String(data == null ? "" : data)));
+      // Canonicalize so the wrapper is cached: navigation (nextSibling/firstChild) returns the same
+      // object, preserving node identity (===), and enrichment grafts on partial-update methods.
+      return canon(__wrapNode(__createText(String(data == null ? "" : data))));
     });
   }
   if (typeof document.createComment !== "function") {
     def(document, "createComment", function (data) {
-      return __wrapNode(__createComment(String(data == null ? "" : data)));
+      return canon(__wrapNode(__createComment(String(data == null ? "" : data))));
     });
   }
   if (typeof document.createDocumentFragment !== "function") {
@@ -11481,6 +11535,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             appendChild: function (child) { try { __appendChild(tplNode, child.__node); } catch (e) {} return child; },
             insertBefore: function (child, ref) { try { __insertNode(tplNode, child.__node, ref ? ref.__node : -1); } catch (e) {} return child; },
             removeChild: function (child) { try { __removeChild(child.__node); } catch (e) {} return child; },
+            append: function () { for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.appendChild(typeof c === "string" ? document.createTextNode(c) : c); } },
+            prepend: function () { var r = this.firstChild; for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.insertBefore(typeof c === "string" ? document.createTextNode(c) : c, r); } },
+            get lastChild() { var k = __children(tplNode); return k.length ? nodeAt(k[k.length - 1]) : null; },
+            get textContent() { var k = __children(tplNode), s = ""; for (var i = 0; i < k.length; i++) { var nd = nodeAt(k[i]); s += (nd && nd.textContent != null ? nd.textContent : ""); } return s; },
             get childNodes() { var k = __children(tplNode), a = []; for (var i = 0; i < k.length; i++) { a.push(nodeAt(k[i])); } return a; },
             get children() { var k = __children(tplNode), a = []; for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { a.push(nodeAt(k[i])); } } return a; },
             get firstChild() { var k = __children(tplNode); return k.length ? nodeAt(k[0]) : null; },
