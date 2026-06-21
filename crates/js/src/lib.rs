@@ -10277,6 +10277,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     XNode.prototype.removeChild = function (c) { var i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); c.parentNode = null; } return c; };
     XNode.prototype.replaceChild = function (nw, old) { var i = this.childNodes.indexOf(old); if (i < 0) { return old; } if (nw.parentNode) { nw.parentNode.removeChild(nw); } nw.parentNode = this; this.childNodes[i] = nw; old.parentNode = null; return old; };
     XNode.prototype.hasChildNodes = function () { return this.childNodes.length > 0; };
+    XNode.prototype.append = function () { var d = this.ownerDocument || this; for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.appendChild(typeof c === "string" ? d.createTextNode(c) : c); } };
+    XNode.prototype.prepend = function () { var d = this.ownerDocument || this; var ref = this.childNodes[0] || null; for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.insertBefore(typeof c === "string" ? d.createTextNode(c) : c, ref); } };
     XNode.prototype.isEqualNode = function (o) { return globalThis.__nodesEqual(this, o); };
     XNode.prototype.cloneNode = function () { return this; };
     Object.defineProperty(XNode.prototype, "firstChild", { get: function () { return this.childNodes[0] || null; } });
@@ -10406,6 +10408,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
 
     // --- Serializer: the DOM Parsing & Serialization "XML serialization" algorithm ----------------
+    var HTML_NS = "http://www.w3.org/1999/xhtml";
+    // Attribute list for either an XML node (our model) or an arena-backed HTML node — so an HTML
+    // element/fragment can be serialized too (XMLSerializer accepts any node).
+    function attrsOf(node) { return node._attrs || (node.attributes ? Array.prototype.slice.call(node.attributes) : []); }
     function escText(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
     function escAttr(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;").replace(/\t/g, "&#9;").replace(/\n/g, "&#10;").replace(/\r/g, "&#13;"); }
     function mapClone(m) { var o = {}; for (var k in m) { o[k] = m[k].slice(); } return o; }
@@ -10419,8 +10425,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     function recordNs(node, map, localPrefixes) {
       var localDefault = null;
-      for (var i = 0; i < node._attrs.length; i++) {
-        var a = node._attrs[i];
+      var __aa = attrsOf(node);
+      for (var i = 0; i < __aa.length; i++) {
+        var a = __aa[i];
         if ((a.namespaceURI || null) !== XMLNS_NS) { continue; }
         if (a.prefix === null) { localDefault = a.value; }
         else { var pfx = a.localName; if (!mapHas(map, pfx, a.value)) { mapAdd(map, pfx, a.value); } localPrefixes[pfx] = a.value; }
@@ -10429,8 +10436,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     function serAttrs(node, map, idx, localPrefixes, ignoreDefault) {
       var out = "";
-      for (var i = 0; i < node._attrs.length; i++) {
-        var a = node._attrs[i];
+      var __aa = attrsOf(node);
+      for (var i = 0; i < __aa.length; i++) {
+        var a = __aa[i];
         var ans = a.namespaceURI || null;
         // A no-namespace attribute literally named "xmlns" (e.g. via setAttribute) is not a real
         // namespace declaration; emitting it would forge one, so it's dropped.
@@ -10505,7 +10513,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         }
       }
       markup += serAttrs(node, map, idx, localPrefixes, ignoreDefault);
-      if (node.childNodes.length === 0) { return markup + "/>"; }
+      // HTML-namespace elements always serialize with an explicit end tag (never self-closing).
+      if (node.childNodes.length === 0 && nodeNs !== HTML_NS) { return markup + "/>"; }
       markup += ">";
       for (var i = 0; i < node.childNodes.length; i++) { markup += serNode(node.childNodes[i], inherited, map, idx); }
       return markup + "</" + qname + ">";
