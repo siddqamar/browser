@@ -22,7 +22,28 @@ permissions:
   contents: write   # create the GitHub release + upload assets
 
 jobs:
+  # Gate: only attempt a signed release if the signing + notarization secrets are configured.
+  # Otherwise the build job is skipped (not failed), so tagging before secrets are set is harmless.
+  check-secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          CERT: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          NOTARY: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          if [ -n "$CERT" ] && [ -n "$NOTARY" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release secrets not configured — skipping the signed macOS build. Add DEVELOPER_ID_P12_BASE64, DEVELOPER_ID_P12_PASSWORD, and NOTARY_* to enable."
+          fi
+
   macos:
+    needs: check-secrets
+    if: needs.check-secrets.outputs.ready == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
