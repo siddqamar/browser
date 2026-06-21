@@ -9040,6 +9040,43 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   def(globalThis, "__applyReflection", applyReflection);
 
+  // Deep structural node equality (DOM `isEqualNode`): same type and type-specific data, equal
+  // attribute sets (order-independent, by namespace+localName+value), and pairwise-equal children.
+  globalThis.__nodesEqual = function (a, b) {
+    if (a === b) { return true; }
+    if (!a || !b || a.nodeType !== b.nodeType) { return false; }
+    var t = a.nodeType;
+    if (t === 1) {
+      if ((a.namespaceURI || null) !== (b.namespaceURI || null)) { return false; }
+      if ((a.prefix || null) !== (b.prefix || null)) { return false; }
+      if (a.localName !== b.localName) { return false; }
+      var aa = a.attributes, ba = b.attributes;
+      if ((aa ? aa.length : 0) !== (ba ? ba.length : 0)) { return false; }
+      for (var i = 0; aa && i < aa.length; i++) {
+        var at = aa[i], ok = false;
+        for (var j = 0; j < ba.length; j++) {
+          var bt = ba[j];
+          if ((at.namespaceURI || null) === (bt.namespaceURI || null)
+              && (at.localName || at.name) === (bt.localName || bt.name)
+              && at.value === bt.value) { ok = true; break; }
+        }
+        if (!ok) { return false; }
+      }
+    } else if (t === 3 || t === 8 || t === 4) {
+      if ((a.data || "") !== (b.data || "")) { return false; }
+    } else if (t === 7) {
+      if (a.target !== b.target || (a.data || "") !== (b.data || "")) { return false; }
+    } else if (t === 10) {
+      if (a.name !== b.name || (a.publicId || "") !== (b.publicId || "") || (a.systemId || "") !== (b.systemId || "")) { return false; }
+    }
+    var ac = a.childNodes || [], bc = b.childNodes || [];
+    if (ac.length !== bc.length) { return false; }
+    for (var k = 0; k < ac.length; k++) {
+      if (!globalThis.__nodesEqual(ac[k], bc[k])) { return false; }
+    }
+    return true;
+  };
+
   function enrichElement(el) {
     if (!el || typeof el !== "object") { return el; }
     if (el.__enriched) { return el; }
@@ -9464,6 +9501,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (typeof el.blur !== "function") { def(el, "blur", fn); }
     if (typeof el.click !== "function") { def(el, "click", fn); }
     if (typeof el.cloneNode !== "function") { def(el, "cloneNode", function () { return this; }); }
+    if (typeof el.isEqualNode !== "function") { def(el, "isEqualNode", function (other) { return globalThis.__nodesEqual(this, other); }); }
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
     if (!("nodeType" in el)) { def(el, "nodeType", 1); }
     if (!("ownerDocument" in el)) {
@@ -9633,6 +9671,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       // supports the full ParentNode mixin (append/prepend/replaceChildren/appendChild/insertBefore).
       // Canonicalize so navigation accessors (firstChild) return enriched, prototype-correct nodes.
       return canon(__wrapNode(__createDocumentFragment()));
+    });
+  }
+
+  if (typeof document.createRange !== "function") {
+    def(document, "createRange", function () {
+      var r = new globalThis.Range();
+      r.setStart(this, 0);
+      r.setEnd(this, 0);
+      return r;
     });
   }
   // document.implementation.createHTMLDocument — used to build/parse HTML off to the side (e.g.
@@ -10535,6 +10582,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   Range.prototype.selectNodeContents = function (node) { this.setStart(node, 0); this.setEnd(node, __nodeLength(__idOf(node))); };
   Range.prototype.cloneRange = function () { var r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; };
   Range.prototype.detach = function () {};
+  Range.prototype.createContextualFragment = function (html) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'createContextualFragment' on 'Range': 1 argument required, but only 0 present.");
+    }
+    // Parse the markup as an HTML fragment (scripts are parsed but not executed since the result
+    // isn't connected), then move the parsed nodes into a DocumentFragment.
+    var tmp = __createElement("template");
+    __setInnerHTML(tmp, html == null ? "" : String(html));
+    var frag = document.createDocumentFragment();
+    var kids = __children(tmp).slice();
+    for (var i = 0; i < kids.length; i++) { __appendChild(frag.__node, kids[i]); }
+    return frag;
+  };
   Range.prototype.toString = function () {
     // Only the common single-text-container case is modeled (the caret tests' usage): substring of
     // the text node between the two offsets.
