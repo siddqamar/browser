@@ -9955,7 +9955,42 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   if (!("activeElement" in document)) { Object.defineProperty(document, "activeElement", { get: function () { try { return document.body; } catch (e) { return null; } }, enumerable: true, configurable: true }); }
   if (!("visibilityState" in document)) { document.visibilityState = "visible"; }
   if (!("hidden" in document)) { document.hidden = false; }
-  if (!("characterSet" in document)) { document.characterSet = "UTF-8"; }
+  // The document's character encoding reflects its <meta charset> (or content-type meta), per the
+  // Encoding standard's label->name mapping; absent one it defaults to UTF-8. charset / characterSet
+  // / inputEncoding are aliases.
+  function __canonCharset(label) {
+    var l = String(label || "").trim().toLowerCase();
+    var m = {
+      "utf-8": "UTF-8", "utf8": "UTF-8", "unicode-1-1-utf-8": "UTF-8",
+      "windows-1252": "windows-1252", "cp1252": "windows-1252", "x-cp1252": "windows-1252",
+      "iso-8859-1": "windows-1252", "latin1": "windows-1252", "ascii": "windows-1252", "us-ascii": "windows-1252",
+      "iso-8859-2": "ISO-8859-2", "latin2": "ISO-8859-2", "l2": "ISO-8859-2",
+      "windows-1251": "windows-1251", "koi8-r": "KOI8-R", "shift_jis": "Shift_JIS", "sjis": "Shift_JIS",
+      "euc-jp": "EUC-JP", "euc-kr": "EUC-KR", "gbk": "GBK", "gb2312": "GBK", "big5": "Big5",
+      "utf-16": "UTF-16LE", "utf-16le": "UTF-16LE", "utf-16be": "UTF-16BE"
+    };
+    return Object.prototype.hasOwnProperty.call(m, l) ? m[l] : null;
+  }
+  function __documentCharset() {
+    try {
+      var m = document.querySelector("meta[charset]");
+      if (m) { var c = __canonCharset(m.getAttribute("charset")); if (c) { return c; } }
+      var hs = document.querySelectorAll("meta[http-equiv]");
+      for (var i = 0; i < hs.length; i++) {
+        if ((hs[i].getAttribute("http-equiv") || "").toLowerCase() === "content-type") {
+          var mt = /charset\s*=\s*([^\s;]+)/i.exec(hs[i].getAttribute("content") || "");
+          if (mt) { var cc = __canonCharset(mt[1]); if (cc) { return cc; } }
+        }
+      }
+    } catch (e) {}
+    return "UTF-8";
+  }
+  if (!("characterSet" in document) || typeof document.characterSet === "string") {
+    var __csGetter = { get: function () { return __documentCharset(); }, enumerable: true, configurable: true };
+    try { Object.defineProperty(document, "characterSet", __csGetter); } catch (e) {}
+    try { Object.defineProperty(document, "charset", __csGetter); } catch (e) {}
+    try { Object.defineProperty(document, "inputEncoding", __csGetter); } catch (e) {}
+  }
   if (!("compatMode" in document)) { document.compatMode = "CSS1Compat"; }
   if (!("scrollingElement" in document)) { Object.defineProperty(document, "scrollingElement", { get: function () { try { return document.documentElement; } catch (e) { return null; } }, enumerable: true, configurable: true }); }
   if (typeof document.querySelectorAll === "function" && typeof document.querySelectorAll.call === "function") { /* present */ }
@@ -10334,6 +10369,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     XDocument.prototype.createCDATASection = function (d) { return new XCData(this, String(d)); };
     XDocument.prototype.createProcessingInstruction = function (t, d) { return new XPI(this, t, d); };
     Object.defineProperty(XDocument.prototype, "documentElement", { get: function () { for (var i = 0; i < this.childNodes.length; i++) { if (this.childNodes[i].nodeType === 1) { return this.childNodes[i]; } } return null; } });
+    // A DOMParser-produced document is always UTF-8, regardless of any encoding declaration inside.
+    Object.defineProperty(XDocument.prototype, "characterSet", { get: function () { return "UTF-8"; } });
+    Object.defineProperty(XDocument.prototype, "charset", { get: function () { return "UTF-8"; } });
+    Object.defineProperty(XDocument.prototype, "inputEncoding", { get: function () { return "UTF-8"; } });
 
     // --- Parser: a small namespace-aware XML reader ----------------------------------------------
     function parse(str) {
