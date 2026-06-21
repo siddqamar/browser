@@ -23,7 +23,12 @@ pub struct Edges {
 impl Edges {
     /// All four sides set to the same value.
     pub fn all(v: f32) -> Self {
-        Edges { top: v, right: v, bottom: v, left: v }
+        Edges {
+            top: v,
+            right: v,
+            bottom: v,
+            left: v,
+        }
     }
 }
 
@@ -197,7 +202,10 @@ pub enum GridEnd {
 
 impl Default for GridPlacement {
     fn default() -> Self {
-        GridPlacement { start: None, end: GridEnd::Auto }
+        GridPlacement {
+            start: None,
+            end: GridEnd::Auto,
+        }
     }
 }
 
@@ -222,15 +230,18 @@ impl WritingMode {
     pub fn start_edges(self, dir: Direction) -> (EdgeSide, EdgeSide) {
         let rtl = dir == Direction::Rtl;
         match self {
-            WritingMode::HorizontalTb => {
-                (EdgeSide::Top, if rtl { EdgeSide::Right } else { EdgeSide::Left })
-            }
-            WritingMode::VerticalLr => {
-                (EdgeSide::Left, if rtl { EdgeSide::Bottom } else { EdgeSide::Top })
-            }
-            WritingMode::VerticalRl => {
-                (EdgeSide::Right, if rtl { EdgeSide::Bottom } else { EdgeSide::Top })
-            }
+            WritingMode::HorizontalTb => (
+                EdgeSide::Top,
+                if rtl { EdgeSide::Right } else { EdgeSide::Left },
+            ),
+            WritingMode::VerticalLr => (
+                EdgeSide::Left,
+                if rtl { EdgeSide::Bottom } else { EdgeSide::Top },
+            ),
+            WritingMode::VerticalRl => (
+                EdgeSide::Right,
+                if rtl { EdgeSide::Bottom } else { EdgeSide::Top },
+            ),
         }
     }
 }
@@ -528,7 +539,10 @@ pub struct GradientStop {
 pub enum Gradient {
     /// A linear gradient. `angle_deg` follows the CSS convention: 0deg = to top, 90deg = to
     /// right, 180deg = to bottom. Stops are sorted by `pos` ascending, each in 0..=1.
-    Linear { angle_deg: f32, stops: Vec<GradientStop> },
+    Linear {
+        angle_deg: f32,
+        stops: Vec<GradientStop>,
+    },
     /// A radial gradient (centered circle, half-diagonal radius). Stops sorted by `pos`.
     Radial { stops: Vec<GradientStop> },
 }
@@ -803,11 +817,20 @@ impl ComputedStyle {
             EdgeSide::Left => "left",
             EdgeSide::All => "top",
         };
-        let (bs, be, is, ie) = (block_start, opp(block_start), inline_start, opp(inline_start));
+        let (bs, be, is, ie) = (
+            block_start,
+            opp(block_start),
+            inline_start,
+            opp(inline_start),
+        );
         // The inline axis is horizontal in horizontal-tb, vertical otherwise.
         let inline_horiz = matches!(self.writing_mode, WritingMode::HorizontalTb);
         let size = |inline: bool| -> &'static str {
-            if inline == inline_horiz { "width" } else { "height" }
+            if inline == inline_horiz {
+                "width"
+            } else {
+                "height"
+            }
         };
         Some(match name {
             "inline-size" => size(true).to_string(),
@@ -929,9 +952,7 @@ impl ComputedStyle {
             "font-size" => px(self.font_size),
             "font-weight" => if self.bold { "700" } else { "400" }.to_string(),
             "font-style" => if self.italic { "italic" } else { "normal" }.to_string(),
-            // `direction` / `unicode-bidi` are not modeled beyond their initial values (they don't
-            // affect our layout); report the initial computed keyword so getComputedStyle reads work.
-            "direction" => "ltr".to_string(),
+            // `unicode-bidi` is not modeled beyond its initial value; report the initial keyword.
             "unicode-bidi" => "normal".to_string(),
             "direction" => match self.direction {
                 Direction::Ltr => "ltr".to_string(),
@@ -1008,10 +1029,10 @@ impl ComputedStyle {
             // --- sizing ---
             "width" => self.width.map(px).unwrap_or_else(|| "auto".to_string()),
             "height" => self.height.map(px).unwrap_or_else(|| "auto".to_string()),
-            "min-width" => self.min_width.map(|c| size_constraint_str(c)).unwrap_or_else(|| "auto".to_string()),
-            "min-height" => self.min_height.map(|c| size_constraint_str(c)).unwrap_or_else(|| "auto".to_string()),
-            "max-width" => self.max_width.map(|c| size_constraint_str(c)).unwrap_or_else(|| "none".to_string()),
-            "max-height" => self.max_height.map(|c| size_constraint_str(c)).unwrap_or_else(|| "none".to_string()),
+            "min-width" => self.min_width.map(size_constraint_str).unwrap_or_else(|| "auto".to_string()),
+            "min-height" => self.min_height.map(size_constraint_str).unwrap_or_else(|| "auto".to_string()),
+            "max-width" => self.max_width.map(size_constraint_str).unwrap_or_else(|| "none".to_string()),
+            "max-height" => self.max_height.map(size_constraint_str).unwrap_or_else(|| "none".to_string()),
 
             // --- insets (position offsets) ---
             "top" => self.top.map(px).unwrap_or_else(|| "auto".to_string()),
@@ -1356,9 +1377,23 @@ impl ComputedStyle {
 fn is_reserved_font_family_word(body: &str) -> bool {
     matches!(
         body.to_ascii_lowercase().as_str(),
-        "serif" | "sans-serif" | "cursive" | "fantasy" | "monospace" | "system-ui" | "math"
-            | "ui-serif" | "ui-sans-serif" | "ui-monospace" | "ui-rounded"
-            | "default" | "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        "serif"
+            | "sans-serif"
+            | "cursive"
+            | "fantasy"
+            | "monospace"
+            | "system-ui"
+            | "math"
+            | "ui-serif"
+            | "ui-sans-serif"
+            | "ui-monospace"
+            | "ui-rounded"
+            | "default"
+            | "inherit"
+            | "initial"
+            | "unset"
+            | "revert"
+            | "revert-layer"
     )
 }
 
@@ -1402,14 +1437,21 @@ pub fn serialize_font_family(val: &str) -> String {
         }
         let first = fam.chars().next().unwrap();
         if first == '"' || first == '\'' {
-            let body: String = fam.chars().skip(1).take(fam.chars().count().saturating_sub(2)).collect();
+            let body: String = fam
+                .chars()
+                .skip(1)
+                .take(fam.chars().count().saturating_sub(2))
+                .collect();
             let words: Vec<&str> = body.split(' ').collect();
             let all_ident = !words.is_empty() && words.iter().all(|w| is_css_ident_word(w));
             let round_trips = all_ident && words.join(" ") == body;
             if round_trips && !is_reserved_font_family_word(&body) {
                 out.push(body);
             } else {
-                out.push(format!("\"{}\"", body.replace('\\', "\\\\").replace('"', "\\\"")));
+                out.push(format!(
+                    "\"{}\"",
+                    body.replace('\\', "\\\\").replace('"', "\\\"")
+                ));
             }
         } else {
             // Unquoted: collapse internal whitespace runs to single spaces.
@@ -1506,7 +1548,13 @@ fn edges_str(e: Edges) -> String {
     } else if e.top == e.bottom && e.left == e.right {
         format!("{} {}", px(e.top), px(e.right))
     } else {
-        format!("{} {} {} {}", px(e.top), px(e.right), px(e.bottom), px(e.left))
+        format!(
+            "{} {} {} {}",
+            px(e.top),
+            px(e.right),
+            px(e.bottom),
+            px(e.left)
+        )
     }
 }
 
@@ -1523,7 +1571,11 @@ fn tracks_str(tracks: &[TrackSize]) -> String {
     if tracks.is_empty() {
         return "none".to_string();
     }
-    tracks.iter().map(|t| track_str(*t)).collect::<Vec<_>>().join(" ")
+    tracks
+        .iter()
+        .map(|t| track_str(*t))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Compute a [`ComputedStyle`] for every element node in `doc`, using the built-in UA
@@ -1611,7 +1663,15 @@ fn cascade_locked(
     let initial = ComputedStyle::default();
     // Custom properties (`--name`) inherit; the root starts with an empty environment.
     let initial_vars: HashMap<String, String> = HashMap::new();
-    cascade_node(doc, doc.root(), &initial, &initial_vars, false, &index, &mut out);
+    cascade_node(
+        doc,
+        doc.root(),
+        &initial,
+        &initial_vars,
+        false,
+        &index,
+        &mut out,
+    );
     (out, root_used_scheme_dark())
 }
 
@@ -1655,7 +1715,15 @@ pub fn cascade_subtree(
     let initial = ComputedStyle::default();
     let initial_vars: HashMap<String, String> = HashMap::new();
     let mut out = HashMap::new();
-    cascade_node(doc, root_id, &initial, &initial_vars, false, &index, &mut out);
+    cascade_node(
+        doc,
+        root_id,
+        &initial,
+        &initial_vars,
+        false,
+        &index,
+        &mut out,
+    );
     out
 }
 
@@ -1750,7 +1818,10 @@ fn meta_color_scheme(doc: &dom::Document) -> Option<ColorScheme> {
         }
         if let dom::NodeData::Element(el) = &doc.get(id).data {
             if el.tag.eq_ignore_ascii_case("meta")
-                && el.attrs.get("name").is_some_and(|n| n.eq_ignore_ascii_case("color-scheme"))
+                && el
+                    .attrs
+                    .get("name")
+                    .is_some_and(|n| n.eq_ignore_ascii_case("color-scheme"))
             {
                 if let Some(content) = el.attrs.get("content") {
                     if let Some(cs) = parse_color_scheme(&content.to_ascii_lowercase()) {
@@ -1844,7 +1915,13 @@ impl<'a> SelectorIndex<'a> {
                 BucketKey::Type(t) => self.by_type.entry(t).or_default(),
                 BucketKey::Universal => &mut self.universal,
             }
-            .push(Entry { origin, order, compiled, decls: &rule.declarations, base: rule.base_url.as_deref() });
+            .push(Entry {
+                origin,
+                order,
+                compiled,
+                decls: &rule.declarations,
+                base: rule.base_url.as_deref(),
+            });
         }
     }
 }
@@ -1943,7 +2020,10 @@ struct NamespaceEnv {
 
 impl NamespaceEnv {
     fn lookup(&self, prefix: &str) -> Option<&str> {
-        self.prefixes.iter().find(|(p, _)| p == prefix).map(|(_, u)| u.as_str())
+        self.prefixes
+            .iter()
+            .find(|(p, _)| p == prefix)
+            .map(|(_, u)| u.as_str())
     }
 }
 
@@ -1982,8 +2062,10 @@ pub fn ua_default_canvas_color() -> (u8, u8, u8) {
 // `:focus-within`/`:focus-visible` during the cascade. The engine sets these via
 // `set_interaction_state` before each cascade. We store the hovered/focused node ids (the
 // `usize` inside a `dom::NodeId`); `usize::MAX` means "none".
-static HOVERED_NODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
-static FOCUSED_NODE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static HOVERED_NODE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+static FOCUSED_NODE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 /// Set the currently hovered and focused node ids (as the raw `usize` of their [`dom::NodeId`]),
 /// or `None` for neither. Call before [`cascade`] whenever interaction state changes so
@@ -1996,33 +2078,59 @@ pub fn set_interaction_state(hovered: Option<usize>, focused: Option<usize>) {
 
 fn interaction_hovered() -> Option<usize> {
     let v = HOVERED_NODE.load(std::sync::atomic::Ordering::Relaxed);
-    if v == usize::MAX { None } else { Some(v) }
+    if v == usize::MAX {
+        None
+    } else {
+        Some(v)
+    }
 }
 fn interaction_focused() -> Option<usize> {
     let v = FOCUSED_NODE.load(std::sync::atomic::Ordering::Relaxed);
-    if v == usize::MAX { None } else { Some(v) }
+    if v == usize::MAX {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 fn viewport_width() -> f32 {
     let b = VIEWPORT_W_BITS.load(std::sync::atomic::Ordering::Relaxed);
-    if b == 0 { 1280.0 } else { f32::from_bits(b) }
+    if b == 0 {
+        1280.0
+    } else {
+        f32::from_bits(b)
+    }
 }
 fn viewport_height() -> f32 {
     let b = VIEWPORT_H_BITS.load(std::sync::atomic::Ordering::Relaxed);
-    if b == 0 { 800.0 } else { f32::from_bits(b) }
+    if b == 0 {
+        800.0
+    } else {
+        f32::from_bits(b)
+    }
 }
 fn viewport_dpr() -> f32 {
     let b = VIEWPORT_DPR_BITS.load(std::sync::atomic::Ordering::Relaxed);
-    if b == 0 { 2.0 } else { f32::from_bits(b) }
+    if b == 0 {
+        2.0
+    } else {
+        f32::from_bits(b)
+    }
 }
 
 /// Viewport width (px) used for `min-width`/`max-width` media queries — the real window width.
-fn assumed_viewport_width() -> f32 { viewport_width() }
+fn assumed_viewport_width() -> f32 {
+    viewport_width()
+}
 /// Viewport height (px) used to resolve `vh` units — the real window height.
-fn assumed_viewport_height() -> f32 { viewport_height() }
+fn assumed_viewport_height() -> f32 {
+    viewport_height()
+}
 /// Width (px) used to evaluate `@container` conditions. Correct container sizing needs layout
 /// (which runs after the cascade), so we approximate with the viewport width.
-fn assumed_container_width() -> f32 { viewport_width() }
+fn assumed_container_width() -> f32 {
+    viewport_width()
+}
 
 /// Recursively compute styles. `parent` is the parent's computed style (the inheritance
 /// source); `parent_vars` is the set of custom properties inherited from ancestors;
@@ -2107,7 +2215,7 @@ fn compute_element_style<'a>(
         min_height: None,
         max_height: None,
         margin: Edges::default(),
-            margin_auto: [false; 4],
+        margin_auto: [false; 4],
         padding: Edges::default(),
         border: Edges::default(),
         border_color: parent.color, // initial border-color is currentColor
@@ -2201,10 +2309,22 @@ fn compute_element_style<'a>(
         }
         match &entry.compiled.pseudo_element {
             Some(PseudoElement::Before) => {
-                before_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
+                before_matches.push((
+                    entry.origin,
+                    entry.compiled.specificity,
+                    entry.order,
+                    entry.decls,
+                    entry.base,
+                ));
             }
             Some(PseudoElement::After) => {
-                after_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
+                after_matches.push((
+                    entry.origin,
+                    entry.compiled.specificity,
+                    entry.order,
+                    entry.decls,
+                    entry.base,
+                ));
             }
             // Other pseudo-elements (`::marker`, `::highlight(x)`, …) don't generate layout boxes
             // here and don't apply to the originating element; they're resolved on demand by
@@ -2214,7 +2334,12 @@ fn compute_element_style<'a>(
                 best_by_order
                     .entry(entry.order)
                     .and_modify(|(_, spec, _, _)| *spec = (*spec).max(entry.compiled.specificity))
-                    .or_insert((entry.origin, entry.compiled.specificity, entry.decls, entry.base));
+                    .or_insert((
+                        entry.origin,
+                        entry.compiled.specificity,
+                        entry.decls,
+                        entry.base,
+                    ));
             }
         }
     };
@@ -2251,7 +2376,13 @@ fn compute_element_style<'a>(
     // them).
     for (order, (origin, specificity, decls, base)) in best_by_order {
         let level = if origin == 0 { 0 } else { 2 };
-        matches.push(MatchEntry { origin: level, specificity, order, decls, base });
+        matches.push(MatchEntry {
+            origin: level,
+            specificity,
+            order,
+            decls,
+            base,
+        });
     }
 
     // Presentational hints: HTML attributes (`border`, `bgcolor`, `align`, `width`, …) mapped to
@@ -2259,7 +2390,13 @@ fn compute_element_style<'a>(
     // `presentational_hints`.
     let hint_decls: Vec<(String, String)> = presentational_hints(doc, node_id, el);
     if !hint_decls.is_empty() {
-        matches.push(MatchEntry { origin: 1, specificity: 0, order: usize::MAX - 1, decls: &hint_decls, base: None });
+        matches.push(MatchEntry {
+            origin: 1,
+            specificity: 0,
+            order: usize::MAX - 1,
+            decls: &hint_decls,
+            base: None,
+        });
     }
 
     // Inline style is its own origin (level 3) with highest precedence.
@@ -2340,7 +2477,15 @@ fn compute_element_style<'a>(
                 let (val, _imp) = split_importance(val);
                 let resolved = resolve_vars(val, &vars);
                 let current_color = style.color;
-                apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color, m.base);
+                apply_declaration(
+                    &mut style,
+                    prop,
+                    &resolved,
+                    parent,
+                    current_color,
+                    inherited_color,
+                    m.base,
+                );
             }
         }
     }
@@ -2356,7 +2501,15 @@ fn compute_element_style<'a>(
             }
             let resolved = resolve_vars(val, &vars);
             let current_color = style.color;
-            apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color, m.base);
+            apply_declaration(
+                &mut style,
+                prop,
+                &resolved,
+                parent,
+                current_color,
+                inherited_color,
+                m.base,
+            );
         }
     }
     // `!important` declarations win over all normal ones: apply them last, still in ascending
@@ -2372,14 +2525,24 @@ fn compute_element_style<'a>(
             }
             let resolved = resolve_vars(val, &vars);
             let current_color = style.color;
-            apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color, m.base);
+            apply_declaration(
+                &mut style,
+                prop,
+                &resolved,
+                parent,
+                current_color,
+                inherited_color,
+                m.base,
+            );
         }
     }
 
     // The UA stylesheet emits `display: block` for block tags; everything else defaults to
     // inline. If no author/UA rule set a display, fall back to the per-tag default.
     let display_was_set = matches.iter().any(|m| {
-        m.decls.iter().any(|(p, _)| p.eq_ignore_ascii_case("display"))
+        m.decls
+            .iter()
+            .any(|(p, _)| p.eq_ignore_ascii_case("display"))
     });
     if !display_was_set && style.display == Display::Inline && is_block_tag(&el.tag) {
         style.display = Display::Block;
@@ -2469,7 +2632,15 @@ fn cascade_pseudo(
             }
             let resolved = resolve_vars(val, vars);
             let current_color = ps.color;
-            apply_declaration(&mut ps, prop, &resolved, element_style, current_color, inherited_color, *base);
+            apply_declaration(
+                &mut ps,
+                prop,
+                &resolved,
+                element_style,
+                current_color,
+                inherited_color,
+                *base,
+            );
         }
     }
 
@@ -2488,7 +2659,10 @@ fn cascade_pseudo(
 
 /// Gather the candidate index entries for `el` (its id/class/type buckets + the universal bucket),
 /// the same set `cascade_node` considers. Returned in bucket order; callers filter + sort.
-fn candidate_entries<'i, 'a>(index: &'i SelectorIndex<'a>, el: &dom::ElementData) -> Vec<&'i Entry<'a>> {
+fn candidate_entries<'i, 'a>(
+    index: &'i SelectorIndex<'a>,
+    el: &dom::ElementData,
+) -> Vec<&'i Entry<'a>> {
     let mut out: Vec<&'i Entry<'a>> = Vec::new();
     if let Some(id) = el.id() {
         if let Some(bucket) = index.by_id.get(id) {
@@ -2542,7 +2716,13 @@ pub fn compute_pseudo_style(
             continue;
         }
         let origin = if entry.origin == 0 { 0 } else { 2 };
-        matches.push((origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
+        matches.push((
+            origin,
+            entry.compiled.specificity,
+            entry.order,
+            entry.decls,
+            entry.base,
+        ));
     }
 
     // Inherit typography/color from the originating element, then reset the box / non-inherited
@@ -2602,7 +2782,15 @@ pub fn compute_pseudo_style(
                 "height" => height_pct = parse_percent(&resolved),
                 _ => {}
             }
-            apply_declaration(&mut ps, prop, &resolved, element_style, current_color, inherited_color, *base);
+            apply_declaration(
+                &mut ps,
+                prop,
+                &resolved,
+                element_style,
+                current_color,
+                inherited_color,
+                *base,
+            );
         }
     }
     // Resolve a tracked percentage width/height against the originating element's content box. Only
@@ -2784,7 +2972,7 @@ fn media_applies(media: Option<&str>) -> bool {
         return true;
     }
     // A comma-separated media query list matches if ANY component matches.
-    query.split(',').any(|component| media_component_matches(component))
+    query.split(',').any(media_component_matches)
 }
 
 fn media_component_matches(component: &str) -> bool {
@@ -2837,14 +3025,18 @@ fn media_component_matches(component: &str) -> bool {
                         }
                     }
                     // Resolution / HiDPI queries, compared against the real device pixel ratio.
-                    "min-resolution" | "-webkit-min-device-pixel-ratio" | "min--moz-device-pixel-ratio" => {
+                    "min-resolution"
+                    | "-webkit-min-device-pixel-ratio"
+                    | "min--moz-device-pixel-ratio" => {
                         if let Some(r) = resolution_dppx(value) {
                             if viewport_dpr() < r {
                                 return false;
                             }
                         }
                     }
-                    "max-resolution" | "-webkit-max-device-pixel-ratio" | "max--moz-device-pixel-ratio" => {
+                    "max-resolution"
+                    | "-webkit-max-device-pixel-ratio"
+                    | "max--moz-device-pixel-ratio" => {
                         if let Some(r) = resolution_dppx(value) {
                             if viewport_dpr() > r {
                                 return false;
@@ -2853,7 +3045,9 @@ fn media_component_matches(component: &str) -> bool {
                     }
                     "orientation" => {
                         let landscape = assumed_viewport_width() >= assumed_viewport_height();
-                        if (value == "portrait" && landscape) || (value == "landscape" && !landscape) {
+                        if (value == "portrait" && landscape)
+                            || (value == "landscape" && !landscape)
+                        {
                             return false;
                         }
                     }
@@ -2933,7 +3127,13 @@ fn container_feature_matches(inner: &str) -> bool {
         return true;
     }
     // Range form: `feature OP value` where OP is one of >= <= > < =.
-    for (op, less, oreq) in [(">=", false, true), ("<=", true, true), (">", false, false), ("<", true, false), ("=", false, false)] {
+    for (op, less, oreq) in [
+        (">=", false, true),
+        ("<=", true, true),
+        (">", false, false),
+        ("<", true, false),
+        ("=", false, false),
+    ] {
         if let Some((feature, value)) = inner.split_once(op) {
             let feature = feature.trim();
             if !matches!(feature, "width" | "inline-size" | "height" | "block-size") {
@@ -2991,10 +3191,36 @@ fn resolution_dppx(value: &str) -> Option<f32> {
 fn is_block_tag(tag: &str) -> bool {
     matches!(
         tag.to_ascii_lowercase().as_str(),
-        "html" | "body" | "div" | "p" | "section" | "article" | "header" | "footer" | "nav"
-            | "main" | "aside" | "ul" | "ol" | "li" | "blockquote" | "pre" | "table" | "tr"
-            | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "form" | "fieldset" | "figure"
-            | "figcaption" | "address" | "hr"
+        "html"
+            | "body"
+            | "div"
+            | "p"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "nav"
+            | "main"
+            | "aside"
+            | "ul"
+            | "ol"
+            | "li"
+            | "blockquote"
+            | "pre"
+            | "table"
+            | "tr"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "form"
+            | "fieldset"
+            | "figure"
+            | "figcaption"
+            | "address"
+            | "hr"
     )
 }
 
@@ -3090,10 +3316,7 @@ fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
 
 /// Parse a `gap` value: 1 value → both row & column; 2 values → row column.
 fn parse_gap(val: &str) -> Option<(f32, f32)> {
-    let parts: Vec<f32> = val
-        .split_whitespace()
-        .filter_map(parse_length)
-        .collect();
+    let parts: Vec<f32> = val.split_whitespace().filter_map(parse_length).collect();
     match parts.len() {
         1 => Some((parts[0], parts[0])),
         n if n >= 2 => Some((parts[0], parts[1])),
@@ -3130,7 +3353,10 @@ fn parse_track_list(val: &str) -> Vec<TrackSize> {
             i += 1;
         }
         let tok: String = chars[start..i].iter().collect();
-        if let Some(inner) = tok.strip_prefix("repeat(").and_then(|s| s.strip_suffix(')')) {
+        if let Some(inner) = tok
+            .strip_prefix("repeat(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
             // repeat(count, tracks...)
             if let Some((count_s, rest)) = inner.split_once(',') {
                 if let Ok(count) = count_s.trim().parse::<usize>() {
@@ -3190,7 +3416,11 @@ fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
         }
         Some(e) => {
             if let Some(n) = e.strip_prefix("span") {
-                n.trim().parse::<i32>().ok().map(GridEnd::Span).unwrap_or(GridEnd::Auto)
+                n.trim()
+                    .parse::<i32>()
+                    .ok()
+                    .map(GridEnd::Span)
+                    .unwrap_or(GridEnd::Auto)
             } else if let Ok(line) = e.parse::<i32>() {
                 GridEnd::Line(line)
             } else {
@@ -3242,7 +3472,11 @@ fn presentational_hints(
         }
         // strip a trailing "px" if the author wrote one, else treat the number as px.
         let n = t.trim_end_matches("px").trim();
-        if n.parse::<f32>().is_ok() { format!("{n}px") } else { t.to_string() }
+        if n.parse::<f32>().is_ok() {
+            format!("{n}px")
+        } else {
+            t.to_string()
+        }
     };
 
     match tag.as_str() {
@@ -3461,15 +3695,20 @@ fn apply_declaration(
                 style.font_family = parent.font_family.clone();
             } else if lower == "initial" || lower == "unset" {
                 // font-family inherits, so `unset` == `inherit`; `initial` is the UA default (None).
-                style.font_family = if lower == "unset" { parent.font_family.clone() } else { None };
+                style.font_family = if lower == "unset" {
+                    parent.font_family.clone()
+                } else {
+                    None
+                };
             } else if !trimmed.is_empty() {
                 style.font_family = Some(serialize_font_family(trimmed));
             }
         }
-        "font-weight" => match parse_font_weight(val) {
-            Some(b) => style.bold = b,
-            None => {}
-        },
+        "font-weight" => {
+            if let Some(b) = parse_font_weight(val) {
+                style.bold = b
+            }
+        }
         "font-style" => match val.trim().to_ascii_lowercase().as_str() {
             "italic" | "oblique" => style.italic = true,
             "normal" => style.italic = false,
@@ -3493,7 +3732,9 @@ fn apply_declaration(
             _ => {}
         },
         "writing-mode" => match val.trim().to_ascii_lowercase().as_str() {
-            "horizontal-tb" | "lr" | "lr-tb" | "rl" => style.writing_mode = WritingMode::HorizontalTb,
+            "horizontal-tb" | "lr" | "lr-tb" | "rl" => {
+                style.writing_mode = WritingMode::HorizontalTb
+            }
             "vertical-rl" | "tb" | "tb-rl" | "sideways-rl" => {
                 style.writing_mode = WritingMode::VerticalRl
             }
@@ -3568,7 +3809,11 @@ fn apply_declaration(
                 style.z_index = Some(n.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
             } else if v.parse::<i128>().is_ok() {
                 // Very large integers (beyond i64) still parse as <integer>; clamp by sign.
-                style.z_index = Some(if v.starts_with('-') { i32::MIN } else { i32::MAX });
+                style.z_index = Some(if v.starts_with('-') {
+                    i32::MIN
+                } else {
+                    i32::MAX
+                });
             }
         }
 
@@ -3713,11 +3958,21 @@ fn apply_declaration(
         "padding-left" => set_edge(&mut style.padding, EdgeSide::Left, val, style.font_size),
 
         // --- Box model: border ---
-        "border" => apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color),
-        "border-top" => apply_border_shorthand(style, val, EdgeSide::Top, current_color, inherited_color),
-        "border-right" => apply_border_shorthand(style, val, EdgeSide::Right, current_color, inherited_color),
-        "border-bottom" => apply_border_shorthand(style, val, EdgeSide::Bottom, current_color, inherited_color),
-        "border-left" => apply_border_shorthand(style, val, EdgeSide::Left, current_color, inherited_color),
+        "border" => {
+            apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color)
+        }
+        "border-top" => {
+            apply_border_shorthand(style, val, EdgeSide::Top, current_color, inherited_color)
+        }
+        "border-right" => {
+            apply_border_shorthand(style, val, EdgeSide::Right, current_color, inherited_color)
+        }
+        "border-bottom" => {
+            apply_border_shorthand(style, val, EdgeSide::Bottom, current_color, inherited_color)
+        }
+        "border-left" => {
+            apply_border_shorthand(style, val, EdgeSide::Left, current_color, inherited_color)
+        }
         "border-width" => {
             if let Some(e) = parse_edges_shorthand(val, style.font_size) {
                 style.border = e;
@@ -3725,7 +3980,9 @@ fn apply_declaration(
         }
         "border-top-width" => set_edge(&mut style.border, EdgeSide::Top, val, style.font_size),
         "border-right-width" => set_edge(&mut style.border, EdgeSide::Right, val, style.font_size),
-        "border-bottom-width" => set_edge(&mut style.border, EdgeSide::Bottom, val, style.font_size),
+        "border-bottom-width" => {
+            set_edge(&mut style.border, EdgeSide::Bottom, val, style.font_size)
+        }
         "border-left-width" => set_edge(&mut style.border, EdgeSide::Left, val, style.font_size),
         "border-color" => {
             if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
@@ -3751,13 +4008,19 @@ fn apply_declaration(
         // --- Box model: width / height ---
         "width" => {
             style.width = parse_length(val);
-            style.width_pct =
-                if style.width.is_none() { parse_percent(val).map(|p| p / 100.0) } else { None };
+            style.width_pct = if style.width.is_none() {
+                parse_percent(val).map(|p| p / 100.0)
+            } else {
+                None
+            };
         }
         "height" => {
             style.height = parse_length(val);
-            style.height_pct =
-                if style.height.is_none() { parse_percent(val).map(|p| p / 100.0) } else { None };
+            style.height_pct = if style.height.is_none() {
+                parse_percent(val).map(|p| p / 100.0)
+            } else {
+                None
+            };
         }
         "aspect-ratio" => {
             // A ratio is present unless the value is just `auto` (or a global keyword). Detecting a
@@ -3973,8 +4236,15 @@ fn resolve_content_attr(content: &str, el: &dom::ElementData) -> String {
     let lower = content.to_ascii_lowercase();
     if lower.starts_with("attr(") && content.ends_with(')') {
         let name = content[5..content.len() - 1].trim();
-        return el.attrs.get(&name.to_ascii_lowercase())
-            .or_else(|| el.attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v))
+        return el
+            .attrs
+            .get(&name.to_ascii_lowercase())
+            .or_else(|| {
+                el.attrs
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            })
             .cloned()
             .unwrap_or_default();
     }
@@ -3992,7 +4262,11 @@ fn parse_size_constraint(val: &str) -> Option<SizeConstraint> {
         return eval_length(&v, 16.0).map(SizeConstraint::Px);
     }
     if let Some(p) = v.strip_suffix('%') {
-        return p.trim().parse::<f32>().ok().map(|x| SizeConstraint::Pct(x / 100.0));
+        return p
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|x| SizeConstraint::Pct(x / 100.0));
     }
     parse_length(val).map(SizeConstraint::Px)
 }
@@ -4009,10 +4283,30 @@ struct OptionalEdges {
 fn parse_optional_edges_shorthand(val: &str) -> Option<OptionalEdges> {
     let parts: Vec<Option<f32>> = val.split_whitespace().map(parse_length).collect();
     match parts.len() {
-        1 => Some(OptionalEdges { top: parts[0], right: parts[0], bottom: parts[0], left: parts[0] }),
-        2 => Some(OptionalEdges { top: parts[0], bottom: parts[0], right: parts[1], left: parts[1] }),
-        3 => Some(OptionalEdges { top: parts[0], right: parts[1], left: parts[1], bottom: parts[2] }),
-        n if n >= 4 => Some(OptionalEdges { top: parts[0], right: parts[1], bottom: parts[2], left: parts[3] }),
+        1 => Some(OptionalEdges {
+            top: parts[0],
+            right: parts[0],
+            bottom: parts[0],
+            left: parts[0],
+        }),
+        2 => Some(OptionalEdges {
+            top: parts[0],
+            bottom: parts[0],
+            right: parts[1],
+            left: parts[1],
+        }),
+        3 => Some(OptionalEdges {
+            top: parts[0],
+            right: parts[1],
+            left: parts[1],
+            bottom: parts[2],
+        }),
+        n if n >= 4 => Some(OptionalEdges {
+            top: parts[0],
+            right: parts[1],
+            bottom: parts[2],
+            left: parts[3],
+        }),
         _ => None,
     }
 }
@@ -4449,7 +4743,12 @@ fn parse_box_shadows(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) 
             dy: lengths[1],
             blur: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
             spread: lengths.get(3).copied().unwrap_or(0.0),
-            color: color.unwrap_or(Rgba { r: current.0, g: current.1, b: current.2, a: 255 }),
+            color: color.unwrap_or(Rgba {
+                r: current.0,
+                g: current.1,
+                b: current.2,
+                a: 255,
+            }),
         });
     }
     out
@@ -4514,15 +4813,43 @@ fn parse_transform(val: &str) -> Option<[f32; 6]> {
                 let y = nums.get(1).copied().unwrap_or(0.0);
                 [1.0, 0.0, 0.0, 1.0, x, y]
             }
-            "translatex" => [1.0, 0.0, 0.0, 1.0, nums.first().copied().unwrap_or(0.0), 0.0],
-            "translatey" => [1.0, 0.0, 0.0, 1.0, 0.0, nums.first().copied().unwrap_or(0.0)],
+            "translatex" => [
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                nums.first().copied().unwrap_or(0.0),
+                0.0,
+            ],
+            "translatey" => [
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                nums.first().copied().unwrap_or(0.0),
+            ],
             "scale" => {
                 let sx = nums.first().copied().unwrap_or(1.0);
                 let sy = nums.get(1).copied().unwrap_or(sx);
                 [sx, 0.0, 0.0, sy, 0.0, 0.0]
             }
-            "scalex" => [nums.first().copied().unwrap_or(1.0), 0.0, 0.0, 1.0, 0.0, 0.0],
-            "scaley" => [1.0, 0.0, 0.0, nums.first().copied().unwrap_or(1.0), 0.0, 0.0],
+            "scalex" => [
+                nums.first().copied().unwrap_or(1.0),
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+            ],
+            "scaley" => [
+                1.0,
+                0.0,
+                0.0,
+                nums.first().copied().unwrap_or(1.0),
+                0.0,
+                0.0,
+            ],
             "rotate" => {
                 let deg = parse_angle_deg(&args).unwrap_or(0.0);
                 let r = deg.to_radians();
@@ -4548,7 +4875,11 @@ fn parse_transform(val: &str) -> Option<[f32; 6]> {
         m = mat_mul(m, t);
         any = true;
     }
-    if any { Some(m) } else { None }
+    if any {
+        Some(m)
+    } else {
+        None
+    }
 }
 
 /// The 2D-affine identity.
@@ -4594,7 +4925,11 @@ fn transform_functions(s: &str) -> Vec<(String, String)> {
         if i >= chars.len() {
             break;
         }
-        let name: String = chars[name_start..i].iter().collect::<String>().trim().to_ascii_lowercase();
+        let name: String = chars[name_start..i]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_ascii_lowercase();
         i += 1; // skip '('
         let args_start = i;
         let mut depth = 1i32;
@@ -4622,7 +4957,10 @@ fn transform_functions(s: &str) -> Vec<(String, String)> {
 /// (`left`/`right`/`top`/`bottom`/`center`) and percentages; px values are approximated as a
 /// fraction of an assumed 200px box (best-effort). Default (0.5, 0.5).
 fn parse_transform_origin(val: &str) -> (f32, f32) {
-    let toks: Vec<String> = val.split_whitespace().map(|t| t.to_ascii_lowercase()).collect();
+    let toks: Vec<String> = val
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
     let mut x = 0.5;
     let mut y = 0.5;
     let resolve = |t: &str, _horizontal: bool| -> Option<f32> {
@@ -4704,7 +5042,11 @@ pub enum EdgeSide {
 fn eval_length(value: &str, font_size_px: f32) -> Option<f32> {
     let lower = value.trim().to_ascii_lowercase();
     let chars: Vec<char> = lower.chars().collect();
-    let mut p = MathParser { chars: &chars, pos: 0, font_size: font_size_px };
+    let mut p = MathParser {
+        chars: &chars,
+        pos: 0,
+        font_size: font_size_px,
+    };
     p.skip_ws();
     let v = p.parse_expr()?;
     p.skip_ws();
@@ -4952,7 +5294,10 @@ fn parse_length_fs(val: &str, font_size: f32) -> Option<f32> {
     if v.ends_with('%') {
         return None; // percentages unsupported for now
     }
-    let num = |suffix: &str| v.strip_suffix(suffix).and_then(|n| n.trim().parse::<f32>().ok());
+    let num = |suffix: &str| {
+        v.strip_suffix(suffix)
+            .and_then(|n| n.trim().parse::<f32>().ok())
+    };
     if let Some(px) = num("px") {
         Some(px)
     } else if let Some(pt) = num("pt") {
@@ -4997,7 +5342,10 @@ fn parse_inset_value(val: &str, font_size: f32) -> InsetValue {
         return InsetValue::Auto;
     }
     // Plain percentage: `10%`.
-    if let Some(p) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+    if let Some(p) = v
+        .strip_suffix('%')
+        .and_then(|n| n.trim().parse::<f32>().ok())
+    {
         return InsetValue::Percent(p);
     }
     // calc() / math functions that mention a percentage: split into percentage + length terms.
@@ -5115,7 +5463,12 @@ fn parse_margin_shorthand(val: &str, font_size: f32) -> (Edges, [bool; 4]) {
         _ => (v[0], v[1], v[2], v[3]),
     };
     (
-        Edges { top: t.0, right: r.0, bottom: b.0, left: l.0 },
+        Edges {
+            top: t.0,
+            right: r.0,
+            bottom: b.0,
+            left: l.0,
+        },
         [t.1, r.1, b.1, l.1],
     )
 }
@@ -5130,7 +5483,12 @@ fn parse_edges_shorthand(val: &str, font_size: f32) -> Option<Edges> {
         .collect();
     match parts.len() {
         1 => Some(Edges::all(parts[0])),
-        2 => Some(Edges { top: parts[0], bottom: parts[0], right: parts[1], left: parts[1] }),
+        2 => Some(Edges {
+            top: parts[0],
+            bottom: parts[0],
+            right: parts[1],
+            left: parts[1],
+        }),
         3 => Some(Edges {
             top: parts[0],
             right: parts[1],
@@ -5185,7 +5543,11 @@ fn apply_border_shorthand(
             }
         }
     }
-    let w = if saw_none && width.is_none() { Some(0.0) } else { width };
+    let w = if saw_none && width.is_none() {
+        Some(0.0)
+    } else {
+        width
+    };
     if let Some(w) = w {
         match side {
             EdgeSide::Top => style.border.top = w,
@@ -5225,7 +5587,10 @@ fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
         // `em` in a font-size resolves against the parent font size.
         return eval_length(&v, parent_px).filter(|n| *n > 0.0);
     }
-    let num = |suffix: &str| v.strip_suffix(suffix).and_then(|n| n.trim().parse::<f32>().ok());
+    let num = |suffix: &str| {
+        v.strip_suffix(suffix)
+            .and_then(|n| n.trim().parse::<f32>().ok())
+    };
     if let Some(px) = num("px") {
         Some(px)
     } else if let Some(pt) = num("pt") {
@@ -5297,9 +5662,30 @@ fn parse_rgba_ctx(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) -> 
     let v = val.trim();
     let lower = v.to_ascii_lowercase();
     match lower.as_str() {
-        "currentcolor" => return Some(Rgba { r: current.0, g: current.1, b: current.2, a: 255 }),
-        "inherit" => return Some(Rgba { r: inherited.0, g: inherited.1, b: inherited.2, a: 255 }),
-        "transparent" => return Some(Rgba { r: 0, g: 0, b: 0, a: 0 }),
+        "currentcolor" => {
+            return Some(Rgba {
+                r: current.0,
+                g: current.1,
+                b: current.2,
+                a: 255,
+            })
+        }
+        "inherit" => {
+            return Some(Rgba {
+                r: inherited.0,
+                g: inherited.1,
+                b: inherited.2,
+                a: 255,
+            })
+        }
+        "transparent" => {
+            return Some(Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            })
+        }
         "initial" | "unset" | "none" | "revert" => return None,
         _ => {}
     }
@@ -5465,7 +5851,9 @@ fn parse_number(tok: &str) -> Option<f32> {
 /// Parse a value that may be a percentage (`50%` → 0.5) or a unitless number used as-is.
 /// Parse a bare `<percentage>` token (`"50%"` → `Some(50.0)`); `None` for anything else.
 fn parse_percent(val: &str) -> Option<f32> {
-    val.trim().strip_suffix('%').and_then(|p| p.trim().parse::<f32>().ok())
+    val.trim()
+        .strip_suffix('%')
+        .and_then(|p| p.trim().parse::<f32>().ok())
 }
 
 fn parse_percent_or_unit(tok: &str) -> Option<f32> {
@@ -5519,11 +5907,7 @@ fn oklab_to_srgb(l: f32, a: f32, b: f32) -> (u8, u8, u8) {
     let lg = -1.268_438 * lc + 2.609_757_4 * mc - 0.341_319_38 * sc;
     let lb = -0.004_196_086 * lc - 0.703_418_6 * mc + 1.707_614_7 * sc;
 
-    (
-        srgb_encode(lr),
-        srgb_encode(lg),
-        srgb_encode(lb),
-    )
+    (srgb_encode(lr), srgb_encode(lg), srgb_encode(lb))
 }
 
 /// Linear sRGB component (0..1, may be out of range) → gamma-encoded 8-bit, clamped.
@@ -5696,7 +6080,7 @@ enum Pseudo {
     Enabled,
     Required,
     Optional,
-    Link,    // <a href> (also :any-link / :visited→never matches, see parse)
+    Link, // <a href> (also :any-link / :visited→never matches, see parse)
     // State (interaction)
     Hover,
     Focus,
@@ -5843,7 +6227,11 @@ impl Spec {
         self.c += o.c;
     }
     fn max_with(self, o: Spec) -> Spec {
-        if (self.a, self.b, self.c) >= (o.a, o.b, o.c) { self } else { o }
+        if (self.a, self.b, self.c) >= (o.a, o.b, o.c) {
+            self
+        } else {
+            o
+        }
     }
 }
 
@@ -5866,7 +6254,12 @@ fn compile_selector(sel: &str) -> Option<Compiled> {
         BucketKey::Universal
     };
     let pseudo_element = selector.pseudo_element.clone();
-    Some(Compiled { selector, key, specificity, pseudo_element })
+    Some(Compiled {
+        selector,
+        key,
+        specificity,
+        pseudo_element,
+    })
 }
 
 /// Parse a complex selector into rightmost-first `(Combinator, Compound)` parts, computing its
@@ -5890,12 +6283,13 @@ fn parse_complex(sel: &str) -> Option<ComplexSelector> {
     let n = chars.len();
     // Flush the current compound text, tagged with the pending combinator; reset pending to the
     // "no combinator seen yet" sentinel for the next compound.
-    let flush = |cur: &mut String, pending: &mut Combinator, parts: &mut Vec<(Combinator, String)>| {
-        if !cur.is_empty() {
-            parts.push((*pending, std::mem::take(cur)));
-            *pending = Combinator::Subject; // sentinel; overwritten before next flush
-        }
-    };
+    let flush =
+        |cur: &mut String, pending: &mut Combinator, parts: &mut Vec<(Combinator, String)>| {
+            if !cur.is_empty() {
+                parts.push((*pending, std::mem::take(cur)));
+                *pending = Combinator::Subject; // sentinel; overwritten before next flush
+            }
+        };
     while i < n {
         let c = chars[i];
         if let Some(q) = quote {
@@ -5992,7 +6386,11 @@ fn parse_complex(sel: &str) -> Option<ComplexSelector> {
         spec.add(cspec);
         out.push((right_link[i], compound));
     }
-    Some(ComplexSelector { parts: out, specificity: spec.pack(), pseudo_element })
+    Some(ComplexSelector {
+        parts: out,
+        specificity: spec.pack(),
+        pseudo_element,
+    })
 }
 
 /// Parse a single compound selector (`type.class#id[attr]:pseudo`...). Returns the compound and
@@ -6042,7 +6440,7 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)>
             };
         }
         i += 1; // consume the `|`
-        // Now read the type / universal that follows the namespace prefix.
+                // Now read the type / universal that follows the namespace prefix.
         if i < n && chars[i] == '*' {
             i += 1; // universal within this namespace
         } else if i < n && !matches!(chars[i], '.' | '#' | '[' | ':') {
@@ -6059,7 +6457,13 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)>
         } else {
             return None; // `ns|` with no type/universal is invalid
         }
-    } else if i < n && chars[i] != '.' && chars[i] != '#' && chars[i] != '[' && chars[i] != ':' && chars[i] != '*' {
+    } else if i < n
+        && chars[i] != '.'
+        && chars[i] != '#'
+        && chars[i] != '['
+        && chars[i] != ':'
+        && chars[i] != '*'
+    {
         let start = i;
         while i < n && !matches!(chars[i], '.' | '#' | '[' | ':' | '*') {
             i += 1;
@@ -6174,14 +6578,18 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)>
                 // `::before` / `:before` and `::after` / `:after` are the box-generating pseudos.
                 // Single-colon is legacy CSS2 syntax, valid only for the four original pseudo-
                 // elements; every other pseudo-element requires double-colon.
-                let legacy_single = matches!(pe_name_l.as_str(), "before" | "after" | "first-line" | "first-letter");
+                let legacy_single = matches!(
+                    pe_name_l.as_str(),
+                    "before" | "after" | "first-line" | "first-letter"
+                );
                 let known_pe = if !double_colon && !legacy_single {
                     None
                 } else {
                     match pe_name_l.as_str() {
                         "before" if pe_arg.is_none() => Some(PseudoElement::Before),
                         "after" if pe_arg.is_none() => Some(PseudoElement::After),
-                        _ => pseudo_element_key(&pe_name_l, pe_arg.as_deref()).map(PseudoElement::Other),
+                        _ => pseudo_element_key(&pe_name_l, pe_arg.as_deref())
+                            .map(PseudoElement::Other),
                     }
                 };
                 if let Some(pe) = known_pe {
@@ -6294,7 +6702,7 @@ fn pseudo_element_key(name: &str, arg: Option<&str>) -> Option<String> {
             let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
             let ident = decode_css_ident(trimmed).filter(|s| is_css_ident(s))?;
             // `::picker(...)` only accepts the literal `select` keyword as its argument.
-            if name == "picker" && ident.to_ascii_lowercase() != "select" {
+            if name == "picker" && !ident.eq_ignore_ascii_case("select") {
                 return None;
             }
             Some(format!("{name}({})", ident.to_lowercase()))
@@ -6313,7 +6721,9 @@ fn pseudo_element_key(name: &str, arg: Option<&str>) -> Option<String> {
 /// by a digit), and contains only name characters. Used to validate pseudo-element arguments.
 fn is_css_ident(s: &str) -> bool {
     let mut chars = s.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     let valid_start = |c: char| c.is_ascii_alphabetic() || c == '_' || c == '-' || !c.is_ascii();
     if !valid_start(first) {
         return false;
@@ -6326,7 +6736,8 @@ fn is_css_ident(s: &str) -> bool {
             _ => {}
         }
     }
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
 }
 
 /// Decode a CSS identifier that may contain escapes (`\61`, `\ `, …). Returns `None` if the input
@@ -6453,7 +6864,10 @@ pub fn parse_gcs_pseudo(arg: &str) -> GcsPseudo {
 
     // before/after (both colon forms) and the legacy four (single colon ok); everything else needs
     // double colon.
-    let legacy_single = matches!(name_l.as_str(), "before" | "after" | "first-line" | "first-letter");
+    let legacy_single = matches!(
+        name_l.as_str(),
+        "before" | "after" | "first-line" | "first-letter"
+    );
     if !double && !legacy_single {
         return GcsPseudo::Invalid;
     }
@@ -6517,7 +6931,12 @@ fn parse_attr(inner: &str) -> Option<AttrSel> {
             if name.is_empty() {
                 return None;
             }
-            return Some(AttrSel { name: strip_attr_namespace(&name.to_ascii_lowercase()), op, value, case_insensitive });
+            return Some(AttrSel {
+                name: strip_attr_namespace(&name.to_ascii_lowercase()),
+                op,
+                value,
+                case_insensitive,
+            });
         }
     }
     // No operator → presence test.
@@ -6525,7 +6944,12 @@ fn parse_attr(inner: &str) -> Option<AttrSel> {
     if name.is_empty() {
         return None;
     }
-    Some(AttrSel { name: strip_attr_namespace(&name.to_ascii_lowercase()), op: AttrOp::Exists, value: String::new(), case_insensitive })
+    Some(AttrSel {
+        name: strip_attr_namespace(&name.to_ascii_lowercase()),
+        op: AttrOp::Exists,
+        value: String::new(),
+        case_insensitive,
+    })
 }
 
 /// Strip optional surrounding quotes.
@@ -6571,7 +6995,9 @@ fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spec)> {
         }
         "lang" => {
             let a = arg?.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-            if a.is_empty() { return None; }
+            if a.is_empty() {
+                return None;
+            }
             Pseudo::Lang(a.to_ascii_lowercase())
         }
         "nth-child" => Pseudo::NthChild(parse_nth(arg?)?),
@@ -6580,12 +7006,16 @@ fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spec)> {
         "nth-last-of-type" => Pseudo::NthLastOfType(parse_nth(arg?)?),
         "not" => {
             let list = parse_selector_list(arg?)?;
-            let s = list.iter().fold(Spec::default(), |acc, c| acc.max_with(unpack_spec(c.specificity)));
+            let s = list.iter().fold(Spec::default(), |acc, c| {
+                acc.max_with(unpack_spec(c.specificity))
+            });
             return Some((Pseudo::Not(list), s));
         }
         "is" | "matches" => {
             let list = parse_selector_list(arg?)?;
-            let s = list.iter().fold(Spec::default(), |acc, c| acc.max_with(unpack_spec(c.specificity)));
+            let s = list.iter().fold(Spec::default(), |acc, c| {
+                acc.max_with(unpack_spec(c.specificity))
+            });
             return Some((Pseudo::Is(list), s));
         }
         "where" => {
@@ -6602,7 +7032,11 @@ fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spec)> {
 
 /// Unpack a packed specificity back to components (for `:is`/`:not` "most specific arg").
 fn unpack_spec(packed: u32) -> Spec {
-    Spec { a: packed / 10000, b: (packed / 100) % 100, c: packed % 100 }
+    Spec {
+        a: packed / 10000,
+        b: (packed / 100) % 100,
+        c: packed % 100,
+    }
 }
 
 /// Parse a comma-separated selector list (the argument of `:is/:where/:not`).
@@ -6670,7 +7104,12 @@ fn split_selector_list(s: &str) -> Vec<String> {
 
 /// Parse an `An+B` micro-syntax (`odd`, `even`, `3`, `2n`, `2n+1`, `-n+3`, `n`).
 fn parse_nth(arg: &str) -> Option<NthArg> {
-    let s: String = arg.trim().to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let s: String = arg
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     if s == "odd" {
         return Some(NthArg { a: 2, b: 1 });
     }
@@ -6694,7 +7133,10 @@ fn parse_nth(arg: &str) -> Option<NthArg> {
         Some(NthArg { a, b })
     } else {
         // Plain integer B.
-        Some(NthArg { a: 0, b: s.parse::<i32>().ok()? })
+        Some(NthArg {
+            a: 0,
+            b: s.parse::<i32>().ok()?,
+        })
     }
 }
 
@@ -6734,15 +7176,28 @@ fn prev_element_sibling(doc: &dom::Document, id: dom::NodeId) -> Option<dom::Nod
     let parent = parent_of(doc, id)?;
     let kids = &doc.get(parent).children;
     let pos = kids.iter().position(|&c| c == id)?;
-    kids[..pos].iter().rev().copied().find(|&c| el_of(doc, c).is_some())
+    kids[..pos]
+        .iter()
+        .rev()
+        .copied()
+        .find(|&c| el_of(doc, c).is_some())
 }
 
 /// All preceding element siblings of `id`, nearest-first.
 fn prev_element_siblings(doc: &dom::Document, id: dom::NodeId) -> Vec<dom::NodeId> {
-    let Some(parent) = parent_of(doc, id) else { return Vec::new() };
+    let Some(parent) = parent_of(doc, id) else {
+        return Vec::new();
+    };
     let kids = &doc.get(parent).children;
-    let Some(pos) = kids.iter().position(|&c| c == id) else { return Vec::new() };
-    kids[..pos].iter().rev().copied().filter(|&c| el_of(doc, c).is_some()).collect()
+    let Some(pos) = kids.iter().position(|&c| c == id) else {
+        return Vec::new();
+    };
+    kids[..pos]
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&c| el_of(doc, c).is_some())
+        .collect()
 }
 
 /// Match a full complex selector against node `id` (right-to-left with backtracking).
@@ -6759,7 +7214,12 @@ fn complex_matches(doc: &dom::Document, id: dom::NodeId, sel: &ComplexSelector) 
 
 /// Match the remaining parts `sel[idx..]` against the tree, given that `sel[idx-1]` matched at
 /// `node`. Each part carries the combinator relating it to the part on its right.
-fn match_from(doc: &dom::Document, node: dom::NodeId, parts: &[(Combinator, Compound)], idx: usize) -> bool {
+fn match_from(
+    doc: &dom::Document,
+    node: dom::NodeId,
+    parts: &[(Combinator, Compound)],
+    idx: usize,
+) -> bool {
     if idx >= parts.len() {
         return true;
     }
@@ -6809,7 +7269,9 @@ fn match_from(doc: &dom::Document, node: dom::NodeId, parts: &[(Combinator, Comp
 
 /// Does node `id` (which must be an element) match a single compound selector?
 fn compound_matches(doc: &dom::Document, id: dom::NodeId, c: &Compound) -> bool {
-    let Some(el) = el_of(doc, id) else { return false };
+    let Some(el) = el_of(doc, id) else {
+        return false;
+    };
     if let Some(t) = &c.type_part {
         if !el.tag.eq_ignore_ascii_case(t) {
             return false;
@@ -6926,19 +7388,37 @@ fn pseudo_matches(doc: &dom::Document, id: dom::NodeId, el: &dom::ElementData, p
     match p {
         Pseudo::Root => el.tag.eq_ignore_ascii_case("html"),
         Pseudo::FirstChild => element_index(doc, id).map(|(i, _)| i == 0).unwrap_or(false),
-        Pseudo::LastChild => element_index(doc, id).map(|(i, t)| i + 1 == t).unwrap_or(false),
+        Pseudo::LastChild => element_index(doc, id)
+            .map(|(i, t)| i + 1 == t)
+            .unwrap_or(false),
         Pseudo::OnlyChild => element_index(doc, id).map(|(_, t)| t == 1).unwrap_or(false),
-        Pseudo::NthChild(n) => element_index(doc, id).map(|(i, _)| n.matches(i as i32 + 1)).unwrap_or(false),
-        Pseudo::NthLastChild(n) => element_index(doc, id).map(|(i, t)| n.matches((t - i) as i32)).unwrap_or(false),
-        Pseudo::FirstOfType => type_index(doc, id, &el.tag).map(|(i, _)| i == 0).unwrap_or(false),
-        Pseudo::LastOfType => type_index(doc, id, &el.tag).map(|(i, t)| i + 1 == t).unwrap_or(false),
-        Pseudo::OnlyOfType => type_index(doc, id, &el.tag).map(|(_, t)| t == 1).unwrap_or(false),
-        Pseudo::NthOfType(n) => type_index(doc, id, &el.tag).map(|(i, _)| n.matches(i as i32 + 1)).unwrap_or(false),
-        Pseudo::NthLastOfType(n) => type_index(doc, id, &el.tag).map(|(i, t)| n.matches((t - i) as i32)).unwrap_or(false),
+        Pseudo::NthChild(n) => element_index(doc, id)
+            .map(|(i, _)| n.matches(i as i32 + 1))
+            .unwrap_or(false),
+        Pseudo::NthLastChild(n) => element_index(doc, id)
+            .map(|(i, t)| n.matches((t - i) as i32))
+            .unwrap_or(false),
+        Pseudo::FirstOfType => type_index(doc, id, &el.tag)
+            .map(|(i, _)| i == 0)
+            .unwrap_or(false),
+        Pseudo::LastOfType => type_index(doc, id, &el.tag)
+            .map(|(i, t)| i + 1 == t)
+            .unwrap_or(false),
+        Pseudo::OnlyOfType => type_index(doc, id, &el.tag)
+            .map(|(_, t)| t == 1)
+            .unwrap_or(false),
+        Pseudo::NthOfType(n) => type_index(doc, id, &el.tag)
+            .map(|(i, _)| n.matches(i as i32 + 1))
+            .unwrap_or(false),
+        Pseudo::NthLastOfType(n) => type_index(doc, id, &el.tag)
+            .map(|(i, t)| n.matches((t - i) as i32))
+            .unwrap_or(false),
         Pseudo::Empty => is_empty_element(doc, id),
         Pseudo::Checked => {
             (el.tag.eq_ignore_ascii_case("input") || el.tag.eq_ignore_ascii_case("option"))
-                && el.attrs.keys().any(|k| k.eq_ignore_ascii_case("checked") || k.eq_ignore_ascii_case("selected"))
+                && el.attrs.keys().any(|k| {
+                    k.eq_ignore_ascii_case("checked") || k.eq_ignore_ascii_case("selected")
+                })
         }
         Pseudo::Disabled => is_form_control(&el.tag) && has_attr(el, "disabled"),
         Pseudo::Enabled => is_form_control(&el.tag) && !has_attr(el, "disabled"),
@@ -6947,17 +7427,23 @@ fn pseudo_matches(doc: &dom::Document, id: dom::NodeId, el: &dom::ElementData, p
         Pseudo::Link => el.tag.eq_ignore_ascii_case("a") && has_attr(el, "href"),
         Pseudo::Hover => {
             let h = interaction_hovered();
-            h == Some(id.0) || h.map(|hn| is_ancestor(doc, id, dom::NodeId(hn))).unwrap_or(false)
+            h == Some(id.0)
+                || h.map(|hn| is_ancestor(doc, id, dom::NodeId(hn)))
+                    .unwrap_or(false)
         }
         // `:active` ≈ `:hover` (no separate pressed-state tracking in the engine).
         Pseudo::Active => {
             let h = interaction_hovered();
-            h == Some(id.0) || h.map(|hn| is_ancestor(doc, id, dom::NodeId(hn))).unwrap_or(false)
+            h == Some(id.0)
+                || h.map(|hn| is_ancestor(doc, id, dom::NodeId(hn)))
+                    .unwrap_or(false)
         }
         Pseudo::Focus | Pseudo::FocusVisible => interaction_focused() == Some(id.0),
         Pseudo::FocusWithin => {
             let f = interaction_focused();
-            f == Some(id.0) || f.map(|fn_| is_ancestor(doc, id, dom::NodeId(fn_))).unwrap_or(false)
+            f == Some(id.0)
+                || f.map(|fn_| is_ancestor(doc, id, dom::NodeId(fn_)))
+                    .unwrap_or(false)
         }
         Pseudo::Lang(want) => element_lang(doc, id)
             .map(|l| {
@@ -7023,7 +7509,11 @@ fn is_ancestor(doc: &dom::Document, ancestor: dom::NodeId, descendant: dom::Node
 fn element_index(doc: &dom::Document, id: dom::NodeId) -> Option<(usize, usize)> {
     let parent = parent_of(doc, id)?;
     let kids = &doc.get(parent).children;
-    let elems: Vec<dom::NodeId> = kids.iter().copied().filter(|&c| el_of(doc, c).is_some()).collect();
+    let elems: Vec<dom::NodeId> = kids
+        .iter()
+        .copied()
+        .filter(|&c| el_of(doc, c).is_some())
+        .collect();
     let pos = elems.iter().position(|&c| c == id)?;
     Some((pos, elems.len()))
 }
@@ -7035,7 +7525,11 @@ fn type_index(doc: &dom::Document, id: dom::NodeId, tag: &str) -> Option<(usize,
     let same: Vec<dom::NodeId> = kids
         .iter()
         .copied()
-        .filter(|&c| el_of(doc, c).map(|e| e.tag.eq_ignore_ascii_case(tag)).unwrap_or(false))
+        .filter(|&c| {
+            el_of(doc, c)
+                .map(|e| e.tag.eq_ignore_ascii_case(tag))
+                .unwrap_or(false)
+        })
         .collect();
     let pos = same.iter().position(|&c| c == id)?;
     Some((pos, same.len()))
@@ -7194,8 +7688,24 @@ mod tests {
                 assert_eq!(stops.len(), 2);
                 assert!((stops[0].pos - 0.0).abs() < 1e-6);
                 assert!((stops[1].pos - 1.0).abs() < 1e-6);
-                assert_eq!(stops[0].color, Rgba { r: 255, g: 0, b: 0, a: 255 });
-                assert_eq!(stops[1].color, Rgba { r: 0, g: 0, b: 255, a: 255 });
+                assert_eq!(
+                    stops[0].color,
+                    Rgba {
+                        r: 255,
+                        g: 0,
+                        b: 0,
+                        a: 255
+                    }
+                );
+                assert_eq!(
+                    stops[1].color,
+                    Rgba {
+                        r: 0,
+                        g: 0,
+                        b: 255,
+                        a: 255
+                    }
+                );
             }
             _ => panic!("expected linear"),
         }
@@ -7207,7 +7717,15 @@ mod tests {
             Gradient::Linear { angle_deg, stops } => {
                 assert_eq!(angle_deg, 90.0); // to right == 90deg
                 assert_eq!(stops.len(), 2);
-                assert_eq!(stops[0].color, Rgba { r: 255, g: 255, b: 255, a: 255 });
+                assert_eq!(
+                    stops[0].color,
+                    Rgba {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 255
+                    }
+                );
                 assert!((stops[0].pos - 0.0).abs() < 1e-6);
                 assert!((stops[1].pos - 1.0).abs() < 1e-6);
             }
@@ -7233,7 +7751,15 @@ mod tests {
         match grad("radial-gradient(red, blue)") {
             Gradient::Radial { stops } => {
                 assert_eq!(stops.len(), 2);
-                assert_eq!(stops[0].color, Rgba { r: 255, g: 0, b: 0, a: 255 });
+                assert_eq!(
+                    stops[0].color,
+                    Rgba {
+                        r: 255,
+                        g: 0,
+                        b: 0,
+                        a: 255
+                    }
+                );
             }
             _ => panic!("expected radial"),
         }
@@ -7241,7 +7767,10 @@ mod tests {
 
     #[test]
     fn repeating_linear_treated_as_linear() {
-        assert!(matches!(grad("repeating-linear-gradient(0deg, red, blue)"), Gradient::Linear { .. }));
+        assert!(matches!(
+            grad("repeating-linear-gradient(0deg, red, blue)"),
+            Gradient::Linear { .. }
+        ));
     }
 
     #[test]
@@ -7261,7 +7790,15 @@ mod tests {
         let s = parse_box_shadows("2px 2px 4px black, 0 0 10px red", (0, 0, 0), (0, 0, 0));
         assert_eq!(s.len(), 2);
         assert_eq!(s[1].blur, 10.0);
-        assert_eq!(s[1].color, Rgba { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(
+            s[1].color,
+            Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
     }
 
     #[test]
@@ -7370,10 +7907,15 @@ mod tests {
             "@property --reg { syntax: \"<length>\"; inherits: false; initial-value: 7px; }",
         );
         let map = cascade(&doc, std::slice::from_ref(&sheet));
-        let div = elem(&doc, |e| e.attrs.get("id").map(|s| s == "t").unwrap_or(false));
+        let div = elem(&doc, |e| {
+            e.attrs.get("id").map(|s| s == "t").unwrap_or(false)
+        });
         // The registered property's initial value is present in the element's custom-prop env even
         // though it was never explicitly set.
-        assert_eq!(map[&div].custom_props.get("--reg").map(String::as_str), Some("7px"));
+        assert_eq!(
+            map[&div].custom_props.get("--reg").map(String::as_str),
+            Some("7px")
+        );
     }
 
     #[test]
@@ -7409,7 +7951,10 @@ mod tests {
         let map = cascade(&doc, &[]);
         let h1 = elem(&doc, |e| e.tag == "h1");
         let mt = map[&h1].margin.top;
-        assert!((mt - 0.67 * 32.0).abs() < 0.01, "h1 margin-top {mt} should be 0.67em of 32px");
+        assert!(
+            (mt - 0.67 * 32.0).abs() < 0.01,
+            "h1 margin-top {mt} should be 0.67em of 32px"
+        );
     }
 
     #[test]
@@ -7434,8 +7979,15 @@ mod tests {
         let map = cascade(&doc, &[]);
         let hr = elem(&doc, |e| e.tag == "hr");
         let s = &map[&hr];
-        assert_eq!(s.height, Some(1.0), "hr should have a 1px height so it paints");
-        assert!(s.background_color.is_some(), "hr should have a visible background fill");
+        assert_eq!(
+            s.height,
+            Some(1.0),
+            "hr should have a 1px height so it paints"
+        );
+        assert!(
+            s.background_color.is_some(),
+            "hr should have a visible background fill"
+        );
     }
 
     #[test]
@@ -7447,22 +7999,35 @@ mod tests {
              :lang(zh-CN) { background-color: #020202 }
              :lang(tr) { font-size: 99px }",
         );
-        let doc = html::parse(
-            r#"<html><body><div lang="zh-CN"><span>x</span></div></body></html>"#,
-        );
+        let doc =
+            html::parse(r#"<html><body><div lang="zh-CN"><span>x</span></div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let span = elem(&doc, |e| e.tag == "span");
         // Inherited lang from the ancestor div: :lang(zh) and :lang(zh-CN) match (color/bg set),
         // :lang(tr) does not (font-size stays the inherited default, not 99px).
-        assert_eq!(map[&span].color, (1, 1, 1), "span :lang(zh) should set color");
-        assert_eq!(map[&span].background_color, Some((2, 2, 2)), "span :lang(zh-CN) should set bg");
-        assert!((map[&span].font_size - 99.0).abs() > 0.5, ":lang(tr) must not match");
+        assert_eq!(
+            map[&span].color,
+            (1, 1, 1),
+            "span :lang(zh) should set color"
+        );
+        assert_eq!(
+            map[&span].background_color,
+            Some((2, 2, 2)),
+            "span :lang(zh-CN) should set bg"
+        );
+        assert!(
+            (map[&span].font_size - 99.0).abs() > 0.5,
+            ":lang(tr) must not match"
+        );
     }
 
     #[test]
     fn font_family_serializes_with_canonical_quoting() {
         // Generic families/CSS-wide keywords stay quoted; valid ident sequences unquote.
-        assert_eq!(serialize_font_family("'Times New Roman'"), "Times New Roman");
+        assert_eq!(
+            serialize_font_family("'Times New Roman'"),
+            "Times New Roman"
+        );
         assert_eq!(serialize_font_family("\"serif\""), "\"serif\"");
         assert_eq!(serialize_font_family("'34J'"), "\"34J\"");
         assert_eq!(serialize_font_family("'A  B'"), "\"A  B\"");
@@ -7475,7 +8040,8 @@ mod tests {
 
     #[test]
     fn white_space_pre_parses() {
-        let doc = html::parse(r#"<html><body><span style="white-space: pre">x</span></body></html>"#);
+        let doc =
+            html::parse(r#"<html><body><span style="white-space: pre">x</span></body></html>"#);
         let map = cascade(&doc, &[]);
         let span = elem(&doc, |e| e.tag == "span");
         assert_eq!(map[&span].white_space, WhiteSpace::Pre);
@@ -7483,9 +8049,7 @@ mod tests {
 
     #[test]
     fn id_beats_class_beats_type() {
-        let sheet = css::parse(
-            "p { color: red } .c { color: green } #x { color: blue }",
-        );
+        let sheet = css::parse("p { color: red } .c { color: green } #x { color: blue }");
         let doc = html::parse(r#"<html><body><p id="x" class="c">t</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
@@ -7514,9 +8078,8 @@ mod tests {
     #[test]
     fn color_and_font_size_inherit_to_children() {
         let sheet = css::parse("#wrap { color: #ff0000; font-size: 24px }");
-        let doc = html::parse(
-            r#"<html><body><div id="wrap"><span>child</span></div></body></html>"#,
-        );
+        let doc =
+            html::parse(r#"<html><body><div id="wrap"><span>child</span></div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let span = elem(&doc, |e| e.tag == "span");
         assert_eq!(map[&span].color, (255, 0, 0));
@@ -7526,16 +8089,15 @@ mod tests {
     #[test]
     fn display_none_propagates_to_subtree() {
         let sheet = css::parse("#h { display: none }");
-        let doc = html::parse(
-            r#"<html><body><div id="h"><p>hidden</p></div><p>shown</p></body></html>"#,
-        );
+        let doc =
+            html::parse(r#"<html><body><div id="h"><p>hidden</p></div><p>shown</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let hidden_div = elem(&doc, |e| e.id() == Some("h"));
         assert!(map[&hidden_div].display_none);
         // The nested <p> inherits hidden-ness.
         let inner = elem(&doc, |e| {
             e.tag == "p"
-                // the hidden one is the first <p>
+            // the hidden one is the first <p>
         });
         // First matching p in doc order is the hidden one.
         assert!(map[&inner].display_none);
@@ -7544,9 +8106,7 @@ mod tests {
     #[test]
     fn compound_selector_matches() {
         let sheet = css::parse("p.note { color: orange }");
-        let doc = html::parse(
-            r#"<html><body><p class="note">a</p><p>b</p></body></html>"#,
-        );
+        let doc = html::parse(r#"<html><body><p class="note">a</p><p>b</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let note = elem(&doc, |e| e.tag == "p" && e.classes().any(|c| c == "note"));
         assert_eq!(map[&note].color, (255, 165, 0));
@@ -7577,7 +8137,12 @@ mod tests {
         // vertical horizontal
         assert_eq!(
             parse_edges_shorthand("10px 20px", 16.0),
-            Some(Edges { top: 10.0, bottom: 10.0, right: 20.0, left: 20.0 })
+            Some(Edges {
+                top: 10.0,
+                bottom: 10.0,
+                right: 20.0,
+                left: 20.0
+            })
         );
     }
 
@@ -7586,7 +8151,12 @@ mod tests {
         // top right bottom left
         assert_eq!(
             parse_edges_shorthand("1px 2px 3px 4px", 16.0),
-            Some(Edges { top: 1.0, right: 2.0, bottom: 3.0, left: 4.0 })
+            Some(Edges {
+                top: 1.0,
+                right: 2.0,
+                bottom: 3.0,
+                left: 4.0
+            })
         );
     }
 
@@ -7596,15 +8166,21 @@ mod tests {
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
-        assert_eq!(map[&p].margin, Edges { top: 5.0, bottom: 5.0, right: 10.0, left: 10.0 });
+        assert_eq!(
+            map[&p].margin,
+            Edges {
+                top: 5.0,
+                bottom: 5.0,
+                right: 10.0,
+                left: 10.0
+            }
+        );
     }
 
     #[test]
     fn per_side_override_and_specificity() {
         // The longhand override and a higher-specificity rule both apply on top of shorthand.
-        let sheet = css::parse(
-            "p { margin: 4px; margin-left: 12px } .x { margin-top: 20px }",
-        );
+        let sheet = css::parse("p { margin: 4px; margin-left: 12px } .x { margin-top: 20px }");
         let doc = html::parse(r#"<html><body><p class="x">t</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
@@ -7623,7 +8199,12 @@ mod tests {
         let d = elem(&doc, |e| e.tag == "div");
         assert_eq!(
             map[&d].padding,
-            Edges { top: 1.0, right: 2.0, left: 2.0, bottom: 3.0 }
+            Edges {
+                top: 1.0,
+                right: 2.0,
+                left: 2.0,
+                bottom: 3.0
+            }
         );
     }
 
@@ -7676,7 +8257,10 @@ mod tests {
         assert_eq!(th.text_align, TextAlign::Center);
         assert_eq!(th.padding, Edges::all(1.0));
         // getComputedStyle reports the table display string.
-        assert_eq!(map[&elem(&doc, |e| e.tag == "table")].get_property("display"), "table");
+        assert_eq!(
+            map[&elem(&doc, |e| e.tag == "table")].get_property("display"),
+            "table"
+        );
     }
 
     #[test]
@@ -7799,15 +8383,24 @@ mod tests {
     fn grid_placement_parses() {
         assert_eq!(
             parse_grid_placement("1 / 3"),
-            Some(GridPlacement { start: Some(1), end: GridEnd::Line(3) })
+            Some(GridPlacement {
+                start: Some(1),
+                end: GridEnd::Line(3)
+            })
         );
         assert_eq!(
             parse_grid_placement("2 / span 2"),
-            Some(GridPlacement { start: Some(2), end: GridEnd::Span(2) })
+            Some(GridPlacement {
+                start: Some(2),
+                end: GridEnd::Span(2)
+            })
         );
         assert_eq!(
             parse_grid_placement("span 3"),
-            Some(GridPlacement { start: None, end: GridEnd::Span(3) })
+            Some(GridPlacement {
+                start: None,
+                end: GridEnd::Span(3)
+            })
         );
     }
 
@@ -7901,9 +8494,7 @@ mod tests {
     #[test]
     fn inherit_keyword_takes_parent_color() {
         let sheet = css::parse("#wrap { color: #ff0000 } span { color: inherit }");
-        let doc = html::parse(
-            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
-        );
+        let doc = html::parse(r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let span = elem(&doc, |e| e.tag == "span");
         assert_eq!(map[&span].color, (255, 0, 0));
@@ -7921,9 +8512,8 @@ mod tests {
 
     #[test]
     fn media_min_width_above_viewport_does_not_apply() {
-        let sheet = css::parse(
-            "p { color: #ff0000 } @media (min-width: 2000px) { p { color: #00ff00 } }",
-        );
+        let sheet =
+            css::parse("p { color: #ff0000 } @media (min-width: 2000px) { p { color: #00ff00 } }");
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
@@ -7943,14 +8533,22 @@ mod tests {
 
         // Dark: the `dark` rule applies, the `light` rule is dropped.
         set_color_scheme_dark(true);
-        let map = cascade(&doc, &[sheet.clone()]);
+        let map = cascade(&doc, std::slice::from_ref(&sheet));
         let p = elem(&doc, |e| e.tag == "p");
-        assert_eq!(map[&p].color, (1, 2, 3), "dark rule should win in Dark mode");
+        assert_eq!(
+            map[&p].color,
+            (1, 2, 3),
+            "dark rule should win in Dark mode"
+        );
 
         // Light: the `light` rule applies, the `dark` rule is dropped.
         set_color_scheme_dark(false);
         let map = cascade(&doc, &[sheet]);
-        assert_eq!(map[&p].color, (4, 5, 6), "light rule should win in Light mode");
+        assert_eq!(
+            map[&p].color,
+            (4, 5, 6),
+            "light rule should win in Light mode"
+        );
     }
 
     #[test]
@@ -7958,8 +8556,14 @@ mod tests {
         assert_eq!(parse_color_scheme("normal"), Some(ColorScheme::Normal));
         assert_eq!(parse_color_scheme("light"), Some(ColorScheme::Light));
         assert_eq!(parse_color_scheme("dark"), Some(ColorScheme::Dark));
-        assert_eq!(parse_color_scheme("light dark"), Some(ColorScheme::LightDark));
-        assert_eq!(parse_color_scheme("dark light"), Some(ColorScheme::LightDark));
+        assert_eq!(
+            parse_color_scheme("light dark"),
+            Some(ColorScheme::LightDark)
+        );
+        assert_eq!(
+            parse_color_scheme("dark light"),
+            Some(ColorScheme::LightDark)
+        );
         // `only` and unknown idents are ignored.
         assert_eq!(parse_color_scheme("only dark"), Some(ColorScheme::Dark));
         assert_eq!(parse_color_scheme("dark only"), Some(ColorScheme::Dark));
@@ -8018,8 +8622,10 @@ mod tests {
 
     #[test]
     fn color_scheme_get_property_serializes() {
-        let mut s = ComputedStyle::default();
-        s.color_scheme = ColorScheme::LightDark;
+        let mut s = ComputedStyle {
+            color_scheme: ColorScheme::LightDark,
+            ..Default::default()
+        };
         assert_eq!(s.get_property("color-scheme"), "light dark");
         s.color_scheme = ColorScheme::Dark;
         assert_eq!(s.get_property("color-scheme"), "dark");
@@ -8027,9 +8633,8 @@ mod tests {
 
     #[test]
     fn media_max_width_below_viewport_does_not_apply() {
-        let sheet = css::parse(
-            "p { color: #ff0000 } @media (max-width: 600px) { p { color: #00ff00 } }",
-        );
+        let sheet =
+            css::parse("p { color: #ff0000 } @media (max-width: 600px) { p { color: #00ff00 } }");
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
@@ -8106,9 +8711,7 @@ mod tests {
     #[test]
     fn line_height_inherits_resolved_px() {
         let sheet = css::parse("#wrap { font-size: 20px; line-height: 1.5 }");
-        let doc = html::parse(
-            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
-        );
+        let doc = html::parse(r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let wrap = elem(&doc, |e| e.id() == Some("wrap"));
         let span = elem(&doc, |e| e.tag == "span");
@@ -8119,9 +8722,7 @@ mod tests {
     #[test]
     fn text_transform_parses_and_inherits() {
         let sheet = css::parse("#wrap { text-transform: uppercase }");
-        let doc = html::parse(
-            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
-        );
+        let doc = html::parse(r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let wrap = elem(&doc, |e| e.id() == Some("wrap"));
         let span = elem(&doc, |e| e.tag == "span");
@@ -8182,18 +8783,29 @@ mod tests {
         // <mark>: yellow bg, black text.
         assert_eq!(g("mark").background_color, Some((0xff, 0xff, 0x00)));
         assert_eq!(g("mark").color, (0, 0, 0));
-        assert_eq!(g("mark").get_property("background-color"), "rgb(255, 255, 0)");
+        assert_eq!(
+            g("mark").get_property("background-color"),
+            "rgb(255, 255, 0)"
+        );
         // <cite>: italic.
         assert!(g("cite").italic);
         // <abbr title>: underline.
         assert!(g("abbr").underline);
         // <sup>/<sub>: smaller font + vertical-align.
-        assert!(g("sup").font_size < 16.0, "sup should be smaller, got {}", g("sup").font_size);
+        assert!(
+            g("sup").font_size < 16.0,
+            "sup should be smaller, got {}",
+            g("sup").font_size
+        );
         assert_eq!(g("sup").vertical_align, VerticalAlign::Super);
         assert_eq!(g("sub").vertical_align, VerticalAlign::Sub);
         assert_eq!(g("sup").get_property("vertical-align"), "super");
         // <small>: smaller font.
-        assert!(g("small").font_size < 16.0, "small should be smaller, got {}", g("small").font_size);
+        assert!(
+            g("small").font_size < 16.0,
+            "small should be smaller, got {}",
+            g("small").font_size
+        );
     }
 
     #[test]
@@ -8240,9 +8852,7 @@ mod tests {
     #[test]
     fn opacity_does_not_inherit() {
         let sheet = css::parse("#wrap { opacity: 0.5 }");
-        let doc = html::parse(
-            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
-        );
+        let doc = html::parse(r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let span = elem(&doc, |e| e.tag == "span");
         assert_eq!(map[&span].opacity, 1.0);
@@ -8279,7 +8889,10 @@ mod tests {
     #[test]
     fn eval_nested_functions() {
         // calc(1px*100) = 100, clamped to [1rem=16, 50] → 50
-        assert_eq!(eval_length("clamp(1rem, calc(1px * 100), 50px)", 16.0), Some(50.0));
+        assert_eq!(
+            eval_length("clamp(1rem, calc(1px * 100), 50px)", 16.0),
+            Some(50.0)
+        );
         // nested min inside max
         assert_eq!(eval_length("max(min(30px, 10px), 5px)", 16.0), Some(10.0));
     }
@@ -8309,7 +8922,11 @@ mod tests {
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
         // 2vw = 25.6, within [10,30] → 25.6
-        assert!((map[&p].font_size - 25.6).abs() < 0.01, "got {}", map[&p].font_size);
+        assert!(
+            (map[&p].font_size - 25.6).abs() < 0.01,
+            "got {}",
+            map[&p].font_size
+        );
     }
 
     #[test]
@@ -8367,9 +8984,8 @@ mod tests {
     #[test]
     fn box_props_do_not_inherit() {
         let sheet = css::parse("#wrap { margin: 30px; padding: 10px; width: 300px }");
-        let doc = html::parse(
-            r#"<html><body><div id="wrap"><span>child</span></div></body></html>"#,
-        );
+        let doc =
+            html::parse(r#"<html><body><div id="wrap"><span>child</span></div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let span = elem(&doc, |e| e.tag == "span");
         assert_eq!(map[&span].margin, Edges::default());
@@ -8390,8 +9006,7 @@ mod tests {
         let mut out = Vec::new();
         let mut order = 0usize;
         for rule in &ua.rules {
-            if media_applies(rule.media.as_deref())
-                && container_applies(rule.container.as_deref())
+            if media_applies(rule.media.as_deref()) && container_applies(rule.container.as_deref())
             {
                 if let Some(spec) = rule_specificity(&rule.selectors, doc, nid) {
                     out.push((0u8, order, spec));
@@ -8453,8 +9068,10 @@ mod tests {
         for e in &index.universal {
             consider(e);
         }
-        let mut out: Vec<_> =
-            best.into_iter().map(|(order, (origin, spec))| (origin, order, spec)).collect();
+        let mut out: Vec<_> = best
+            .into_iter()
+            .map(|(order, (origin, spec))| (origin, order, spec))
+            .collect();
         out.sort();
         out
     }
@@ -8546,10 +9163,7 @@ mod tests {
         assert!(!span_is_bold(&map, &doc));
     }
 
-    fn span_is_bold(
-        map: &HashMap<dom::NodeId, ComputedStyle>,
-        doc: &dom::Document,
-    ) -> bool {
+    fn span_is_bold(map: &HashMap<dom::NodeId, ComputedStyle>, doc: &dom::Document) -> bool {
         let span = elem(doc, |e| e.tag == "span");
         map[&span].bold
     }
@@ -8660,9 +9274,8 @@ mod tests {
              li:last-child { font-style: italic }
              li:nth-child(odd) { letter-spacing: 3px }",
         );
-        let doc = html::parse(
-            r#"<html><body><ul><li>1</li><li>2</li><li>3</li></ul></body></html>"#,
-        );
+        let doc =
+            html::parse(r#"<html><body><ul><li>1</li><li>2</li><li>3</li></ul></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let li1 = elem_nth(&doc, 0, |e| e.tag == "li");
         let li2 = elem_nth(&doc, 1, |e| e.tag == "li");
@@ -8777,12 +9390,12 @@ mod tests {
 
         // Hover the inner span: `.btn:hover` should match the ancestor `.btn` too.
         set_interaction_state(Some(label.0), None);
-        let map = cascade(&doc, &[sheet.clone()]);
+        let map = cascade(&doc, std::slice::from_ref(&sheet));
         assert_eq!(map[&btn].color, red());
 
         // Focus the field.
         set_interaction_state(None, Some(field.0));
-        let map = cascade(&doc, &[sheet.clone()]);
+        let map = cascade(&doc, std::slice::from_ref(&sheet));
         assert!(map[&field].bold);
 
         // Clear state: neither matches.
@@ -8870,7 +9483,7 @@ mod tests {
         let p = elem(&doc, |e| e.tag == "p");
         assert_eq!(map[&p].color, (0, 0, 255)); // only `p { blue }` applied to the element
         assert!(map[&p].before.is_none()); // no `content` → no generated box
-        // The compile step now KEEPS pseudo-elements (routing them to ::before/::after).
+                                           // The compile step now KEEPS pseudo-elements (routing them to ::before/::after).
         assert_eq!(
             compile_selector("p::before").unwrap().pseudo_element,
             Some(PseudoElement::Before)
@@ -8911,12 +9524,13 @@ mod tests {
     #[test]
     fn pseudo_element_content_attr() {
         let sheet = css::parse("div::before { content: attr(data-label) }");
-        let doc = html::parse(
-            r#"<html><body><div data-label="Note">x</div></body></html>"#,
-        );
+        let doc = html::parse(r#"<html><body><div data-label="Note">x</div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let d = elem(&doc, |e| e.tag == "div");
-        assert_eq!(map[&d].before.as_ref().unwrap().content.as_deref(), Some("Note"));
+        assert_eq!(
+            map[&d].before.as_ref().unwrap().content.as_deref(),
+            Some("Note")
+        );
     }
 
     #[test]
@@ -8940,7 +9554,10 @@ mod tests {
         let doc = html::parse(r#"<html><body><div>d</div></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let d = elem(&doc, |e| e.tag == "div");
-        assert_eq!(map[&d].before.as_ref().unwrap().content.as_deref(), Some("L"));
+        assert_eq!(
+            map[&d].before.as_ref().unwrap().content.as_deref(),
+            Some("L")
+        );
     }
 
     #[test]
@@ -8953,7 +9570,10 @@ mod tests {
         let map = cascade(&doc, &[sheet]);
         let d = elem(&doc, |e| e.tag == "div");
         // `.x::before` (class) wins over `div::before` (type) → "b".
-        assert_eq!(map[&d].before.as_ref().unwrap().content.as_deref(), Some("b"));
+        assert_eq!(
+            map[&d].before.as_ref().unwrap().content.as_deref(),
+            Some("b")
+        );
     }
 
     #[test]
@@ -8969,9 +9589,18 @@ mod tests {
         assert_eq!(parse_gcs_pseudo("::after"), Pseudo("after".into()));
         assert_eq!(parse_gcs_pseudo("::marker"), Pseudo("marker".into()));
         // Functional pseudos.
-        assert_eq!(parse_gcs_pseudo("::highlight(name)"), Pseudo("highlight(name)".into()));
-        assert_eq!(parse_gcs_pseudo("::highlight( name "), Pseudo("highlight(name)".into())); // auto-closed
-        assert_eq!(parse_gcs_pseudo("::picker(select)"), Pseudo("picker(select)".into()));
+        assert_eq!(
+            parse_gcs_pseudo("::highlight(name)"),
+            Pseudo("highlight(name)".into())
+        );
+        assert_eq!(
+            parse_gcs_pseudo("::highlight( name "),
+            Pseudo("highlight(name)".into())
+        ); // auto-closed
+        assert_eq!(
+            parse_gcs_pseudo("::picker(select)"),
+            Pseudo("picker(select)".into())
+        );
         // CSS escapes resolve.
         assert_eq!(parse_gcs_pseudo(r":bef\oRE"), Pseudo("before".into()));
         // Invalid forms → empty style.
@@ -8995,15 +9624,17 @@ mod tests {
                #x::highlight(foo) { color: rgb(0, 128, 0) }"#,
         );
         let doc = html::parse(r#"<html><body><div id="x">d</div></body></html>"#);
-        let map = cascade(&doc, &[sheet.clone()]);
+        let map = cascade(&doc, std::slice::from_ref(&sheet));
         let x = elem(&doc, |e| e.tag == "div");
         let es = &map[&x];
         // ::before: cascaded color + content.
-        let before = compute_pseudo_style(&doc, &[sheet.clone()], x, es, "before").unwrap();
+        let before =
+            compute_pseudo_style(&doc, std::slice::from_ref(&sheet), x, es, "before").unwrap();
         assert_eq!(before.get_property("color"), "rgb(255, 0, 0)");
         assert_eq!(before.get_property("content"), "\"x\"");
         // ::highlight(foo): a named-highlight rule cascades onto the pseudo.
-        let hi = compute_pseudo_style(&doc, &[sheet.clone()], x, es, "highlight(foo)").unwrap();
+        let hi = compute_pseudo_style(&doc, std::slice::from_ref(&sheet), x, es, "highlight(foo)")
+            .unwrap();
         assert_eq!(hi.get_property("color"), "rgb(0, 128, 0)");
         // A pseudo with no matching rules still yields a (non-empty) style inheriting from the el.
         let marker = compute_pseudo_style(&doc, &[sheet], x, es, "marker").unwrap();
@@ -9017,9 +9648,7 @@ mod tests {
             ":root { letter-spacing: 5px }
              p:empty { color: red }",
         );
-        let doc = html::parse(
-            r#"<html><body><p></p><p>full</p></body></html>"#,
-        );
+        let doc = html::parse(r#"<html><body><p></p><p>full</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let html_el = elem(&doc, |e| e.tag == "html");
         assert_eq!(map[&html_el].letter_spacing, 5.0);
@@ -9082,7 +9711,11 @@ mod tests {
     // --- get_property (getComputedStyle string serialization) ----------------------------------
 
     /// Cascade a doc + sheet and return the computed style for the first element matching `pred`.
-    fn cs_of(html_src: &str, sheet_src: &str, pred: impl Fn(&dom::ElementData) -> bool) -> ComputedStyle {
+    fn cs_of(
+        html_src: &str,
+        sheet_src: &str,
+        pred: impl Fn(&dom::ElementData) -> bool,
+    ) -> ComputedStyle {
         let sheet = css::parse(sheet_src);
         let doc = html::parse(html_src);
         let map = cascade(&doc, &[sheet]);
@@ -9092,33 +9725,59 @@ mod tests {
 
     #[test]
     fn get_property_display_block_inline_flex_none() {
-        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
+            e.tag == "div"
+        });
         assert_eq!(cs.get_property("display"), "block");
-        let cs = cs_of("<html><body><span></span></body></html>", "", |e| e.tag == "span");
+        let cs = cs_of("<html><body><span></span></body></html>", "", |e| {
+            e.tag == "span"
+        });
         assert_eq!(cs.get_property("display"), "inline");
-        let cs = cs_of("<html><body><div class='x'></div></body></html>", ".x{display:flex}", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div class='x'></div></body></html>",
+            ".x{display:flex}",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("display"), "flex");
-        let cs = cs_of("<html><body><div class='x'></div></body></html>", ".x{display:none}", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div class='x'></div></body></html>",
+            ".x{display:none}",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("display"), "none");
     }
 
     #[test]
     fn get_property_color_serializes_rgb() {
-        let cs = cs_of("<html><body><p style='color:red'>t</p></body></html>", "", |e| e.tag == "p");
+        let cs = cs_of(
+            "<html><body><p style='color:red'>t</p></body></html>",
+            "",
+            |e| e.tag == "p",
+        );
         assert_eq!(cs.get_property("color"), "rgb(255, 0, 0)");
     }
 
     #[test]
     fn get_property_background_color_transparent_default() {
-        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
+            e.tag == "div"
+        });
         assert_eq!(cs.get_property("background-color"), "rgba(0, 0, 0, 0)");
-        let cs = cs_of("<html><body><div style='background-color:#00ff00'></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div style='background-color:#00ff00'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("background-color"), "rgb(0, 255, 0)");
     }
 
     #[test]
     fn get_property_font_size_and_weight() {
-        let cs = cs_of("<html><body><p style='font-size:20px;font-weight:bold'>t</p></body></html>", "", |e| e.tag == "p");
+        let cs = cs_of(
+            "<html><body><p style='font-size:20px;font-weight:bold'>t</p></body></html>",
+            "",
+            |e| e.tag == "p",
+        );
         assert_eq!(cs.get_property("font-size"), "20px");
         assert_eq!(cs.get_property("font-weight"), "700");
         let cs = cs_of("<html><body><p>t</p></body></html>", "", |e| e.tag == "p");
@@ -9127,39 +9786,65 @@ mod tests {
 
     #[test]
     fn get_property_position() {
-        let cs = cs_of("<html><body><div style='position:absolute'></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div style='position:absolute'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("position"), "absolute");
-        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
+            e.tag == "div"
+        });
         assert_eq!(cs.get_property("position"), "static");
     }
 
     #[test]
     fn get_property_width_height_auto_or_px() {
-        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
+            e.tag == "div"
+        });
         assert_eq!(cs.get_property("width"), "auto");
-        let cs = cs_of("<html><body><div style='width:100px;height:50px'></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div style='width:100px;height:50px'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("width"), "100px");
         assert_eq!(cs.get_property("height"), "50px");
     }
 
     #[test]
     fn get_property_margin_longhand_and_shorthand() {
-        let cs = cs_of("<html><body><div style='margin:10px 20px 30px 40px'></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div style='margin:10px 20px 30px 40px'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("margin-top"), "10px");
         assert_eq!(cs.get_property("margin-right"), "20px");
         assert_eq!(cs.get_property("margin-bottom"), "30px");
         assert_eq!(cs.get_property("margin-left"), "40px");
         assert_eq!(cs.get_property("margin"), "10px 20px 30px 40px");
-        let cs = cs_of("<html><body><div style='margin:5px'></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div style='margin:5px'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("margin"), "5px");
     }
 
     #[test]
     fn get_property_opacity_and_padding() {
-        let cs = cs_of("<html><body><div style='opacity:0.5;padding:8px'></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of(
+            "<html><body><div style='opacity:0.5;padding:8px'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
         assert_eq!(cs.get_property("opacity"), "0.5");
         assert_eq!(cs.get_property("padding"), "8px");
-        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
+            e.tag == "div"
+        });
         assert_eq!(cs.get_property("opacity"), "1");
     }
 
@@ -9176,7 +9861,9 @@ mod tests {
 
     #[test]
     fn get_property_untracked_returns_empty() {
-        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
+            e.tag == "div"
+        });
         assert_eq!(cs.get_property("visibility"), "");
         assert_eq!(cs.get_property("cursor"), "");
         assert_eq!(cs.get_property("--custom-var"), "");
@@ -9185,7 +9872,9 @@ mod tests {
 
     #[test]
     fn get_property_is_case_insensitive() {
-        let cs = cs_of("<html><body><div></div></body></html>", "", |e| e.tag == "div");
+        let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
+            e.tag == "div"
+        });
         assert_eq!(cs.get_property("DISPLAY"), "block");
         assert_eq!(cs.get_property("Font-Size"), "16px");
     }
@@ -9229,7 +9918,9 @@ mod tests {
     #[test]
     fn pres_table_border_attr_borders_table_and_cells() {
         // <table border="2"> → 2px border on the table AND 1px on each cell.
-        let doc = html::parse(r#"<html><body><table border="2"><tr><td>x</td></tr></table></body></html>"#);
+        let doc = html::parse(
+            r#"<html><body><table border="2"><tr><td>x</td></tr></table></body></html>"#,
+        );
         let map = cascade(&doc, &[]);
         let table = elem(&doc, |e| e.tag == "table");
         let td = elem(&doc, |e| e.tag == "td");
@@ -9355,7 +10046,11 @@ mod tests {
         );
         let m = cs.mask_image.expect("data: mask should parse");
         assert!(m.url.starts_with("data:image/svg+xml,"));
-        assert_eq!(m.size, MaskSize::Stretch, "no size keyword → Stretch (fit-to-box)");
+        assert_eq!(
+            m.size,
+            MaskSize::Stretch,
+            "no size keyword → Stretch (fit-to-box)"
+        );
     }
 
     #[test]
@@ -9412,7 +10107,11 @@ mod tests {
             "td { background-color: blue }",
             |e| e.tag == "td",
         );
-        assert_eq!(cs.background_color, Some((0, 0, 255)), "author CSS should beat bgcolor attr");
+        assert_eq!(
+            cs.background_color,
+            Some((0, 0, 255)),
+            "author CSS should beat bgcolor attr"
+        );
     }
 
     // ------------------------------------------------------------------------------------------
@@ -9430,7 +10129,8 @@ mod tests {
         );
         assert_eq!(cs.resolved_inset(EdgeSide::Top, false, f32::NAN), "auto");
         assert_eq!(cs.resolved_inset(EdgeSide::Left, false, f32::NAN), "10%");
-        assert_eq!(cs.resolved_inset(EdgeSide::Bottom, false, f32::NAN), "10px"); // 1em @ 10px
+        assert_eq!(cs.resolved_inset(EdgeSide::Bottom, false, f32::NAN), "10px");
+        // 1em @ 10px
     }
 
     #[test]
@@ -9472,7 +10172,10 @@ mod tests {
     #[test]
     fn split_importance_strips_keyword() {
         assert_eq!(split_importance("red !important"), ("red", true));
-        assert_eq!(split_importance("rgb(0, 0, 255)!important"), ("rgb(0, 0, 255)", true));
+        assert_eq!(
+            split_importance("rgb(0, 0, 255)!important"),
+            ("rgb(0, 0, 255)", true)
+        );
         assert_eq!(split_importance("10px"), ("10px", false));
     }
 
@@ -9481,7 +10184,12 @@ mod tests {
         assert_eq!(parse_inset_value("auto", 16.0), InsetValue::Auto);
         assert_eq!(parse_inset_value("10%", 16.0), InsetValue::Percent(10.0));
         assert_eq!(parse_inset_value("1em", 10.0), InsetValue::Length(10.0));
-        assert_eq!(parse_inset_value("calc(10% - 1px)", 16.0), InsetValue::Calc { pct: 10.0, px: -1.0 });
+        assert_eq!(
+            parse_inset_value("calc(10% - 1px)", 16.0),
+            InsetValue::Calc {
+                pct: 10.0,
+                px: -1.0
+            }
+        );
     }
 }
-
