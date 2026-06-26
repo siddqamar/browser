@@ -202,6 +202,11 @@ struct HostState {
     /// The page URL (the document's address). Set once at bootstrap. Combined with any `<base href>`
     /// it yields the document base URL, used to resolve relative `url(...)` in inline styles.
     page_url: RefCell<String>,
+    /// Cookie getter: given the page URL, return the current document.cookie string for it.
+    cookie_getter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// Cookie setter: given the page URL and a cookie string (from document.cookie = "..."),
+    /// parse and store it. Returns true on success.
+    cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
 }
 
 impl HostState {
@@ -211,6 +216,13 @@ impl HostState {
         // did, the sends simply fail / the connect errs harmlessly.
         let (tx, _rx) = std::sync::mpsc::channel();
         let (ws_tx, _ws_rx) = std::sync::mpsc::channel();
+        // For no-network paths (unit tests), provide a simple fallback jar so document.cookie
+        // roundtrips keep working with the naive "append name=val" behavior tests expect.
+        // Use Arc<Mutex<...>> so the closures are Send + Sync for HostState.
+        let fallback: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(String::new()));
+        let fb_get = Arc::clone(&fallback);
+        let fb_set = Arc::clone(&fallback);
         Self::with_fetcher(
             doc,
             Rc::new(|_| None),
@@ -218,6 +230,21 @@ impl HostState {
             tx,
             Arc::new(|_, _, _| Err("no WebSocket connector".to_string())),
             ws_tx,
+            Arc::new(move |_| fb_get.lock().map(|g| g.clone()).unwrap_or_default()),
+            Arc::new(move |_, v| {
+                if let Ok(mut s) = fb_set.lock() {
+                    let pair = v.split(';').next().unwrap_or("").trim();
+                    if pair.contains('=') {
+                        if s.is_empty() {
+                            *s = pair.to_string();
+                        } else {
+                            s.push_str("; ");
+                            s.push_str(pair);
+                        }
+                    }
+                }
+                true
+            }),
         )
     }
 
@@ -229,6 +256,8 @@ impl HostState {
         fetch_tx: Sender<FetchCompletion>,
         ws_connector: WsConnector,
         ws_evt_tx: Sender<WsEvent>,
+        cookie_getter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+        cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
     ) -> Rc<Self> {
         Rc::new(HostState {
             doc,
@@ -254,6 +283,8 @@ impl HostState {
             viewport_scroll_y: Cell::new(0.0),
             doc_height: Cell::new(0.0),
             page_url: RefCell::new(String::new()),
+            cookie_getter,
+            cookie_setter,
         })
     }
 
@@ -4200,6 +4231,13 @@ mod tests {
         Arc::new(|_url, _id, _evt| Err("no WebSocket connector".to_string()))
     }
 
+    fn noop_cookie_get() -> Arc<dyn Fn(&str) -> String + Send + Sync> {
+        Arc::new(|_| String::new())
+    }
+    fn noop_cookie_set() -> Arc<dyn Fn(&str, &str) -> bool + Send + Sync> {
+        Arc::new(|_, _| false)
+    }
+
     #[test]
     fn two_module_graph_resolves_named_import() {
         let entry = "https://x/app.js".to_string();
@@ -4220,6 +4258,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4253,6 +4293,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4281,6 +4323,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4314,6 +4358,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         // Must not panic; the entry's evaluation surfaces an error.
         assert!(
@@ -4338,6 +4384,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4382,6 +4430,8 @@ mod tests {
             modules,
             no_fetch(),
             request_fetcher,
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4410,6 +4460,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4454,6 +4506,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4511,6 +4565,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4565,6 +4621,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4616,6 +4674,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4667,6 +4727,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4709,6 +4771,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4744,6 +4808,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4782,6 +4848,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4828,6 +4896,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4867,6 +4937,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4912,6 +4984,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -4964,6 +5038,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5012,6 +5088,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5061,6 +5139,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5116,6 +5196,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5193,6 +5275,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5209,6 +5293,61 @@ mod tests {
             attr("data-reply").as_deref(),
             Some("echo:hi"),
             "cross-frame postMessage round-trip"
+        );
+    }
+
+    #[test]
+    fn window_open_runs_child_and_opener_postmessage_roundtrips() {
+        // window.open() loads a real auxiliary browsing context: the child's script runs, and
+        // cross-window postMessage works both ways with correct `event.source` identity (the child
+        // posts to `opener`; the page posts to the returned window and the child echoes back).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var w = window.open('child.html');
+                window.addEventListener('message', function (e) {
+                  if (e.source === w) { document.body.setAttribute('data-reply', String(e.data)); }
+                });
+                w.postMessage('hi', '*');
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("child.html") {
+                    let body = "<!doctype html><html><body><script>self.addEventListener('message', function (e) { e.source.postMessage('echo:' + e.data, '*'); });<\\/script></body></html>";
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{body}"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-reply").as_deref(),
+            Some("echo:hi"),
+            "window.open postMessage round-trip via opener"
         );
     }
 
@@ -5242,6 +5381,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5301,6 +5442,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5361,6 +5504,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5397,6 +5542,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5444,6 +5591,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         set_cross_origin_isolated(false); // reset the process-global flag for other tests
@@ -5485,6 +5634,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5548,6 +5699,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5598,6 +5751,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5645,6 +5800,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         let elapsed = start.elapsed();
@@ -5691,6 +5848,8 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         let console = all_console(&out);
@@ -5738,6 +5897,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5790,6 +5951,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5838,6 +6001,8 @@ mod tests {
             modules,
             no_fetch(),
             request_fetcher,
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5888,6 +6053,8 @@ mod tests {
             modules,
             no_fetch(),
             request_fetcher,
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5924,6 +6091,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5952,6 +6121,8 @@ mod tests {
             modules,
             no_fetch(),
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -5996,6 +6167,8 @@ mod tests {
             modules,
             fetcher,
             no_request(),
+            noop_cookie_get(),
+            noop_cookie_set(),
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -6199,6 +6372,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
@@ -6225,6 +6400,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
@@ -6272,6 +6449,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
@@ -6300,6 +6479,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
@@ -6326,6 +6507,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(outputs.is_empty() || outputs.iter().all(|o| o.error.is_none()));
@@ -6354,6 +6537,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
@@ -6402,6 +6587,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert!(outputs.iter().all(|o| o.error.is_none()));
@@ -6443,6 +6630,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
@@ -6474,6 +6663,8 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
             None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
