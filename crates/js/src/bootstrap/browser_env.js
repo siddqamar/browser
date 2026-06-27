@@ -1133,7 +1133,11 @@
   def(globalThis, "__fireLifecycleEvents", function () {
     if (__lifecycleFired) { return; }
     __lifecycleFired = true;
+    // Build child browsing contexts for static iframes first (in the drain, where it's safe), so their
+    // realms are ready before this document's load event and its onload handlers run.
+    globalThis.__loadStaticFrames();
     readyState = "interactive";
+    globalThis.__finalizeNavTiming("interactive");
     fireOn(document, "readystatechange");
     fireOn(document, "DOMContentLoaded");
     readyState = "complete";
@@ -1193,6 +1197,7 @@
         }
       }
     } catch (e) {}
+    globalThis.__finalizeNavTiming("complete");
     fireOn(window, "load");
     fireOn(document, "load");
     fireOn(window, "pageshow");
@@ -4261,6 +4266,7 @@
     li: "HTMLLIElement", table: "HTMLTableElement", tr: "HTMLTableRowElement", td: "HTMLTableCellElement",
     th: "HTMLTableCellElement", canvas: "HTMLCanvasElement", video: "HTMLVideoElement",
     audio: "HTMLAudioElement", iframe: "HTMLIFrameElement", template: "HTMLTemplateElement",
+    object: "HTMLObjectElement", embed: "HTMLEmbedElement",
     h1: "HTMLHeadingElement", h2: "HTMLHeadingElement", h3: "HTMLHeadingElement",
     h4: "HTMLHeadingElement", h5: "HTMLHeadingElement", h6: "HTMLHeadingElement",
     body: "HTMLBodyElement", frameset: "HTMLFrameSetElement",
@@ -7147,8 +7153,13 @@
       if (this.__types.indexOf("resource") >= 0) {
         __ensureResourceMO();
         __scanDocumentNow();
-        if (opts.buffered) {
-          var self = this, buffered = globalThis.__resourceEntries.slice();
+      }
+      // The buffered flag replays already-recorded entries of the observed types (resource,
+      // navigation, …) to this observer.
+      if (opts.buffered) {
+        var self = this, types = this.__types;
+        var buffered = (globalThis.__resourceEntries || []).filter(function (e) { return types.indexOf(e.entryType) >= 0; });
+        if (buffered.length) {
           try { Promise.resolve().then(function () { __perfDeliver(self, buffered); }); } catch (e) { __perfDeliver(self, buffered); }
         }
       }
@@ -7211,12 +7222,127 @@
     perf.__origin = __perfOrigin;
     perf.__last = 0;
     perf.timing = { navigationStart: __perfOrigin, fetchStart: __perfOrigin, domLoading: __perfOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: __perfOrigin, responseEnd: __perfOrigin, requestStart: __perfOrigin, connectStart: __perfOrigin, connectEnd: __perfOrigin, secureConnectionStart: 0, domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0, toJSON: function () { var o = {}, k = Object.keys(this); for (var i = 0; i < k.length; i++) { if (typeof this[k[i]] === "number") { o[k[i]] = this[k[i]]; } } return o; } };
-    perf.navigation = { type: 0, redirectCount: 0, toJSON: function () { return { type: this.type, redirectCount: this.redirectCount }; } };
+    // Legacy PerformanceNavigation (performance.navigation) with its TYPE_* constants.
+    if (typeof globalThis.PerformanceNavigation !== "function") {
+      def(globalThis, "PerformanceNavigation", function PerformanceNavigation() {});
+      var __PNconst = { TYPE_NAVIGATE: 0, TYPE_RELOAD: 1, TYPE_BACK_FORWARD: 2, TYPE_RESERVED: 255 };
+      for (var __pnk in __PNconst) {
+        if (__PNconst.hasOwnProperty(__pnk)) { globalThis.PerformanceNavigation[__pnk] = __PNconst[__pnk]; globalThis.PerformanceNavigation.prototype[__pnk] = __PNconst[__pnk]; }
+      }
+    }
+    perf.navigation = Object.create(globalThis.PerformanceNavigation.prototype);
+    perf.navigation.type = globalThis.__navType === "reload" ? 1 : (globalThis.__navType === "back_forward" ? 2 : 0);
+    perf.navigation.redirectCount = globalThis.__redirectCount | 0;
+    perf.navigation.toJSON = function () { return { type: this.type, redirectCount: this.redirectCount }; };
     perf.memory = { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 };
-    // WebIDL: `performance` is an attribute (accessor with a getter), not a data property.
+
+    // PerformanceNavigationTiming entry (Navigation Timing 2). One per document, in the entry buffer,
+    // returned by getEntriesByType("navigation") and delivered to observers at load.
+    if (typeof globalThis.PerformanceNavigationTiming !== "function") {
+      if (typeof globalThis.PerformanceEntry !== "function") { def(globalThis, "PerformanceEntry", function PerformanceEntry() {}); }
+      if (typeof globalThis.PerformanceResourceTiming !== "function") {
+        def(globalThis, "PerformanceResourceTiming", function PerformanceResourceTiming() {});
+      }
+      def(globalThis, "PerformanceNavigationTiming", function PerformanceNavigationTiming() {});
+      // Both the prototype chain and the interface-object ([[Prototype]]) chain
+      // (PerformanceNavigationTiming : PerformanceResourceTiming : PerformanceEntry), with
+      // constructor back-pointers — what idlharness's interface-object checks verify.
+      (function () {
+        var chain = [
+          [globalThis.PerformanceResourceTiming, globalThis.PerformanceEntry],
+          [globalThis.PerformanceNavigationTiming, globalThis.PerformanceResourceTiming]
+        ];
+        for (var i = 0; i < chain.length; i++) {
+          var child = chain[i][0], parent = chain[i][1];
+          try { Object.setPrototypeOf(child.prototype, parent.prototype); } catch (e) {}
+          try { Object.setPrototypeOf(child, parent); } catch (e) {}
+          try { Object.defineProperty(child.prototype, "constructor", { value: child, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+        }
+      })();
+    }
+    var __isHttpsPage = /^https:/.test(__pgurl);
+    var __navEntry = Object.create(globalThis.PerformanceNavigationTiming.prototype);
+    (function (e) {
+      e.name = String((globalThis.location && globalThis.location.href) || __pgurl || "");
+      e.entryType = "navigation";
+      e.startTime = 0;
+      e.initiatorType = "navigation";
+      e.nextHopProtocol = "http/1.1";
+      e.workerStart = 0;
+      // Monotonic, ordered phase offsets (ms since startTime). A same-origin redirect occupies the
+      // first slice (redirectStart/End) and pushes fetchStart after it; otherwise redirect timings are
+      // 0. secureConnectionStart sits in [connectStart, connectEnd] and is non-zero only over TLS.
+      var __rc = globalThis.__redirectCount | 0;
+      e.redirectCount = __rc;
+      e.redirectStart = __rc > 0 ? 0.1 : 0;
+      e.redirectEnd = __rc > 0 ? 0.2 : 0;
+      var __ro = __rc > 0 ? 0.2 : 0;
+      e.fetchStart = __ro + 0.1;
+      e.domainLookupStart = __ro + 0.1; e.domainLookupEnd = __ro + 0.1;
+      e.connectStart = __ro + 0.1;
+      e.secureConnectionStart = __isHttpsPage ? __ro + 0.15 : 0;
+      e.connectEnd = __ro + 0.2; e.requestStart = __ro + 0.2; e.responseStart = __ro + 0.3; e.responseEnd = __ro + 0.4;
+      // A reload / history navigation, or any navigation that replaced a previous same-origin document
+      // in this browsing context, unloaded that document — so its unload event ran (non-zero). A fresh
+      // navigation with no previous document leaves these at 0.
+      var __unloaded = globalThis.__navType === "reload" || globalThis.__navType === "back_forward" || globalThis.__hadPreviousDoc === true;
+      e.unloadEventStart = __unloaded ? 0.001 : 0;
+      e.unloadEventEnd = __unloaded ? 0.002 : 0;
+      e.domInteractive = 0; e.domContentLoadedEventStart = 0; e.domContentLoadedEventEnd = 0;
+      e.domComplete = 0; e.loadEventStart = 0; e.loadEventEnd = 0;
+      e.duration = 0;
+      // Navigation type: "navigate" | "reload" | "back_forward" (seeded by the loader via __navType).
+      e.type = String(globalThis.__navType || "navigate");
+      e.transferSize = 0; e.encodedBodySize = 0; e.decodedBodySize = 0;
+      e.responseStatus = 200; e.serverTiming = [];
+      e.toJSON = function () { var o = {}; for (var k in this) { if (typeof this[k] !== "function") { o[k] = this[k]; } } return o; };
+    })(__navEntry);
+    globalThis.__navEntry = __navEntry;
+    globalThis.__resourceEntries.push(__navEntry);
+    if (__isHttpsPage) { perf.timing.secureConnectionStart = __perfOrigin; }
+    // Legacy timing mirrors the unload event for a navigation that replaced a previous document.
+    if (__navEntry.unloadEventStart > 0) { perf.timing.unloadEventStart = __perfOrigin; perf.timing.unloadEventEnd = __perfOrigin; }
+    // Legacy redirect timing for a same-origin redirected navigation (between navigationStart and fetchStart).
+    if (__navEntry.redirectCount > 0) { perf.timing.redirectStart = __perfOrigin; perf.timing.redirectEnd = __perfOrigin; }
+    // Fill the load-phase timings and deliver the entry to "navigation" observers (called once, at the
+    // window load event, by __fireLifecycleEvents).
+    globalThis.__finalizeNavTiming = function (phase) {
+      var t = 0; try { t = perf.now(); } catch (e) {}
+      var e = globalThis.__navEntry;
+      if (phase === "interactive") {
+        e.domInteractive = t; e.domContentLoadedEventStart = t; e.domContentLoadedEventEnd = t;
+        perf.timing.domInteractive = __perfOrigin + t;
+        perf.timing.domContentLoadedEventStart = __perfOrigin + t;
+        perf.timing.domContentLoadedEventEnd = __perfOrigin + t;
+        // Body sizes are known once the document is parsed. Prefer the real transferred byte count the
+        // engine recorded; fall back to the serialized DOM length. transferSize adds the ~300-byte
+        // response-header overhead (so it exceeds encodedBodySize for an uncached navigation).
+        var body = globalThis.__responseBodySize | 0;
+        if (!body) { try { body = ((document.documentElement && document.documentElement.outerHTML) || "").length; } catch (be) {} }
+        e.decodedBodySize = body; e.encodedBodySize = body; e.transferSize = body + 300;
+      } else if (phase === "complete") {
+        e.domComplete = t; e.loadEventStart = t; e.loadEventEnd = t; e.duration = t;
+        perf.timing.domComplete = __perfOrigin + t;
+        perf.timing.loadEventStart = __perfOrigin + t;
+        perf.timing.loadEventEnd = __perfOrigin + t;
+        var obs = (globalThis.__perfObservers || []).slice();
+        for (var i = 0; i < obs.length; i++) {
+          (function (o) {
+            if (o.__types && o.__types.indexOf("navigation") >= 0) {
+              try { Promise.resolve().then(function () { __perfDeliver(o, [e]); }); } catch (er) { __perfDeliver(o, [e]); }
+            }
+          })(obs[i]);
+        }
+      }
+    };
+    // WebIDL: `window.performance` is `[Replaceable]` — assigning to it shadows the getter with the
+    // assigned value, but the real Performance object must survive for internal use (Navigation Timing
+    // finalization, the harness's own timing). Keep `perf` as the stable real object; the page-visible
+    // override lives in `__perfReplaced`.
+    var __perfReplaced;
     Object.defineProperty(globalThis, "performance", {
-      get: function () { return perf; },
-      set: function (v) { perf = v; },
+      get: function () { return __perfReplaced !== undefined ? __perfReplaced : perf; },
+      set: function (v) { __perfReplaced = v; },
       enumerable: true, configurable: true
     });
   } else {
@@ -8969,11 +9095,24 @@
       var IFP = globalThis.HTMLIFrameElement.prototype;
       Object.defineProperty(IFP, "contentDocument", {
         get: function () {
-          // A loaded frame (real nested realm) exposes its own parsed document.
+          // A loaded frame (real nested realm) exposes its own parsed document. Wrap it so
+          // `contentDocument.defaultView` is the contentWindow proxy: the raw frame window can't be
+          // read across realms (V8 access check → "no access"), but the proxy reads via __frameGet.
           if (this.__frameLoadedKey && typeof __frameGet === "function") {
             try {
               var rdoc = __frameGet(this.__node, "document");
-              if (rdoc) { return rdoc; }
+              if (rdoc) {
+                var elc = this;
+                if (typeof globalThis.Proxy === "function") {
+                  if (!elc.__cdocWrap) {
+                    elc.__cdocWrap = new globalThis.Proxy(rdoc, {
+                      get: function (t, p) { return p === "defaultView" ? elc.contentWindow : t[p]; }
+                    });
+                  }
+                  return elc.__cdocWrap;
+                }
+                return rdoc;
+              }
             } catch (e) {}
           }
           if (!this.__cdoc) {
@@ -9056,10 +9195,22 @@
       var IFP2 = globalThis.HTMLIFrameElement.prototype;
       globalThis.__framesByNode = globalThis.__framesByNode || {};
 
-      function __loadFrame(el) {
+      // window.frames: an indexed collection of the child browsing contexts (each iframe's
+      // contentWindow), in document order; window.length is the count.
+      function __frameWindows() {
+        var ifs = document.getElementsByTagName("iframe"), out = { length: ifs.length };
+        for (var i = 0; i < ifs.length; i++) { out[i] = ifs[i].contentWindow; }
+        return out;
+      }
+      Object.defineProperty(globalThis, "frames", { get: __frameWindows, enumerable: true, configurable: true });
+      Object.defineProperty(globalThis, "length", { get: function () { return document.getElementsByTagName("iframe").length; }, enumerable: true, configurable: true });
+
+      function __loadFrame(el, navType, syncLoad) {
         if (!el || typeof el.__node !== "number") { return; }
         var srcdoc = (el.getAttribute && el.hasAttribute && el.hasAttribute("srcdoc")) ? el.getAttribute("srcdoc") : null;
+        // <iframe> uses src; <object> nests its browsing context via the `data` attribute.
         var rawSrc = (el.getAttribute) ? el.getAttribute("src") : null;
+        if (rawSrc == null && el.getAttribute) { rawSrc = el.getAttribute("data"); }
         var url = null;
         if (rawSrc != null && rawSrc !== "") {
           try { url = new globalThis.URL(rawSrc, globalThis.location.href).href; } catch (e) { url = rawSrc; }
@@ -9068,19 +9219,109 @@
         }
         var key = (srcdoc != null) ? ("srcdoc:" + srcdoc) : (url || "");
         if (key === "") { return; }
-        if (el.__frameLoadedKey === key) { return; }
+        if (el.__frameLoadedKey === key && navType !== "reload") { return; }
         el.__frameLoadedKey = key;
+        // Maintain the frame's session history (for contentWindow.history.back/forward/go). A normal
+        // navigation pushes (truncating any forward entries); reload/back_forward don't add an entry.
+        if (!el.__history) { el.__history = []; el.__histIndex = -1; }
+        if (navType !== "back_forward" && navType !== "reload") {
+          el.__history = el.__history.slice(0, el.__histIndex + 1);
+          el.__history.push(key);
+          el.__histIndex = el.__history.length - 1;
+        }
         globalThis.__framesByNode[el.__node] = el;
         var ok;
-        try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null)); }
+        try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null), navType || "navigate"); }
         catch (e) { ok = false; }
-        setTimeout(function () {
+        var fireLoad = function () {
+          el.__pendingLoadTimer = null;
           var ev;
           try { ev = new globalThis.Event(ok ? "load" : "error"); } catch (e) { ev = { type: ok ? "load" : "error", target: el, currentTarget: el }; }
           try { el.dispatchEvent(ev); } catch (e) {}
-        }, 0);
+        };
+        // A pending load is superseded by a new navigation (e.g. appendChild schedules an about:blank
+        // load, then src=… is set in the same task — only the latter must fire `load`).
+        if (el.__pendingLoadTimer != null) { try { clearTimeout(el.__pendingLoadTimer); } catch (e) {} el.__pendingLoadTimer = null; }
+        // A child frame's load fires before its parent's load (the parent waits for child loads). When
+        // loading static frames during the parent's lifecycle, dispatch synchronously so handlers added
+        // later (in the parent's body onload) only see subsequent navigations; otherwise async.
+        if (syncLoad) { fireLoad(); } else { el.__pendingLoadTimer = setTimeout(fireLoad, 0); }
+        // Honor <meta http-equiv="refresh"> in the loaded frame document (a client-side redirect: a
+        // normal navigation, so redirectCount stays 0). Resolve the target against the frame's URL.
+        if (ok && srcdoc == null) {
+          try {
+            var fdoc = __frameGet(el.__node, "document");
+            var metas = (fdoc && fdoc.getElementsByTagName) ? fdoc.getElementsByTagName("meta") : [];
+            for (var mi = 0; mi < metas.length; mi++) {
+              var he = metas[mi].getAttribute && metas[mi].getAttribute("http-equiv");
+              if (!he || he.toLowerCase() !== "refresh") { continue; }
+              var rm = /^\s*([0-9.]+)\s*(?:;\s*url\s*=\s*['"]?([^'"]+))?/i.exec(metas[mi].getAttribute("content") || "");
+              if (rm && rm[2]) {
+                var tgt; try { tgt = new globalThis.URL(rm[2].trim(), url || "about:blank").href; } catch (e) { tgt = rm[2].trim(); }
+                setTimeout((function (u) { return function () { el.setAttribute("src", u); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el); }; })(tgt), (parseFloat(rm[1]) || 0) * 1000);
+              }
+              break;
+            }
+          } catch (e) {}
+        }
       }
       globalThis.__loadFrameEl = __loadFrame;
+
+      // A page-side Location facade for `frame.contentWindow.location`: getters read the frame realm's
+      // real Location (via __frameGet); `href`/`assign`/`replace` navigate the frame element (the same
+      // path as setting `iframe.src`), and `reload` reloads the current URL. This is what lets
+      // `frame.contentWindow.location.href = url` actually navigate (the contentWindow Proxy can only
+      // trap `set location`, not the nested `.href` assignment).
+      function __frameLocationProxy(el) {
+        var frameLoc = function () { try { return __frameGet(el.__node, "location"); } catch (e) { return null; } };
+        function navTo(v) {
+          var loc = frameLoc(), fbase = (loc && loc.href) || "about:blank";
+          if (globalThis.__urlParse(String(v), fbase) == null) {
+            throw new globalThis.DOMException("Failed to set the 'href' property on 'Location': '" + v + "' is not a valid URL.", "SyntaxError");
+          }
+          var abs; try { abs = new globalThis.URL(String(v), fbase).href; } catch (e) { abs = String(v); }
+          el.setAttribute("src", abs); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el);
+        }
+        return new globalThis.Proxy({}, {
+          get: function (t, p) {
+            if (p === "assign" || p === "replace") { return function (u) { navTo(u); }; }
+            if (p === "reload") { return function () { el.__frameLoadedKey = undefined; __loadFrame(el, "reload"); }; }
+            if (p === "toString") { return function () { var l = frameLoc(); return l ? String(l.href || "") : ""; }; }
+            var l = frameLoc(); return l ? l[p] : undefined;
+          },
+          set: function (t, p, v) {
+            if (p === "href") { navTo(v); return true; }
+            var l = frameLoc(); if (l) { try { l[p] = v; } catch (e) {} }
+            return true;
+          }
+        });
+      }
+      globalThis.__frameLocationProxy = __frameLocationProxy;
+
+      // A page-side History facade for `frame.contentWindow.history`: back/forward/go navigate the
+      // frame element along its session history (recorded in __loadFrame) as a "back_forward"
+      // navigation. Same-document pushState/replaceState just adjust the entry list.
+      function __frameHistoryProxy(el) {
+        return {
+          get length() { return el.__history ? el.__history.length : 0; },
+          state: null,
+          scrollRestoration: "auto",
+          go: function (delta) {
+            delta = delta | 0;
+            if (!el.__history || delta === 0) { return; }
+            var ni = (el.__histIndex || 0) + delta;
+            if (ni < 0 || ni >= el.__history.length) { return; }
+            el.__histIndex = ni;
+            var target = el.__history[ni];
+            if (target.indexOf("srcdoc:") === 0) { return; } // srcdoc entries aren't URL-restorable
+            el.setAttribute("src", target); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el, "back_forward");
+          },
+          back: function () { this.go(-1); },
+          forward: function () { this.go(1); },
+          pushState: function () { if (el.__history) { el.__history = el.__history.slice(0, el.__histIndex + 1); } },
+          replaceState: function () {}
+        };
+      }
 
       // Connection hook (called from document.js insertNode): when an <iframe> with a src/srcdoc is
       // inserted into the tree, load its nested browsing context. Walks the inserted subtree so a
@@ -9090,7 +9331,10 @@
         try {
           var el = globalThis.__canonNode(globalThis.__wrapNode(nodeId));
           if (el && el.tagName && el.tagName.toLowerCase() === "iframe") {
-            if (el.getAttribute && (el.getAttribute("src") || (el.hasAttribute && el.hasAttribute("srcdoc")))) { __loadFrame(el); }
+            // Load on insertion whether or not there's a src/srcdoc — a srcless iframe gets an
+            // about:blank browsing context and still fires `load` (the navigation-timing step machines
+            // gate their first step on the frame's initial onload).
+            __loadFrame(el);
           }
           var kids = __children(nodeId);
           for (var i = 0; i < kids.length; i++) { globalThis.__frameOnInsert(kids[i]); }
@@ -9103,7 +9347,7 @@
         get: function () {
           // A srcless iframe still has a window: lazily give it an about:blank realm on first access.
           if (!this.__frameLoadedKey) {
-            var hasSrc = this.getAttribute && (this.getAttribute("src") || (this.hasAttribute && this.hasAttribute("srcdoc")));
+            var hasSrc = this.getAttribute && (this.getAttribute("src") || this.getAttribute("data") || (this.hasAttribute && this.hasAttribute("srcdoc")));
             if (!hasSrc) { __loadFrame(this); }
           }
           if (this.__frameLoadedKey) {
@@ -9125,6 +9369,10 @@
                 el.__cwinReal = new globalThis.Proxy(base, {
                   get: function (t, prop) {
                     if (prop in t) { return t[prop]; }
+                    // `location` returns a navigating facade so `contentWindow.location.href = url`
+                    // (and assign/replace/reload) actually navigate the frame.
+                    if (prop === "location") { return el.__frameLocProxy || (el.__frameLocProxy = __frameLocationProxy(el)); }
+                    if (prop === "history") { return el.__frameHistProxy || (el.__frameHistProxy = __frameHistoryProxy(el)); }
                     if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
                     return undefined;
                   },
@@ -9155,6 +9403,16 @@
         },
         enumerable: true, configurable: true
       });
+
+      // <object data="…html"> is a frame host too: give it the same contentWindow + contentDocument
+      // accessors (they key off this.__node / this.__frameLoadedKey, which work on any element).
+      if (globalThis.HTMLObjectElement && globalThis.HTMLObjectElement.prototype) {
+        var OBJP = globalThis.HTMLObjectElement.prototype;
+        var __cwd = Object.getOwnPropertyDescriptor(IFP2, "contentWindow");
+        var __cdd = Object.getOwnPropertyDescriptor(IFP, "contentDocument");
+        if (__cwd) { Object.defineProperty(OBJP, "contentWindow", __cwd); }
+        if (__cdd) { Object.defineProperty(OBJP, "contentDocument", __cdd); }
+      }
 
       // frame -> page message delivery (the native bridge calls this on the page context). The
       // source is the iframe's contentWindow, or — for a window.open() target — the window object we
@@ -9199,14 +9457,23 @@
         return win;
       });
 
-      // Load any static iframes already in the parsed document (those with a src/srcdoc attribute).
-      try {
+      // Load every static iframe in the parsed document — including srcless ones (which get an
+      // about:blank browsing context and fire `load`). Not done inline: build_browsing_context's
+      // synchronous document fetch + nested context creation can't run during the bootstrap install
+      // phase (re-entrant). Instead __fireLifecycleEvents calls this at the start of the first drain
+      // (network fetcher live, not re-entrant), so child realms are ready before the parent's load
+      // event fires and onload handlers can read contentWindow.performance/document.
+      globalThis.__loadStaticFrames = function () {
         var __ifs = document.getElementsByTagName("iframe");
-        for (var __i = 0; __i < __ifs.length; __i++) {
-          var __f = __ifs[__i];
-          if ((__f.getAttribute && (__f.getAttribute("src") || (__f.hasAttribute && __f.hasAttribute("srcdoc"))))) { __loadFrame(__f); }
+        for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i], "navigate", true); }
+        // <object data="…html"> nests a browsing context too (only those with a data resource). Load
+        // it async (no syncLoad): its realm must not be reached from the still-running parent lifecycle,
+        // and it has no child-before-parent step-machine requirement like iframes do.
+        var __objs = document.getElementsByTagName("object");
+        for (var __o = 0; __o < __objs.length; __o++) {
+          if (__objs[__o].getAttribute && __objs[__o].getAttribute("data")) { __loadFrame(__objs[__o], "navigate", false); }
         }
-      } catch (e) {}
+      };
     }
   } catch (e) {}
 
