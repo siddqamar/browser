@@ -1561,6 +1561,8 @@
     if (name === "place-items") return ["align-items", "justify-items"];
     if (name === "place-self") return ["align-self", "justify-self"];
     if (name === "columns") return ["column-width", "column-count"];
+    // SVG `marker` shorthand sets all three marker longhands to the same value.
+    if (name === "marker") return ["marker-start", "marker-mid", "marker-end"];
     return null;
   }
   // Shorthands we don't value-serialize but whose longhand set we know, so the CSS-wide-keyword
@@ -1727,6 +1729,8 @@
       if (!fl) return null;
       return [["flex-grow", fl.grow], ["flex-basis", fl.basis], ["flex-shrink", fl.shrink]];
     }
+    // `marker` sets all three marker longhands to the same value.
+    if (name === "marker") { return [["marker-start", value], ["marker-mid", value], ["marker-end", value]]; }
     return null;
   }
   // Parse the `flex` shorthand into {grow, shrink, basis}. Returns null if it can't be modeled.
@@ -1838,6 +1842,11 @@
       // A CSS-wide keyword in any longhand can't combine (handled by the early-return above).
       // Canonical: `grow shrink basis`.
       return fg + " " + fsk + " " + fb;
+    }
+    // `marker`: the common longhand value when all three markers agree, else "".
+    if (name === "marker") {
+      var m0 = g("marker-start"), m1 = g("marker-mid"), m2 = g("marker-end");
+      return m0 === m1 && m1 === m2 ? m0 : "";
     }
     return "";
   }
@@ -2031,7 +2040,8 @@
       "font-size-adjust font-synthesis font-display src unicode-range ascent-override descent-override " +
       "line-gap-override size-adjust contain content-visibility container container-type container-name " +
       "counter-set inset gap row-gap column-gap place-items place-content place-self justify-items " +
-      "image-rendering image-orientation shape-outside shape-margin shape-image-threshold " +
+      "x y cx cy r rx ry " +
+      "image-rendering image-orientation shape-outside shape-inside shape-subtract shape-margin shape-image-threshold " +
       "mix-blend-mode isolation backdrop-filter filter clip-path mask-clip mask-composite mask-mode " +
       "mask-origin mask-position mask-repeat mask-size mask-type mask-border " +
       "offset offset-path offset-distance offset-rotate offset-anchor offset-position " +
@@ -2069,6 +2079,95 @@
     "padding-top":1, "padding-right":1, "padding-bottom":1, "padding-left":1,
     "border-top-width":1, "border-right-width":1, "border-bottom-width":1, "border-left-width":1,
     "outline-width":1, "column-rule-width":1, "column-width":1 };
+  // SVG enumerated presentation properties → their permitted keyword set (lowercased).
+  var SVG_ENUM_VALUES = {
+    "stroke-linecap": ["butt", "round", "square"],
+    "stroke-linejoin": ["miter", "round", "bevel", "miter-clip", "arcs"],
+    "fill-rule": ["nonzero", "evenodd"],
+    "clip-rule": ["nonzero", "evenodd"],
+    "color-interpolation": ["auto", "srgb", "linearrgb"],
+    "color-interpolation-filters": ["auto", "srgb", "linearrgb"],
+    "image-rendering": ["auto", "smooth", "high-quality", "pixelated", "crisp-edges", "optimizespeed", "optimizequality"],
+    "shape-rendering": ["auto", "optimizespeed", "crispedges", "geometricprecision"],
+    "text-rendering": ["auto", "optimizespeed", "optimizelegibility", "geometricprecision"]
+  };
+  // A small CSS calc() engine: parse + type-check (length/percentage/number consistency), constant-
+  // fold pure-number expressions, and resolve to {px,pct} given length-unit context (em/vw/…).
+  var __calc = (function () {
+    var ABS = { px: 1, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6, "in": 96, pt: 96 / 72, pc: 16 };
+    function lex(s) {
+      s = s.replace(/calc\(/gi, "("); // nested calc() == parentheses
+      var t = [], i = 0, n = s.length;
+      var re = /\s*(?:([0-9]*\.?[0-9]+(?:e[-+]?[0-9]+)?)([a-z%]*)|([-+*/()]))/iy;
+      while (i < n) {
+        if (/\s/.test(s[i]) && re.lastIndex <= i) { /* handled by regex skip */ }
+        re.lastIndex = i; var m = re.exec(s); if (!m || m.index !== i && false) { return null; }
+        if (!m) { if (/\s/.test(s[i])) { i++; continue; } return null; }
+        i = re.lastIndex;
+        if (m[1] != null) { t.push({ t: "v", num: parseFloat(m[1]), unit: (m[2] || "").toLowerCase() }); }
+        else { t.push({ t: m[3] }); }
+        while (i < n && /\s/.test(s[i])) { i++; }
+      }
+      return t;
+    }
+    function parse(str) {
+      str = String(str).trim();
+      var m = /^calc\(([\s\S]*)\)$/i.exec(str); if (!m) { return null; }
+      var toks = lex(m[1]); if (!toks || !toks.length) { return null; }
+      var pos = 0;
+      function peek() { return toks[pos]; }
+      function expr() { var a = term(); if (a == null) { return null; } while (peek() && (peek().t === "+" || peek().t === "-")) { var op = toks[pos++].t; var b = term(); if (b == null) { return null; } a = { op: op, a: a, b: b }; } return a; }
+      function term() { var a = factor(); if (a == null) { return null; } while (peek() && (peek().t === "*" || peek().t === "/")) { var op = toks[pos++].t; var b = factor(); if (b == null) { return null; } a = { op: op, a: a, b: b }; } return a; }
+      function factor() { var k = peek(); if (!k) { return null; } if (k.t === "(") { pos++; var e = expr(); if (!e || !peek() || peek().t !== ")") { return null; } pos++; return e; } if (k.t === "v") { pos++; return { leaf: k }; } return null; }
+      var ast = expr(); if (ast == null || pos !== toks.length) { return null; }
+      return ast;
+    }
+    // Type kind: {k:"num",v} | {k:"dim",l,p} | {k:"bad"}.
+    function kind(node) {
+      if (node.leaf) { var u = node.leaf.unit; if (u === "") { return { k: "num", v: node.leaf.num }; } if (u === "%") { return { k: "dim", l: false, p: true }; } if (ABS[u] != null || /^(em|ex|ch|rem|vw|vh|vmin|vmax|lh|rlh|cap|ic|vi|vb)$/.test(u)) { return { k: "dim", l: true, p: false }; } return { k: "bad" }; }
+      var a = kind(node.a), b = kind(node.b); if (a.k === "bad" || b.k === "bad") { return { k: "bad" }; }
+      if (node.op === "+" || node.op === "-") { if (a.k === "num" && b.k === "num") { return { k: "num", v: node.op === "+" ? a.v + b.v : a.v - b.v }; } if (a.k === "dim" && b.k === "dim") { return { k: "dim", l: a.l || b.l, p: a.p || b.p }; } return { k: "bad" }; }
+      if (node.op === "*") { if (a.k === "num" && b.k === "num") { return { k: "num", v: a.v * b.v }; } if (a.k === "num") { return b; } if (b.k === "num") { return a; } return { k: "bad" }; }
+      if (node.op === "/") { if (b.k !== "num") { return { k: "bad" }; } if (a.k === "num") { return { k: "num", v: a.v / b.v }; } return a; }
+      return { k: "bad" };
+    }
+    // Resolve to {px, pct, num} given ctx {fs, rfs, vw, vh}.
+    function resolve(node, ctx) {
+      if (node.leaf) {
+        var u = node.leaf.unit, x = node.leaf.num;
+        if (u === "") { return { px: 0, pct: 0, num: x }; }
+        if (u === "%") { return { px: 0, pct: x, num: 0 }; }
+        if (ABS[u] != null) { return { px: x * ABS[u], pct: 0, num: 0 }; }
+        var rel = { em: ctx.fs, ex: ctx.fs * 0.5, ch: ctx.fs * 0.5, cap: ctx.fs, ic: ctx.fs, rem: ctx.rfs, vw: ctx.vw / 100, vh: ctx.vh / 100, vi: ctx.vw / 100, vb: ctx.vh / 100, vmin: Math.min(ctx.vw, ctx.vh) / 100, vmax: Math.max(ctx.vw, ctx.vh) / 100, lh: ctx.fs * 1.2, rlh: ctx.rfs * 1.2 };
+        if (rel[u] != null) { return { px: x * rel[u], pct: 0, num: 0 }; }
+        return null;
+      }
+      var a = resolve(node.a, ctx), b = resolve(node.b, ctx); if (!a || !b) { return null; }
+      if (node.op === "+") { return { px: a.px + b.px, pct: a.pct + b.pct, num: a.num + b.num }; }
+      if (node.op === "-") { return { px: a.px - b.px, pct: a.pct - b.pct, num: a.num - b.num }; }
+      if (node.op === "*") { var s = (a.px === 0 && a.pct === 0) ? a.num : null, t2 = (b.px === 0 && b.pct === 0) ? b.num : null; if (s != null) { return { px: b.px * s, pct: b.pct * s, num: b.num * s }; } if (t2 != null) { return { px: a.px * t2, pct: a.pct * t2, num: a.num * t2 }; } return null; }
+      if (node.op === "/") { var d = (b.px === 0 && b.pct === 0) ? b.num : null; if (d) { return { px: a.px / d, pct: a.pct / d, num: a.num / d }; } return null; }
+      return null;
+    }
+    function fmtNum(x) { return (Math.round(x * 1e6) / 1e6).toString(); }
+    return {
+      // Whether a calc() string is type-valid for a <length-percentage>/<number> context.
+      valid: function (str) { var a = parse(str); if (!a) { return false; } return kind(a).k !== "bad"; },
+      // If `str` is a calc() with a pure-number value, return "calc(N)"; if it's a unit calc, return
+      // the normalized string; null if not calc/invalid.
+      serialize: function (str) { var a = parse(str); if (!a) { return null; } var k = kind(a); if (k.k === "bad") { return null; } if (k.k === "num") { return "calc(" + fmtNum(k.v) + ")"; } return null; },
+      // Resolve a calc() to a computed string (px, or "calc(P% + Xpx)" if it keeps a percentage).
+      compute: function (str, ctx) {
+        var a = parse(str); if (!a) { return null; } var k = kind(a); if (k.k === "bad") { return null; }
+        var r = resolve(a, ctx); if (!r) { return null; }
+        var px = r.px + r.num; // user-unit numbers count as px in SVG length context
+        if (r.pct === 0) { return fmtNum(px) + "px"; }
+        if (px === 0) { return fmtNum(r.pct) + "%"; }
+        return "calc(" + fmtNum(r.pct) + "%" + (px >= 0 ? " + " + fmtNum(px) + "px" : " - " + fmtNum(-px) + "px") + ")";
+      }
+    };
+  })();
+  globalThis.__calc = __calc;
   function isValidValue(name, value) {
     var v = String(value).trim();
     if (v === "") return false;
@@ -2077,6 +2176,29 @@
     var vl = v.toLowerCase();
     if (/(^|[^a-z-])(var|env)\s*\(/i.test(v)) return true; // can't validate around substitutions
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
+    // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
+    // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
+    // non-negative; stroke-dashoffset allows negatives.
+    // SVG geometry CSS properties (<length-percentage>; x/y/cx/cy allow negatives; r non-negative;
+    // rx/ry add the `auto` keyword).
+    if (name === "x" || name === "y" || name === "cx" || name === "cy") { return /^calc\(/i.test(v) ? __calc.valid(v) : isLenPct(v, true); }
+    if (name === "r") { return /^calc\(/i.test(v) ? __calc.valid(v) : isLenPct(v, false); }
+    if (name === "rx" || name === "ry") { return vl === "auto" || (/^calc\(/i.test(v) ? __calc.valid(v) : isLenPct(v, false)); }
+    if (name === "stroke-width") { return /^calc\(/i.test(v) ? __calc.valid(v) : isStrokeLen(v, false); }
+    if (name === "stroke-dashoffset") { return /^calc\(/i.test(v) ? __calc.valid(v) : isStrokeLen(v, true); }
+    if (name === "stroke-dasharray") {
+      if (vl === "none") { return true; }
+      var items = splitDashList(v);
+      if (!items.length) { return false; }
+      for (var si = 0; si < items.length; si++) { var it = items[si]; if (/^calc\(/i.test(it) ? !__calc.valid(it) : !isStrokeLen(it, false)) { return false; } }
+      return true;
+    }
+    // inline-size / block-size: auto | content keywords | non-negative <length-percentage>
+    // (NOT none / border-width keywords, unlike the generic NONNEG set) — checked first.
+    if (name === "inline-size" || name === "block-size") {
+      if (vl === "auto" || vl === "min-content" || vl === "max-content" || vl === "fit-content" || /^fit-content\(/i.test(v)) { return true; }
+      return isValidLengthLike(v, false);
+    }
     if (hasOwn(NONNEG_LENGTH_LONGHANDS, name)) {
       if (vl === "auto" || vl === "none" || vl === "min-content" || vl === "max-content" ||
           vl === "fit-content" || vl === "thin" || vl === "medium" || vl === "thick" || /^fit-content\(/i.test(v)) return true;
@@ -2086,8 +2208,62 @@
       if (vl === "auto") return true;
       return /^[-+]?\d+$/.test(v);
     }
-    if (name === "opacity") {
-      return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(v);
+    // <alpha-value>: <number> | <percentage> (single token, no trailing dot). The value is not
+    // clamped at parse time (computed value clamps).
+    if (name === "opacity" || name === "fill-opacity" || name === "stroke-opacity" ||
+        name === "stop-opacity" || name === "flood-opacity" || name === "shape-image-threshold") {
+      return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(v) && !/\.(?:%|$)/.test(v);
+    }
+    // fill / stroke <paint>: none | <color> | <url> [none | <color>]?.
+    if (name === "fill" || name === "stroke") {
+      if (vl === "none" || vl === "currentcolor" || vl === "context-fill" || vl === "context-stroke") { return true; }
+      if (isValidColor(v)) { return true; }
+      var pm = /^url\(\s*(?:"[^"]*"|'[^']*'|[^)\s]*)\s*\)\s*([\s\S]*)$/i.exec(v);
+      if (pm) { var pfb = pm[1].trim(); return pfb === "" || pfb.toLowerCase() === "none" || isValidColor(pfb); }
+      return false;
+    }
+    // SVG keyword (enumerated) presentation properties: a single keyword from a fixed set.
+    if (hasOwn(SVG_ENUM_VALUES, name)) { return SVG_ENUM_VALUES[name].indexOf(vl) >= 0; }
+    // stroke-miterlimit: a single non-negative <number> (no trailing dot, no second value).
+    if (name === "stroke-miterlimit") {
+      return /^\+?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i.test(v) && !/\.$/.test(v) && parseFloat(v) >= 0;
+    }
+    // marker (shorthand) and marker-start/mid/end: none | <url>.
+    if (name === "marker-start" || name === "marker-mid" || name === "marker-end" || name === "marker") {
+      return vl === "none" || /^url\(/i.test(v);
+    }
+    // paint-order: normal | [ fill || stroke || markers ] (each keyword at most once).
+    if (name === "paint-order") {
+      if (vl === "normal") { return true; }
+      var poToks = vl.split(/\s+/), poOk = { fill: 1, stroke: 1, markers: 1 }, poSeen = {};
+      for (var pi = 0; pi < poToks.length; pi++) { var pt = poToks[pi]; if (!poOk[pt] || poSeen[pt]) { return false; } poSeen[pt] = 1; }
+      return poToks.length >= 1 && poToks.length <= 3;
+    }
+    // SVG text presentation properties with a small keyword/length grammar.
+    if (name === "text-anchor") { return vl === "start" || vl === "middle" || vl === "end"; }
+    if (name === "text-decoration-style") { return /^(solid|double|dotted|dashed|wavy)$/.test(vl); }
+    if (name === "text-decoration-line") {
+      if (vl === "none" || vl === "spelling-error" || vl === "grammar-error") { return true; }
+      var dlToks = vl.split(/\s+/), dlOk = { underline: 1, overline: 1, "line-through": 1, blink: 1 }, dlSeen = {};
+      for (var di = 0; di < dlToks.length; di++) { var dt = dlToks[di]; if (!dlOk[dt] || dlSeen[dt]) { return false; } dlSeen[dt] = 1; }
+      return dlToks.length > 0;
+    }
+    // shape-margin is a non-negative <length-percentage> (no auto/keywords, single token).
+    if (name === "shape-margin") { return isValidLengthLike(v, false); }
+    // shape-inside / shape-subtract: auto | [ <basic-shape: circle()|ellipse()|polygon()> | <uri> ]+
+    // (auto only on its own; not none / inset()).
+    if (name === "shape-inside" || name === "shape-subtract") {
+      if (vl === "auto") { return true; }
+      var rest = v.trim();
+      var comp = /^\s*(?:(?:circle|ellipse|polygon)\([^()]*\)|url\(\s*(?:"[^"]*"|'[^']*'|[^)\s]*)\s*\))(?:\s+|$)/i;
+      var matched = false;
+      while (rest.length) {
+        var mm = comp.exec(rest);
+        if (!mm) { return false; }
+        matched = true;
+        rest = rest.slice(mm[0].length);
+      }
+      return matched;
     }
     return true;
   }
@@ -2110,6 +2286,39 @@
     for (var i = 0; i < names.length; i++) o[names[i]] = 1;
     return o;
   })();
+  // Split a list on commas/whitespace at the top level (not inside parentheses, e.g. calc()).
+  function splitDashList(v) {
+    var out = [], cur = "", depth = 0;
+    for (var i = 0; i < v.length; i++) {
+      var c = v[i];
+      if (c === "(") { depth++; }
+      else if (c === ")") { depth--; }
+      if (depth === 0 && (c === "," || /\s/.test(c))) { if (cur.trim()) { out.push(cur.trim()); cur = ""; } continue; }
+      cur += c;
+    }
+    if (cur.trim()) { out.push(cur.trim()); }
+    return out;
+  }
+  globalThis.__splitDashList = splitDashList;
+  var STROKE_LEN_UNITS = /^(px|em|ex|ch|rem|vw|vh|vmin|vmax|cm|mm|q|in|pt|pc|cap|ic|vi|vb|lh|rlh)$/;
+  // A single CSS <length-percentage> token: a unit is required (a unitless non-zero is not a length;
+  // only `0` is allowed unitless), no trailing dot.
+  function isLenPct(v, allowNegative) {
+    var m = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z%]*)$/i.exec(String(v).trim());
+    if (!m || /\.$/.test(m[1])) { return false; }
+    var num = parseFloat(m[1]), unit = m[2].toLowerCase();
+    if (!allowNegative && num < 0) { return false; }
+    if (unit === "") { return num === 0; }
+    return unit === "%" || STROKE_LEN_UNITS.test(unit);
+  }
+  // A single <length-percentage> | <number> token (no trailing dot, optional sign).
+  function isStrokeLen(v, allowNegative) {
+    var m = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z%]*)$/i.exec(String(v).trim());
+    if (!m || /\.$/.test(m[1])) { return false; }
+    var num = parseFloat(m[1]), unit = m[2].toLowerCase();
+    if (!allowNegative && num < 0) { return false; }
+    return unit === "" || unit === "%" || STROKE_LEN_UNITS.test(unit);
+  }
   function isValidLengthLike(v, allowNegative) {
     // Accept a single dimension/percentage/zero/calc token (optionally signed).
     if (/^calc\(/i.test(v)) return true;
@@ -2164,8 +2373,61 @@
   // the cascade within a declaration block resolves on importance, not source order. The CSSOM
   // `setProperty` path leaves this false so an explicit set always replaces.
   var __blockImportanceCascade = false;
+  // Length-valued longhands serialize a bare `0` with a unit ("0px"), per CSS.
+  var LENGTH_VALUED = (function () {
+    var o = Object.create(null);
+    var names = Object.keys(NONNEG_LENGTH_LONGHANDS).concat(["shape-margin",
+      "margin-top", "margin-right", "margin-bottom", "margin-left",
+      "top", "right", "bottom", "left", "inset-block-start", "inset-block-end",
+      "inset-inline-start", "inset-inline-end", "text-indent", "letter-spacing", "word-spacing",
+      "column-gap", "row-gap", "border-top-left-radius", "border-top-right-radius",
+      "border-bottom-left-radius", "border-bottom-right-radius", "flex-basis",
+      "x", "y", "cx", "cy", "r", "rx", "ry"]);
+    for (var i = 0; i < names.length; i++) { o[names[i]] = 1; }
+    return o;
+  })();
+  var OPACITY_VALUED = { "opacity": 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "flood-opacity": 1, "shape-image-threshold": 1 };
+  // Serialize one stroke length token: fold a pure-number calc() to calc(N); lowercase the unit.
+  function serStrokeTok(it) {
+    if (/^calc\(/i.test(it)) { var s = __calc.serialize(it); return s != null ? s : it; }
+    var m = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z%]*)$/i.exec(it.trim());
+    return m ? m[1] + m[2].toLowerCase() : it;
+  }
+  // Canonicalize paint-order: fill in missing keywords in the default order (fill, stroke, markers),
+  // then return the shortest prefix that round-trips to the full order.
+  function canonPaintOrder(v) {
+    v = String(v).toLowerCase().trim();
+    if (v === "normal" || v === "") { return "normal"; }
+    var toks = v.split(/\s+/), def = ["fill", "stroke", "markers"], full = toks.slice();
+    for (var d = 0; d < def.length; d++) { if (full.indexOf(def[d]) < 0) { full.push(def[d]); } }
+    for (var k = 1; k <= 3; k++) {
+      var rebuilt = full.slice(0, k);
+      for (var e = 0; e < def.length; e++) { if (rebuilt.indexOf(def[e]) < 0) { rebuilt.push(def[e]); } }
+      if (rebuilt.join(" ") === full.join(" ")) { return full.slice(0, k).join(" "); }
+    }
+    return full.join(" ");
+  }
   function setDecl(out, name, val, important) {
     important = !!important;
+    if (val != null && hasOwn(LENGTH_VALUED, name) && /^[+-]?0(?:\.0*)?$/.test(String(val).trim())) {
+      val = "0px";
+    }
+    // <alpha-value> properties serialize a percentage as its number ratio (50% -> 0.5).
+    if (val != null && hasOwn(OPACITY_VALUED, name)) {
+      var am = /^([-+]?(?:\d+\.?\d*|\.\d+))%$/.exec(String(val).trim());
+      if (am) { val = String(parseFloat(am[1]) / 100); }
+    }
+    // paint-order serializes minimally (drops keywords whose position matches the default order).
+    if (val != null && name === "paint-order") { val = canonPaintOrder(String(val)); }
+    // stroke length properties: lowercase units, fold pure-number calc(), and (dasharray)
+    // serialize the list comma-separated.
+    if (val != null && (name === "stroke-width" || name === "stroke-dashoffset" || name === "stroke-dasharray")) {
+      var sv = String(val).trim();
+      if (!(name === "stroke-dasharray" && sv.toLowerCase() === "none")) {
+        var toks = name === "stroke-dasharray" ? splitDashList(sv) : [sv];
+        val = toks.map(serStrokeTok).join(", ");
+      }
+    }
     var i = findDecl(out, name);
     if (val == null || val === "") { if (i >= 0) out.splice(i, 1); return; }
     if (i >= 0) {
@@ -2479,8 +2741,10 @@
   // attribute (so external className/setAttribute changes are reflected); the mutating
   // methods run the spec "update steps" which serialize the ordered set back to `class`.
   function makeClassList(node) { return makeTokenList(node, "class", null); }
+  globalThis.__makeTokenList = function (node, attrName) { return makeTokenList(node, attrName, null); };
   // A DOMTokenList over an arbitrary reflected attribute (`attrName`). `supported` is an optional
   // allow-list of tokens for `supports()` (null => supports() throws TypeError, like `class`).
+  // Exposed as __makeTokenList so svg.js can back SVGAElement.relList over the `rel` attribute.
   function makeTokenList(node, attrName, supported) {
     // ASCII whitespace per the HTML spec: TAB, LF, FF, CR, SPACE.
     function splitTokens(s) {
@@ -4584,11 +4848,14 @@
 
   // Apply all reflection accessors for the element `el` (node id `node`, lowercase tag `tag`).
   function applyReflection(el, node, tag) {
-    // Global attributes (HTMLElement) on every HTML element. The SVG/MathML tags skip these.
+    // Global attributes. The HTMLElement ones apply only to HTML elements; SVG/MathML elements get
+    // just the HTMLOrSVGElement subset (nonce/autofocus/tabIndex) — title/lang/dir/etc. are not on them.
+    var __htmlOrSvgGlobal = { nonce: 1, autofocus: 1, tabIndex: 1 };
+    var __isHtmlEl = el.namespaceURI === "http://www.w3.org/1999/xhtml";
     for (var gk in __reflGlobals) {
-      if (Object.prototype.hasOwnProperty.call(__reflGlobals, gk)) {
-        defineReflected(el, node, gk, __reflGlobals[gk]);
-      }
+      if (!Object.prototype.hasOwnProperty.call(__reflGlobals, gk)) { continue; }
+      if (!__isHtmlEl && !__htmlOrSvgGlobal[gk]) { continue; }
+      defineReflected(el, node, gk, __reflGlobals[gk]);
     }
     // ARIA nullable-string reflection (HTMLElement + Element).
     defineReflected(el, node, "role", { type: "nullable string", domAttrName: "role" });
@@ -4598,9 +4865,10 @@
     }
     // ARIA element reflection (aria*Element / aria*Elements) — Element / FrozenArray<Element>.
     applyAomElementReflection(el, node);
-    // Per-element attributes.
+    // Per-element attributes — only for HTML-namespace elements. (A same-named foreign element, e.g.
+    // SVG <a>, has its own IDL reflected on its interface prototype by svg.js, not as own props here.)
     var tbl = __reflTables[tag];
-    if (tbl) {
+    if (tbl && el.namespaceURI === "http://www.w3.org/1999/xhtml") {
       for (var k in tbl) {
         if (Object.prototype.hasOwnProperty.call(tbl, k)) { defineReflected(el, node, k, tbl[k]); }
       }
@@ -5091,8 +5359,8 @@
             enumerable: true, configurable: true
           });
         }
-        // relList: on HTML a/area/link, and on SVG a.
-        if ((ns === HTML && (ln === "a" || ln === "area" || ln === "link")) || (ns === SVG && ln === "a")) {
+        // relList: on HTML a/area/link. (SVG <a>.relList is defined on SVGAElement.prototype.)
+        if (ns === HTML && (ln === "a" || ln === "area" || ln === "link")) {
           install("relList", "rel");
         }
         if (ns === HTML && ln === "output") { install("htmlFor", "for"); }
@@ -5257,11 +5525,13 @@
             });
           }
         }
-        __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 });
+        // SVG <a>.href is an SVGAnimatedString (SVGURIReference) on the interface prototype, not an
+        // own DOMString URL reflection — so only reflect href for HTML hyperlink elements here.
+        if (el.namespaceURI === "http://www.w3.org/1999/xhtml") { __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 }); }
         // HTMLHyperlinkElementUtils URL-decomposition accessors on <a>/<area>: protocol/host/...
         // derived from the resolved href. These also make the WPT reflection harness' resolveUrl()
         // (which decomposes a throwaway <a>) compute correct expected values for `url`-type attrs.
-        if (__formTag === "a" || __formTag === "area") {
+        if ((__formTag === "a" || __formTag === "area") && el.namespaceURI === "http://www.w3.org/1999/xhtml") {
           var __hrefParts = function () {
             var raw = __getAttr(node, "href");
             var resolved = (raw == null) ? "" : __resolveURL(raw);
@@ -5579,11 +5849,15 @@
     if (typeof el.load !== "function") { def(el, "load", fn); }
     if (typeof el.canPlayType !== "function") { def(el, "canPlayType", function () { return ""; }); }
     if (typeof el.addTextTrack !== "function") { def(el, "addTextTrack", function (kind) { return { kind: kind || "", mode: "disabled", cues: [], activeCues: [], addCue: fn, removeCue: fn, addEventListener: fn, removeEventListener: fn }; }); }
-    // SVGSVGElement animation controls (no SMIL): accept and ignore.
-    if (typeof el.pauseAnimations !== "function") { def(el, "pauseAnimations", fn); }
-    if (typeof el.unpauseAnimations !== "function") { def(el, "unpauseAnimations", fn); }
-    if (typeof el.setCurrentTime !== "function") { def(el, "setCurrentTime", fn); }
-    if (typeof el.getCurrentTime !== "function") { def(el, "getCurrentTime", function () { return 0; }); }
+    // SVGSVGElement / SVGAnimationElement timeline controls are provided on the SVG interface
+    // prototypes by svg.js; only install inert fallbacks on non-SVG elements (never as own props that
+    // would shadow the prototype methods).
+    if (el.namespaceURI !== "http://www.w3.org/2000/svg") {
+      if (typeof el.pauseAnimations !== "function") { def(el, "pauseAnimations", fn); }
+      if (typeof el.unpauseAnimations !== "function") { def(el, "unpauseAnimations", fn); }
+      if (typeof el.setCurrentTime !== "function") { def(el, "setCurrentTime", fn); }
+      if (typeof el.getCurrentTime !== "function") { def(el, "getCurrentTime", function () { return 0; }); }
+    }
     // Declarative partial-update methods (WICG): {append,prepend,before,after,replaceWith}HTML[Unsafe].
     globalThis.__addPartialMethods(el);
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
@@ -5635,21 +5909,11 @@
     if (!("offsetHeight" in el)) { el.offsetHeight = 0; }
     if (!("clientWidth" in el)) { el.clientWidth = 0; }
     if (!("clientHeight" in el)) { el.clientHeight = 0; }
-    // SVG geometry properties expose SVGAnimatedLength / SVGAnimatedRect objects whose `.baseVal`
-    // pages read (e.g. favicon generators do `svg.width.baseVal.value`). Provide zeroed stubs so
-    // those reads don't throw. Gated on SVG tags so HTML elements keep their own width/height attrs.
+    // SVG DOM: animated-attribute reflection (SVGAnimatedLength baseVal/animVal), the SMIL timeline
+    // controls on the <svg> root, and the animation-element API. Implemented in <svg> bootstrap;
+    // acts only on SVG-namespace elements, leaving HTML elements untouched.
     try {
-      var __svgTag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : "";
-      if (svgTags[__svgTag]) {
-        var __len = ["width", "height", "x", "y"];
-        for (var __si = 0; __si < __len.length; __si++) {
-          (function (p) {
-            if (!(p in el)) { def(el, p, { baseVal: { value: 0, valueAsString: "0", valueInSpecifiedUnits: 0 }, animVal: { value: 0 } }); }
-          })(__len[__si]);
-        }
-        if (!("viewBox" in el)) { def(el, "viewBox", { baseVal: { x: 0, y: 0, width: 0, height: 0 }, animVal: { x: 0, y: 0, width: 0, height: 0 } }); }
-        if (!("preserveAspectRatio" in el)) { def(el, "preserveAspectRatio", { baseVal: { align: 0, meetOrSlice: 0 }, animVal: { align: 0, meetOrSlice: 0 } }); }
-      }
+      if (typeof globalThis.__svgEnrich === "function") { globalThis.__svgEnrich(el); }
     } catch (e) {}
     // <canvas>: a REAL 2D context that records a display list of resolved drawing commands.
     // The JS side maintains drawing state (styles + a 2D affine transform + path) and pushes

@@ -842,17 +842,27 @@
       set: function (v) { __setAttr(id, "id", String(v)); },
       enumerable: true, configurable: true
     });
-    Object.defineProperty(el, "className", {
-      get: function () { var v = __getAttr(id, "class"); return v == null ? "" : v; },
-      set: function (v) { __setAttr(id, "class", String(v)); },
-      enumerable: true, configurable: true
-    });
+    // `className` is a DOMString reflection for HTML/MathML, but an SVGAnimatedString for SVG (defined
+    // on SVGElement.prototype by svg.js) — so don't shadow it with an own string property there.
+    // (elNamespace honours createElementNS metadata, which the raw arena namespace doesn't carry.)
+    if (elNamespace(id) !== "http://www.w3.org/2000/svg") {
+      Object.defineProperty(el, "className", {
+        get: function () { var v = __getAttr(id, "class"); return v == null ? "" : v; },
+        set: function (v) { __setAttr(id, "class", String(v)); },
+        enumerable: true, configurable: true
+      });
+    }
 
     // Per-element attribute namespace metadata: keyed by the qualified-name storage key, holds
     // { namespaceURI, prefix, localName } so getAttributeNS / Attr.localName reflect correctly.
     function elIsHtml() {
       var m = __nsMeta[id];
-      return m ? m.isHTML : (__nodeType(id) === 1);
+      if (m) { return m.isHTML; }
+      if (__nodeType(id) !== 1) { return false; }
+      // Parsed elements have no metadata: HTML-namespace (stored as null) lowercases attribute
+      // names; SVG/MathML foreign content is case-sensitive.
+      var ns = __namespaceUri(id);
+      return ns == null || ns === HTML_NS;
     }
     def(el, "getAttribute", function (name) {
       // HTML elements ASCII-lowercase the qualified name before matching (stored lowercased).
