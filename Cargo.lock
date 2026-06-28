@@ -1131,6 +1131,7 @@ dependencies = [
  "fontdue",
  "html",
  "layout",
+ "lumen",
  "paint",
  "style",
  "v8",
@@ -1400,6 +1401,10 @@ checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
 dependencies = [
  "imgref",
 ]
+
+[[package]]
+name = "lumen"
+version = "0.1.0"
 
 [[package]]
 name = "maybe-rayon"
@@ -2207,6 +2212,13 @@ dependencies = [
  "timezone_provider",
  "tinystr",
  "writeable",
+]
+
+[[package]]
+name = "test262-runner"
+version = "0.1.0"
+dependencies = [
+ "lumen",
 ]
 
 [[package]]

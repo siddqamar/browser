@@ -6,6 +6,8 @@ members = [
     "crates/css",
     "crates/dom",
     "crates/js",
+    "crates/lumen",
+    "crates/test262-runner",
     "crates/style",
     "crates/layout",
     "crates/paint",

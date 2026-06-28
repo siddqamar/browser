@@ -4,12 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exactly one JS backend is compiled. `backend-v8` (default) is the production engine; building
+# with `--no-default-features --features backend-lumen` links NO V8 at all and routes JS through
+# the from-scratch `lumen` engine instead. As lumen matures the default will flip and `backend-v8`
+# will eventually be removed. The two are mutually exclusive.
+default = ["backend-v8"]
+backend-v8 = ["dep:v8"]
+backend-lumen = ["dep:lumen"]
+
 [dependencies]
 # The V8 JavaScript engine (Google's production engine). Walled off behind our own Runtime API
 # so it can be replaced later — same pattern as net/ureq and paint/fontdue. Nothing outside this
 # crate knows V8 exists. V8 gives us full JS speed + complete language support, including real
-# ES modules and dynamic import.
-v8 = "150"
+# ES modules and dynamic import. Optional: only linked under the `backend-v8` feature.
+v8 = { version = "150", optional = true }
+# Our from-scratch JS engine — the eventual replacement for V8. Only linked under `backend-lumen`.
+lumen = { path = "../lumen", optional = true }
 # The real DOM, so page scripts can read and mutate the live document tree.
 dom = { path = "../dom" }
 # The cascade + CSS parser, so `getComputedStyle` can compute real values in-Session (the JS runs

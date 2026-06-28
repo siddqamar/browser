@@ -25,36 +25,49 @@
 //! `dataset` write-through, the DOM interface class hierarchy + `instanceof`, navigator/location/
 //! storage/observers, the timer/event loop) lives in that reused, engine-agnostic JavaScript.
 
+#[cfg(feature = "backend-v8")]
 mod inner_text;
 
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::cell::Cell;
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::cell::RefCell;
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::collections::HashMap;
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::rc::Rc;
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::sync::mpsc::{Receiver, Sender};
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::sync::Arc;
+#[cfg(feature = "backend-v8")]
 pub(crate) use std::sync::Once;
 
 /// A completion delivered from a background request thread back to the worker: `(request id,
 /// response-envelope JSON or None on transport error)`. Drained on the worker thread inside
 /// [`drain_event_loop`] to resolve/reject the pending JS `fetch()` promise.
+#[cfg(feature = "backend-v8")]
 type FetchCompletion = (u64, Option<String>);
 
 /// A WebSocket event delivered from a background socket thread to the worker: `(socket id, kind,
 /// payload)`. kind `0`=open, `1`=text, `2`=binary(base64), `3`=close("code:reason"), `4`=error.
 /// Drained opportunistically (non-blocking) inside [`drain_event_loop`] and dispatched to JS via
 /// `__wsDeliver`. A socket is long-lived, so — unlike a fetch — it never touches `in_flight`.
+#[cfg(feature = "backend-v8")]
 type WsEvent = (u64, u8, String);
 
 /// An outgoing WebSocket command from JS to a background socket thread: `(kind, payload)`.
 /// kind `0`=send text, `1`=send binary(base64), `2`=close. Sent over a per-socket channel whose
 /// receiver lives on that socket's `net::ws_run` thread.
+#[cfg(feature = "backend-v8")]
 type WsOut = (u8, String);
 
 /// Host WebSocket connector (built by the engine, mirroring `request_fetcher`): given
 /// `(url, id, ws_evt_tx)` it spawns the socket thread and returns the per-socket outgoing sender,
 /// or `Err` if the thread couldn't start. Crosses the crate boundary with PRIMITIVE tuples only.
+#[cfg(feature = "backend-v8")]
 type WsConnector =
     Arc<dyn Fn(String, u64, Sender<WsEvent>) -> Result<Sender<WsOut>, String> + Send + Sync>;
 
@@ -68,6 +81,7 @@ pub struct EvalOutput {
 }
 
 /// Initialize the V8 platform exactly once for the whole process. Safe to call repeatedly.
+#[cfg(feature = "backend-v8")]
 fn ensure_v8_initialized() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -82,6 +96,7 @@ fn ensure_v8_initialized() {
 // ---------------------------------------------------------------------------------------------
 
 /// A shared, mutable handle to the page's DOM.
+#[cfg(feature = "backend-v8")]
 type SharedDoc = Rc<RefCell<dom::Document>>;
 
 /// A single DOM mutation recorded by the native mutation primitives while at least one
@@ -89,6 +104,7 @@ type SharedDoc = Rc<RefCell<dom::Document>>;
 /// (`__deliverMutations`) drains these as JSON, matches them against the JS-side observer
 /// registry, and builds the spec `MutationRecord` objects. We keep this Rust-side struct (rather
 /// than tracking mutations in JS) because the mutations happen inside the Rust DOM primitives.
+#[cfg(feature = "backend-v8")]
 struct MutationRec {
     /// "childList" | "attributes" | "characterData".
     kind: &'static str,
@@ -107,6 +123,7 @@ struct MutationRec {
 /// State shared between Rust and the native primitive callbacks. Stored on the context slot as an
 /// `Rc<HostState>` so any callback can recover it from `scope.get_current_context().get_slot()`.
 /// Interior mutability via `RefCell` since the slot only hands out `&HostState` (well, `Rc`).
+#[cfg(feature = "backend-v8")]
 struct HostState {
     doc: SharedDoc,
     console: RefCell<Vec<String>>,
@@ -214,6 +231,7 @@ struct HostState {
     cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
 }
 
+#[cfg(feature = "backend-v8")]
 impl HostState {
     fn new(doc: SharedDoc) -> Rc<Self> {
         // No-DOM paths: dead-end channels (their receivers are dropped immediately) and a connector
@@ -310,6 +328,7 @@ impl HostState {
 
 /// Recover the `Rc<HostState>` from the current context's slot. Panics only if state was never
 /// installed, which is a programming error (every context we run callbacks in installs it).
+#[cfg(feature = "backend-v8")]
 fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
     let context = scope.get_current_context();
     context
@@ -322,30 +341,60 @@ fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
 // implementation — these are pure Rust and unchanged in behavior.
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(feature = "backend-v8")]
 mod dom_helpers;
+#[cfg(feature = "backend-v8")]
 mod eval_loop;
+#[cfg(feature = "backend-v8")]
 mod forced_layout;
+#[cfg(feature = "backend-v8")]
 mod iframe;
+#[cfg(feature = "backend-v8")]
 mod modules;
+#[cfg(feature = "backend-v8")]
 mod primitives;
+#[cfg(feature = "backend-v8")]
 mod runtime;
+#[cfg(feature = "backend-v8")]
 mod selector;
+#[cfg(feature = "backend-v8")]
 mod session;
+#[cfg(feature = "backend-v8")]
 mod style_query;
+#[cfg(feature = "backend-v8")]
 mod worker;
 
+#[cfg(feature = "backend-v8")]
 pub(crate) use dom_helpers::*;
+#[cfg(feature = "backend-v8")]
 pub use eval_loop::*;
+#[cfg(feature = "backend-v8")]
 pub use iframe::*;
+#[cfg(feature = "backend-v8")]
 pub use modules::*;
+#[cfg(feature = "backend-v8")]
 pub use primitives::*;
+#[cfg(feature = "backend-v8")]
 pub use runtime::*;
+#[cfg(feature = "backend-v8")]
 pub(crate) use selector::*;
+#[cfg(feature = "backend-v8")]
 pub use session::*;
+#[cfg(feature = "backend-v8")]
 pub(crate) use style_query::*;
+#[cfg(feature = "backend-v8")]
 pub use worker::*;
 
-#[cfg(test)]
+// The from-scratch backend. Implements the language-evaluation slice of the public API
+// (`Runtime`/`eval`/`eval_batch`) on top of `lumen`; the DOM `Session` surface is still V8-only and
+// will grow into lumen in a later milestone. (Named `lumen_backend`, not `lumen`, to avoid clashing
+// with the `lumen` crate.)
+#[cfg(feature = "backend-lumen")]
+mod lumen_backend;
+#[cfg(feature = "backend-lumen")]
+pub use lumen_backend::*;
+
+#[cfg(all(test, feature = "backend-v8"))]
 mod tests {
     use super::*;
 

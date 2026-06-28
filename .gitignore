@@ -19,6 +19,10 @@
 /wpt/
 dist/
 
+# tc39/test262 conformance suite (cloned on demand by scripts/test262-clone.sh) + its score report.
+/test262/
+/test262-report/
+
 # Scratch area lists generated for wpt-run-missing.sh (local, per-run)
 /scripts/.missing_areas.txt
 /scripts/.remaining_areas.txt
