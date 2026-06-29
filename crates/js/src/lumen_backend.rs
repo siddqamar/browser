@@ -24,7 +24,9 @@ impl Default for Runtime {
 
 impl Runtime {
     pub fn new() -> Self {
-        Runtime { engine: Engine::new() }
+        Runtime {
+            engine: Engine::new(),
+        }
     }
 
     /// Evaluate a script in the persistent realm. Never panics on a JS error — it is captured into
